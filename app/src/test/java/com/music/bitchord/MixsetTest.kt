@@ -5,6 +5,8 @@ import com.music.bitchord.playback.smart.EnergySample
 import com.music.bitchord.playback.smart.MixCandidate
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.bestPartCue
+import com.music.bitchord.playback.smart.buildupStart
+import com.music.bitchord.playback.smart.mixsetEntryPoint
 import com.music.bitchord.playback.smart.mixsetMixOutAnchor
 import com.music.bitchord.playback.smart.planTransition
 import org.junit.Assert.assertEquals
@@ -246,14 +248,103 @@ class MixsetTest {
     // -- Part B: mixset through the planner -----------------------------------
 
     @Test
+    fun mixsetAnchor_landsOnFirstCooldown() {
+        val length = 300.0
+        // Drop at 60, then a cliff into a settled low stretch from 129:
+        // the anchor opens the cooldown at the 130 grid point instead of
+        // waiting for the 150 target.
+        val points = curve(length, energyAt = { t ->
+            when {
+                t == 60.0 -> 3.0
+                t >= 129.0 -> 0.3
+                else -> 1.0
+            }
+        })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..150).map { it * 2.0 },
+            phraseBoundaries = listOf(130.0),
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals("mixset_peak", anchor.type)
+        assertEquals(130.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_quietSingingCooldownStillWins() {
+        val length = 300.0
+        // Same comedown, but a soft vocal sits on it: energy runs the
+        // decision, so the cooldown still wins over any loud calm point.
+        val points = curve(length, energyAt = { t ->
+            when {
+                t == 60.0 -> 3.0
+                t >= 129.0 -> 0.3
+                else -> 1.0
+            }
+        })
+        val mask = points.map { p ->
+            if (p.time >= 130.0 && p.time <= 140.0) 0.5 else 0.1
+        }
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = mask,
+            downbeats = (0..150).map { it * 2.0 },
+            phraseBoundaries = listOf(130.0),
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals(130.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun buildupStart_findsFootOfRise() {
+        val length = 200.0
+        // A steady climb from 40 to the 120 peak: the foot sits where the
+        // curve first clears 40% of the peak going back — about a third of
+        // the way up, not at the peak and not at the inaudible start.
+        val points = curve(length, energyAt = { t ->
+            if (t in 40.0..120.0) 0.3 + (t - 40.0) * 2.7 / 80.0 else 0.3
+        })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..100).map { it * 2.0 },
+        )
+        assertEquals(66.0, buildupStart(analysis, 120.0)!!, 1e-6)
+        assertEquals(66.0, mixsetEntryPoint(analysis)!!, 1e-6)
+    }
+
+    @Test
+    fun buildupStart_flatLineReturnsNull() {
+        val length = 180.0
+        // A spike on a flat bed is not a buildup: nothing genuinely rises
+        // into it, so the entry falls back to the peak itself downstream.
+        val points = curve(length, energyAt = { t ->
+            if (t >= 119.0 && t <= 121.0) 3.0 else 1.0
+        })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..90).map { it * 2.0 },
+        )
+        assertNull(buildupStart(analysis, 120.0))
+    }
+
+    @Test
     fun mixsetMode_cutsEarly_offBestPart_withCappedEntry() {
-        // Outgoing drop at 60 -> anchor ~150 (below the 160 floor, by design).
-        // Incoming drop at 120 (66%) -> the 50% ceiling pulls it to ~90.
+        // Outgoing drop at 60 with a hard stop at 150 -> cooldown landing
+        // ~150 (below the 160 floor, by design). Incoming spike at 120 on a
+        // flat bed (no real buildup) -> entry falls back to the peak, pulled
+        // to ~90 by the 50% ceiling.
         val (out, next) = strongPair(
             outEnergyAt = { t ->
                 when {
                     t >= 59.0 && t <= 61.0 -> 3.0
-                    t < 170.0 -> 1.0
+                    t < 150.0 -> 1.0
                     else -> 0.0
                 }
             },

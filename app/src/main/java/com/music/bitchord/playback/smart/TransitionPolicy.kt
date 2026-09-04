@@ -868,6 +868,20 @@ const val MIXSET_WAIT_TOLERANCE_SECONDS = 8.0
  * lands on a vocal. Unknown stays cheap — absence of a mask is not evidence.
  */
 const val MIXSET_SINGING_PENALTY = 40.0
+/**
+ * Energy-arc constants. A cooldown is an 8 s stretch running below 70% of the
+ * track mean with its max-min spread under half the mean — low AND settled,
+ * so a cliff edge or a single quiet bar does not qualify. A buildup foot is
+ * the nearest point at least 4 s before the peak sitting at or under 40% of
+ * the peak's own energy with the stretch after it rising at least 0.5 above
+ * the foot — a genuine rise, not a flat line that happens to sit low.
+ */
+const val MIXSET_COOLDOWN_WINDOW_SECONDS = 8.0
+const val MIXSET_LOW_MEAN_FRACTION = 0.7
+const val MIXSET_STABLE_SPREAD_FRACTION = 0.5
+const val MIXSET_BUILDUP_FOOT_FRACTION = 0.4
+const val MIXSET_BUILDUP_MIN_SECONDS = 4.0
+const val MIXSET_BUILDUP_RISE_MARGIN = 0.5
 /** Mixset blends are cuts between peaks, never long beds: overlap ceiling in beats. */
 const val MIXSET_MAX_BEATS = 16.0
 
@@ -901,14 +915,59 @@ private fun maxEnergyTimeAfterIntro(analysis: TrackAnalysis): Double? {
 }
 
 /**
- * Mixset outgoing anchor: at least [MIXSET_MIN_PLAY_SECONDS] past the track's
- * best part, aiming for [MIXSET_TARGET_PLAY_SECONDS], but waiting past the
- * target — up to [MIXSET_MAX_PLAY_SECONDS] — for a phrase boundary or
- * downbeat whose surroundings sing the least. Cutting at a fixed offset
- * lands mid-chorus whenever the peak runs long; waiting for the peak to end
- * is what a DJ does. A rescue anchor just ahead of the playhead when it is
- * already past the window — a manually started track plays from 0, not from
- * its best cue, so the computed window can already be behind.
+ * Where the incoming track joins in Mixset Mode: the foot of its buildup —
+ * the rise into the peak — so the track plays its own build and the peak
+ * lands on its own time after the handoff, instead of being cued in the
+ * face. Null when the curve shows no genuine rise (flat lines sit low
+ * everywhere); the caller then falls back to the peak itself.
+ */
+fun buildupStart(analysis: TrackAnalysis, peakTime: Double): Double? {
+    val curve = analysis.energyCurve
+    if (curve.size < 3 || !peakTime.isFinite()) return null
+    val peakEnergy = curve.minByOrNull { abs(it.time - peakTime) }
+        ?.energy?.takeIf { it.isFinite() && it > 0 } ?: return null
+    val footCeiling = MIXSET_BUILDUP_FOOT_FRACTION * peakEnergy
+    // Walk back from just before the peak: the foot is the nearest low point
+    // with a real climb after it.
+    for (i in curve.indices.reversed()) {
+        val point = curve[i]
+        if (!point.time.isFinite() || !point.energy.isFinite()) continue
+        if (point.time > peakTime - MIXSET_BUILDUP_MIN_SECONDS) continue
+        if (point.time >= peakTime) continue
+        if (point.energy > footCeiling) continue
+        val after = curve.subList(i, curve.size)
+            .filter { it.time.isFinite() && it.energy.isFinite() && it.time <= peakTime }
+        // A transient spike clears the mean check on its own width: the climb
+        // has to last a musical stretch to count as a buildup.
+        if (after.size < 2 || after.last().time - point.time < MIXSET_COOLDOWN_WINDOW_SECONDS) continue
+        if (after.sumOf { it.energy } / after.size >= point.energy + MIXSET_BUILDUP_RISE_MARGIN) {
+            return nearestValue(analysis.downbeats, point.time, MIXSET_BUILDUP_MIN_SECONDS)
+                ?: point.time
+        }
+    }
+    return null
+}
+
+/**
+ * Mixset entry: the buildup foot when the curve shows one, else the peak.
+ * One function so the hard/echo/plain cues, the WSOLA drop and the adaptive
+ * handoff all agree on where the incoming track begins.
+ */
+fun mixsetEntryPoint(analysis: TrackAnalysis): Double? {
+    val peak = bestPartCue(analysis) ?: return null
+    return buildupStart(analysis, peak) ?: peak
+}
+
+/**
+ * Mixset outgoing anchor: the first cooldown past the track's best part — a
+ * low, settled stretch where the peak has audibly ended — inside the
+ * 60–120 s window. Cutting on the comedown instead of at a fixed offset is
+ * what keeps a long chorus from being cut mid-phrase. When the curve shows
+ * no cooldown (a track that never comes down), the anchor falls back to the
+ * calmest grid point near the 90 s target. A rescue anchor just ahead of the
+ * playhead when it is already past the window — a manually started track
+ * plays from 0, not from its best cue, so the computed window can already
+ * be behind.
  */
 fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Double): MixOutAnchor {
     val rescue = MixOutAnchor(
@@ -924,10 +983,56 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
     val from = max(0.0, floor)
     val to = min(length, cap)
     if (to <= from) return rescue
-    // A calm landing matters more than exact seconds: singing over the cut is
-    // what makes a mixset transition sound late. Measured-calm wins, unknown
-    // is second choice, singing is last — and last by a margin no distance
-    // inside the window can overcome (see MIXSET_SINGING_PENALTY).
+    // Energy first: a quiet-but-singing cooldown still beats a loud calm
+    // point, because the comedown is over and the blend has room. The vocal
+    // penalty below only breaks ties the energy leaves.
+    cooldownLanding(analysis, from, to)?.let { landing ->
+        val time = landing.coerceIn(0.0, max(0.0, length - 2.0))
+        return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
+    }
+    val time = fallbackMixsetAnchor(analysis, from, to, base)
+        .coerceIn(0.0, max(0.0, length - 2.0))
+    return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
+}
+
+/**
+ * The first cooldown inside [from]..[to]: the earliest phrase boundary or
+ * downbeat opening an 8 s stretch that runs low and settled. A cliff edge
+ * fails the spread check and a lone quiet bar fails the mean check, so what
+ * qualifies is a comedown that actually lasts. Null when the track never
+ * comes down inside the window.
+ */
+fun cooldownLanding(analysis: TrackAnalysis, from: Double, to: Double): Double? {
+    val curve = analysis.energyCurve
+    if (curve.size < 3 || to <= from) return null
+    val mean = meanEnergy(analysis) ?: return null
+    if (mean <= 0) return null
+    val lowCeiling = MIXSET_LOW_MEAN_FRACTION * mean
+    val spreadCeiling = MIXSET_STABLE_SPREAD_FRACTION * mean
+    val grid = (analysis.phraseBoundaries + analysis.downbeats)
+        .filter { it.isFinite() && it in from..to }
+        .distinct()
+        .sorted()
+    for (point in grid) {
+        val window = curve.filter {
+            it.time.isFinite() && it.energy.isFinite() &&
+                it.time >= point && it.time <= point + MIXSET_COOLDOWN_WINDOW_SECONDS
+        }.map { it.energy }
+        if (window.size < 2) continue
+        if (window.average() >= lowCeiling) continue
+        if ((window.max() - window.min()) >= spreadCeiling) continue
+        return point
+    }
+    return null
+}
+
+// Fallback when the track never cools down: no energy claim is possible, so
+// the calmest grid point near the target wins. A calm landing matters more
+// than exact seconds: singing over the cut is what makes a mixset transition
+// sound late. Measured-calm wins, unknown is second choice, singing is last
+// — and last by a margin no distance inside the window can overcome
+// (see MIXSET_SINGING_PENALTY).
+fun fallbackMixsetAnchor(analysis: TrackAnalysis, from: Double, to: Double, base: Double): Double {
     fun scored(time: Double): Double {
         val vocal = vocalActivityBetween(analysis, time - 2.0, time + 2.0)
         val penalty = when {
@@ -945,14 +1050,12 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
     // short, but a calm point well before it beats riding far into vocals.
     val early = grid.filter { it <= base }.minByOrNull(::scored)
     val late = grid.filter { it > base }.minByOrNull(::scored)
-    val chosen = when {
+    return when {
         late == null -> early
         early == null -> late
         scored(late) <= scored(early) + MIXSET_WAIT_TOLERANCE_SECONDS -> late
         else -> early
     } ?: base.coerceIn(from, to)
-    val time = chosen.coerceIn(0.0, max(0.0, length - 2.0))
-    return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
 }
 
 /**

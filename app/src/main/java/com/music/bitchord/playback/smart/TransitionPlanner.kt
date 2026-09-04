@@ -640,11 +640,13 @@ private fun capIncomingEntry(
 }
 
 /**
- * Mixset entry: straight into the best part, skipping the intro — the 50%
- * ceiling still applies so it stays a part pick, not a deep-album cut.
+ * Mixset entry: the foot of the buildup, skipping the intro — the 50%
+ * ceiling still applies so it stays a part pick, not a deep-album cut. The
+ * handoff aims here, not at the peak: the peak arrives on its own time after
+ * the takeover, which is what lets a long buildup breathe.
  */
 private fun mixsetEntryCue(nextAnalysis: TrackAnalysis, nextLength: Double): Double {
-    val best = bestPartCue(nextAnalysis) ?: incomingStartPoint(nextAnalysis)
+    val best = mixsetEntryPoint(nextAnalysis) ?: incomingStartPoint(nextAnalysis)
     return capIncomingEntry(best, nextAnalysis, nextLength, mixsetActive = true)
 }
 
@@ -927,7 +929,7 @@ fun planWsolaTransition(
     val outgoingBeatSeconds = 60 / outgoingBpm
 
     val rawDropTime = if (mixset) {
-        bestPartCue(nextAnalysis) ?: incomingMixInPoint(nextAnalysis)
+        mixsetEntryPoint(nextAnalysis) ?: incomingMixInPoint(nextAnalysis)
     } else {
         incomingMixInPoint(nextAnalysis)
     }
@@ -1449,11 +1451,11 @@ fun planTransition(
     } else {
         0.0
     }
-    // In Mixset Mode the handoff aims at the incoming track's best part, not
-    // its intro arrangement — the 50% ceiling still applies.
+    // In Mixset Mode the handoff aims at the buildup foot, not the peak or
+    // the intro arrangement — the 50% ceiling still applies.
     val incomingDropTime = if (mixset) {
         capIncomingEntry(
-            bestPartCue(nextAnalysis) ?: incomingCuePoint(nextAnalysis),
+            mixsetEntryPoint(nextAnalysis) ?: incomingCuePoint(nextAnalysis),
             nextAnalysis, nextLength, mixsetActive = true,
         )
     } else {
