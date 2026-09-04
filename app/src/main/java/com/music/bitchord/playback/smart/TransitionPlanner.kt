@@ -80,6 +80,13 @@ private const val AUTO_FALLBACK_SECONDS = 8.0
 private const val MIN_SMART_DURATION_SECONDS = 45.0
 
 /**
+ * Narrowest overlap the 80%-play floor may squeeze a transition down to. When
+ * the anchor sits so close above the floor that even this does not fit, the
+ * rail stays off and the anchor's own placement stands.
+ */
+private const val MIN_TRANSITION_OVERLAP_SECONDS = 4.0
+
+/**
  * Blueprint §5.7 per-archetype duration budgets, in beats. The old single
  * ceiling (16 beats / 12 s) would strangle the blueprint's long blends — a
  * 32-bar harmonic blend alone is 128 beats — so each archetype gets its own
@@ -287,16 +294,24 @@ private fun hardCutPlan(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
     length: Double,
+    nextLength: Double,
     playbackTime: Double,
     mixAnchor: Double,
     score: CompatibilityScore,
     policyReasons: List<String>,
+    mixset: Boolean = false,
 ): TransitionPlan {
     val beatSeconds = analysis.beatInterval.orZero().takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
-    val cutAt = nearestTimedValue(analysis.downbeats, mixAnchor, tolerance = beatSeconds * 2)
-        ?.coerceIn(0.0, length) ?: mixAnchor.coerceIn(0.0, length)
-    val cue = incomingStartPoint(nextAnalysis)
+    val playFloorSeconds = if (mixset) 0.0 else 0.8 * length
+    val cutAt = (nearestTimedValue(analysis.downbeats, mixAnchor, tolerance = beatSeconds * 2)
+        ?.coerceIn(0.0, length) ?: mixAnchor.coerceIn(0.0, length))
+        .coerceAtLeast(min(playFloorSeconds, length))
+    val cue = if (mixset) {
+        mixsetEntryCue(nextAnalysis, nextLength)
+    } else {
+        capIncomingEntry(incomingStartPoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+    }
     val started = playbackTime >= cutAt
     return TransitionPlan(
         shouldStart = started,
@@ -331,17 +346,34 @@ private fun echoOutPlan(
     mixAnchor: Double,
     score: CompatibilityScore,
     policyReasons: List<String>,
+    mixset: Boolean = false,
 ): TransitionPlan {
     val bpmOut = analysis.bpm.orZero()
     val beatSeconds = if (bpmOut > 0) 60 / bpmOut else 0.5
     val fade = min(32.0 * beatSeconds, min(mixAnchor * 0.6, ABSOLUTE_MAX_TRANSITION_SECONDS))
         .coerceAtLeast(1.0)
     val targetStart = max(0.0, mixAnchor - fade)
-    val transitionStart = alignedTransitionStart(
-        analysis, targetStart, mixAnchor - 0.05,
-        preferEarlier = true, minimum = targetStart,
-    )
-    val cue = incomingStartPoint(nextAnalysis)
+    // The track plays its floor: never start the wash before it (normal mode).
+    val playFloorSeconds = if (mixset) 0.0 else 0.8 * length
+    val transitionStart = if (!mixset && playFloorSeconds < mixAnchor - 1.0) {
+        max(
+            alignedTransitionStart(
+                analysis, targetStart, mixAnchor - 0.05,
+                preferEarlier = true, minimum = targetStart,
+            ),
+            playFloorSeconds,
+        )
+    } else {
+        alignedTransitionStart(
+            analysis, targetStart, mixAnchor - 0.05,
+            preferEarlier = true, minimum = targetStart,
+        )
+    }
+    val cue = if (mixset) {
+        mixsetEntryCue(nextAnalysis, nextLength)
+    } else {
+        capIncomingEntry(incomingStartPoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+    }
     val maxHandoff = nextLength - MIN_INCOMING_CLEARANCE_SECONDS
     val handoff = if (nextLength > 0 && maxHandoff >= cue) min(cue, maxHandoff) else cue
     val started = playbackTime >= transitionStart
@@ -389,22 +421,37 @@ private fun loopCutPlan(
     dropTime: Double,
     score: CompatibilityScore,
     policyReasons: List<String>,
+    mixset: Boolean = false,
 ): TransitionPlan {
     val bpmOut = analysis.bpm.orZero()
     val beatOut = if (bpmOut > 0) 60 / bpmOut else 0.5
     val windowSec = min(6 * 4 * beatOut, min(mixAnchor * 0.6, ABSOLUTE_MAX_TRANSITION_SECONDS))
         .coerceAtLeast(1.0)
-    val transitionStart = alignedTransitionStart(
-        analysis, max(0.0, mixAnchor - windowSec), mixAnchor - 0.05,
-        preferEarlier = true, minimum = max(0.0, mixAnchor - windowSec),
-    )
+    val playFloorSeconds = if (mixset) 0.0 else 0.8 * length
+    val rawStart = max(0.0, mixAnchor - windowSec)
+    val transitionStart = if (!mixset && playFloorSeconds < mixAnchor - 1.0) {
+        max(
+            alignedTransitionStart(
+                analysis, rawStart, mixAnchor - 0.05,
+                preferEarlier = true, minimum = rawStart,
+            ),
+            playFloorSeconds,
+        )
+    } else {
+        alignedTransitionStart(
+            analysis, rawStart, mixAnchor - 0.05,
+            preferEarlier = true, minimum = rawStart,
+        )
+    }
     val bpmIn = nextAnalysis.bpm.orZero()
     val ratio = if (bpmOut > 0 && bpmIn > 0) normalizedTempoRatio(bpmOut, bpmIn) else 1.0
     val rate = if (ratio in 0.9..1.1) 1.0 / ratio else 1.0
     val dropSnap = nearestTimedValue(nextAnalysis.downbeats, dropTime, tolerance = beatOut * 4)
         ?: dropTime
     val buildInSec = (mixAnchor - transitionStart) * rate
-    val cue = max(0.0, dropSnap - buildInSec)
+    // Capping only ever moves the start earlier (a longer quiet build into the
+    // same drop), never later, so the drop arrival this plan promises holds.
+    val cue = capIncomingEntry(max(0.0, dropSnap - buildInSec), nextAnalysis, nextLength, mixset)
     val started = playbackTime >= transitionStart
     return TransitionPlan(
         shouldStart = started,
@@ -571,6 +618,35 @@ internal fun incomingCuePoint(analysis: TrackAnalysis): Double {
 private fun incomingStartPoint(analysis: TrackAnalysis): Double =
     listOfNotNull(analysis.audibleStartTime, analysis.pickupTime, analysis.firstBeat)
         .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
+
+/**
+ * Incoming entries stay in the opening stretch: 30% of the incoming track
+ * normally, 50% in Mixset Mode — with a floor at the audible start so a long
+ * intro is never cued into silence. Applied where musical targets are chosen
+ * (before overlap math derives consistency from them), never to an already
+ * derived cue/handoff pair.
+ */
+private fun capIncomingEntry(
+    cue: Double,
+    nextAnalysis: TrackAnalysis,
+    nextLength: Double,
+    mixsetActive: Boolean,
+): Double {
+    if (!cue.isFinite() || nextLength <= 0) return cue
+    val fraction = if (mixsetActive) 0.5 else 0.3
+    val audible = listOfNotNull(nextAnalysis.audibleStartTime, nextAnalysis.pickupTime)
+        .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
+    return min(cue, max(fraction * nextLength, audible + 2.0)).coerceAtLeast(0.0)
+}
+
+/**
+ * Mixset entry: straight into the best part, skipping the intro — the 50%
+ * ceiling still applies so it stays a part pick, not a deep-album cut.
+ */
+private fun mixsetEntryCue(nextAnalysis: TrackAnalysis, nextLength: Double): Double {
+    val best = bestPartCue(nextAnalysis) ?: incomingStartPoint(nextAnalysis)
+    return capIncomingEntry(best, nextAnalysis, nextLength, mixsetActive = true)
+}
 
 // ---------------------------------------------------------------------------
 // WSOLA-style beat-matched phrase-switch plan (ported from WsolaPlanner.kt)
@@ -831,6 +907,8 @@ fun planWsolaTransition(
     nextAnalysis: TrackAnalysis,
     duration: Double = 0.0,
     nextDuration: Double = 0.0,
+    mixset: Boolean = false,
+    mixAnchorOverride: Double? = null,
 ): WsolaPlanResult {
     val policy = assessTransitionTier(analysis, nextAnalysis)
     if (policy.tier != TransitionTier.BEATMATCHED) {
@@ -848,13 +926,31 @@ fun planWsolaTransition(
     val incomingBeatSeconds = 60 / incomingBpm
     val outgoingBeatSeconds = 60 / outgoingBpm
 
-    val incomingDropTime = incomingMixInPoint(nextAnalysis)
+    val rawDropTime = if (mixset) {
+        bestPartCue(nextAnalysis) ?: incomingMixInPoint(nextAnalysis)
+    } else {
+        incomingMixInPoint(nextAnalysis)
+    }
+    val incomingDropTime = rawDropTime
+        ?.takeIf { it.isFinite() && it >= 0 }
+        ?.let { capIncomingEntry(it, nextAnalysis, incomingLength, mixset) }
     if (incomingDropTime == null || !incomingDropTime.isFinite() || incomingDropTime < 0) {
         return WsolaPlanResult.Refused("incoming-mix-in")
     }
 
     val contentEnd = analysis.contentEndTime.orZero().takeIf { it != 0.0 } ?: outgoingLength
-    val mixOutAnchor = resolveMixOutAnchor(analysis, contentEnd = contentEnd, duration = outgoingLength)
+    // In Mixset Mode the caller hands down the peak anchor it already
+    // resolved: re-resolving here would silently move the window back to the
+    // tail and the early cut would never happen.
+    val mixOutAnchor = if (mixset && mixAnchorOverride != null && mixAnchorOverride.isFinite()) {
+        MixOutAnchor(
+            time = mixAnchorOverride.coerceIn(0.0, outgoingLength),
+            type = "mixset_peak",
+            discardedMusicSeconds = max(0.0, outgoingLength - mixAnchorOverride),
+        )
+    } else {
+        resolveMixOutAnchor(analysis, contentEnd = contentEnd, duration = outgoingLength)
+    }
     val unshiftedOverlapEnd = min(outgoingLength, mixOutAnchor.time)
     val outgoingArrangementOverlap =
         if (mixOutAnchor.type == "content_end") {
@@ -984,6 +1080,8 @@ private fun phraseSwitch(
     nextAnalysis: TrackAnalysis,
     length: Double,
     nextLength: Double,
+    mixset: Boolean = false,
+    mixAnchor: Double = 0.0,
 ): TransitionPlan? {
     if (!harmonicallyCompatible(trustedKey(analysis), trustedKey(nextAnalysis))) return null
 
@@ -992,6 +1090,8 @@ private fun phraseSwitch(
         nextAnalysis = nextAnalysis,
         duration = length,
         nextDuration = nextLength,
+        mixset = mixset,
+        mixAnchorOverride = mixAnchor.takeIf { mixset },
     ) as? WsolaPlanResult.Planned ?: return null
 
     val overlap = planned.transitionEnd - planned.transitionStart
@@ -1109,6 +1209,8 @@ private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrac
  *   played through in order, which is the sole case that earns a gapless
  *   handoff instead of a mix.
  * @param currentTime the outgoing track's playhead, in seconds.
+ * @param mixset Mixset Mode: the outgoing window becomes ~90 s past the
+ *   track's best part and the 80%-play floor below does not apply.
  */
 fun planTransition(
     analysis: TrackAnalysis = TrackAnalysis(),
@@ -1121,6 +1223,7 @@ fun planTransition(
     minFadeSeconds: Double = 1.0,
     mode: CrossfadeMode = CrossfadeMode.STANDARD,
     albumSequential: Boolean = false,
+    mixset: Boolean = false,
 ): TransitionPlan {
     val length = max(duration.orZero(), trackDurationSeconds(currentTrack))
     val playbackTime = max(0.0, currentTime.orZero())
@@ -1141,18 +1244,29 @@ fun planTransition(
     } else {
         length
     }
-    // Blueprint §7: mix-out candidates live in [length-3min, length-30s] with a
-    // length-60s fallback. Tracks too short to survive either keep the old
-    // behavior exactly.
-    val candidateWindow = (max(0.0, length - 180.0)..(length - 30.0))
-        .takeIf { length >= 90.0 && it.start < it.endInclusive }
-    val mixOutAnchor = resolveMixOutAnchor(
-        analysis,
-        contentEnd = finalMixAnchor,
-        duration = length,
-        allowedWindow = candidateWindow,
-        fallbackTime = if (length >= 90.0) length - 60.0 else null,
-    )
+    // The outgoing track plays at least 80% in normal mode: candidates live
+    // in [0.8*length, length-15s] with a max(length-45s, 0.8*length)
+    // fallback. Tracks too short to survive either keep the old behavior
+    // exactly. Mixset Mode replaces the floor with its own early anchor, so
+    // the floor below is zero when it is on.
+    val playFloorSeconds = if (mixset) 0.0 else 0.8 * length
+    val candidateWindow = if (mixset) {
+        null
+    } else {
+        (max(0.0, playFloorSeconds)..(length - 15.0))
+            .takeIf { it.start < it.endInclusive }
+    }
+    val mixOutAnchor = if (mixset) {
+        mixsetMixOutAnchor(analysis, length, playbackTime)
+    } else {
+        resolveMixOutAnchor(
+            analysis,
+            contentEnd = finalMixAnchor,
+            duration = length,
+            allowedWindow = candidateWindow,
+            fallbackTime = max(length - 45.0, playFloorSeconds).takeIf { length >= 60.0 },
+        )
+    }
     val hasInteriorMixOut = mixOutAnchor.time < finalMixAnchor - 1
 
     if (albumSequential && sameAlbum(currentTrack, nextTrack) && !hasInteriorMixOut) {
@@ -1186,16 +1300,23 @@ fun planTransition(
     }
 
     val preferredMixAnchor = min(length, mixOutAnchor.time)
+    // A mixset anchor is interior by design — the playhead reaching it is the
+    // transition arriving, not a missed window to abandon for the track end.
     val mixAnchor =
-        if (playbackTime >= preferredMixAnchor - 0.05 && preferredMixAnchor < finalMixAnchor - 1) {
+        if (!mixset && playbackTime >= preferredMixAnchor - 0.05 && preferredMixAnchor < finalMixAnchor - 1) {
             finalMixAnchor
         } else {
             preferredMixAnchor
         }
 
+    val nextLength = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
+
     val policy = assessTransitionTier(analysis, nextAnalysis)
     if (policy.tier == TransitionTier.PLAIN_CROSSFADE) {
+        // Even the fallback fade respects the play floor; if the anchor sits
+        // on the floor itself the fade degrades to zero rather than negative.
         val transitionStart = max(0.0, mixAnchor - standardFade)
+            .coerceAtLeast(min(playFloorSeconds, mixAnchor))
         val started = playbackTime >= transitionStart
         return TransitionPlan(
             shouldStart = started,
@@ -1204,22 +1325,27 @@ fun planTransition(
             transitionEnd = mixAnchor,
             fadeSeconds = mixAnchor - transitionStart,
             transitionStyle = TransitionStyle.EQUAL_POWER,
-            incomingCueTime = incomingStartPoint(nextAnalysis),
+            incomingCueTime = if (mixset) {
+                mixsetEntryCue(nextAnalysis, nextLength)
+            } else {
+                capIncomingEntry(incomingStartPoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+            },
             policyReasons = policy.reasons,
             reason = if (started) "smart-plain-crossfade" else "before-plain-crossfade-window",
         )
     }
 
-    val nextLength = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
-
     // Blueprint §5.6: score the pair once on proxy points, then route to the
     // archetype's implementation. phraseSwitch below is the HARMONIC_BLEND
     // engine and the adaptive tail is SMOOTH_CROSSFADE/FILTER_SWEEP; the other
     // three archetypes branch to their own planners here and never reach them.
-    val proxyEntry = incomingCuePoint(nextAnalysis)
+    val proxyEntry = capIncomingEntry(incomingCuePoint(nextAnalysis), nextAnalysis, nextLength, mixset)
     val proxyScore = scoreCompatibility(analysis, nextAnalysis, mixAnchor, proxyEntry)
     if (proxyScore.overall < SCORE_ACCEPTABLE) {
-        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+        return hardCutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        )
     }
     val dropInB = firstDropSec(nextAnalysis)
     val highEnergyA = isHighEnergyAt(analysis, mixAnchor)
@@ -1235,12 +1361,15 @@ fun planTransition(
         (PitchTracker.pitchSemitoneGap(analysis.vocalPitchMedianHz, nextAnalysis.vocalPitchMedianHz)
             ?: Double.POSITIVE_INFINITY) < 0.5
     ) {
-        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+        return hardCutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        )
     }
     if (selectedType == TransitionType.ECHO_REVERB_OUT) {
         return echoOutPlan(
             analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyScore, policy.reasons,
+            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
         )
     }
     if (selectedType == TransitionType.LOOP_CUT_DROP && dropInB != null) {
@@ -1252,16 +1381,22 @@ fun planTransition(
         if (mixAnchor >= 32 * beatOutA) {
             return loopCutPlan(
                 analysis, nextAnalysis, length, nextLength,
-                playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons,
+                playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons, mixset,
             )
         }
-        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+        return hardCutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        )
     }
     if (selectedType == TransitionType.HARD_CUT) {
-        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+        return hardCutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        )
     }
 
-    phraseSwitch(analysis, nextAnalysis, length, nextLength)
+    phraseSwitch(analysis, nextAnalysis, length, nextLength, mixset, mixAnchor)
         ?.takeIf { playbackTime < it.transitionEnd }
         ?.let { plan ->
             val started = playbackTime >= plan.transitionStart
@@ -1289,11 +1424,17 @@ fun planTransition(
             0.0
         }
     val mixEnd = max(0.0, mixAnchor - outgoingArrangementOverlap)
+    // The track plays its floor: in normal mode the overlap may not reach
+    // back past 80% of the track. Mixset cuts between peaks with short
+    // blends, so its ceiling is 16 beats on top of the usual rails.
+    val typeBeats = min(maxBeatsFor(selectedType), if (mixset) MIXSET_MAX_BEATS else Double.POSITIVE_INFINITY)
+    val floorRail = mixEnd - playFloorSeconds
     val maximumOverlap = minOf(
-        if (handoffBpm > 0) (maxBeatsFor(selectedType) * 60) / handoffBpm else AUTO_TRANSITION_MAX_SECONDS,
+        if (handoffBpm > 0) (typeBeats * 60) / handoffBpm else AUTO_TRANSITION_MAX_SECONDS,
         ABSOLUTE_MAX_TRANSITION_SECONDS,
         mixEnd * 0.6,
         if (nextLength > 0) nextLength * 0.6 else AUTO_TRANSITION_MAX_SECONDS,
+        if (!mixset && floorRail >= MIN_TRANSITION_OVERLAP_SECONDS) floorRail else Double.POSITIVE_INFINITY,
     )
     val handoffBeats = if (sameBeatBlend) 8 else 4
     val beatSeconds = if (handoffBpm > 0) 60 / handoffBpm else 0.5
@@ -1308,7 +1449,16 @@ fun planTransition(
     } else {
         0.0
     }
-    val incomingDropTime = incomingCuePoint(nextAnalysis)
+    // In Mixset Mode the handoff aims at the incoming track's best part, not
+    // its intro arrangement — the 50% ceiling still applies.
+    val incomingDropTime = if (mixset) {
+        capIncomingEntry(
+            bestPartCue(nextAnalysis) ?: incomingCuePoint(nextAnalysis),
+            nextAnalysis, nextLength, mixsetActive = true,
+        )
+    } else {
+        capIncomingEntry(incomingCuePoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+    }
     val alignedIncomingBpm = alignTempoOctave(currentBpm, nextBpm)
     val requestedIncomingHandoff =
         if (sameBeatBlend && alignedIncomingBpm > 0) {

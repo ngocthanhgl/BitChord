@@ -577,6 +577,7 @@ class CrossfadeController(
             duration = duration / 1000.0,
             fadeSeconds = fallbackSeconds,
             mode = CrossfadeMode.SMART,
+            mixset = AppSettings.mixsetModeEnabled.value && AppSettings.smartFadeEnabled.value,
         )
         // One line per distinct verdict rather than one per 250ms tick, so the
         // log says what the planner decided for this pair without burying it.

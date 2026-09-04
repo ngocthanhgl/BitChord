@@ -848,6 +848,81 @@ fun scoreCompatibility(
     return CompatibilityScore(bpm, key, energy, structure, vocal, overall)
 }
 
+/** Mixset Mode: each track plays about this long of its best part before the cut. */
+const val MIXSET_PLAY_SECONDS = 90.0
+/** How far around that point the anchor may wander for a phrase and calm vocal. */
+const val MIXSET_ANCHOR_SEARCH_SECONDS = 15.0
+/** Mixset blends are cuts between peaks, never long beds: overlap ceiling in beats. */
+const val MIXSET_MAX_BEATS = 16.0
+
+/**
+ * The track's best part: its drop, else its loudest moment past the intro,
+ * else the analyzed mix-in. One deterministic function both sides share, so
+ * the outgoing cut point and the incoming cue agree without the controller
+ * having to remember where the current track started.
+ */
+fun bestPartCue(analysis: TrackAnalysis): Double? {
+    firstDropSec(analysis)?.let { return it }
+    maxEnergyTimeAfterIntro(analysis)?.let { return it }
+    return analysis.mixInTime.takeIf { it.isFinite() && it > 0 }
+}
+
+private fun maxEnergyTimeAfterIntro(analysis: TrackAnalysis): Double? {
+    val curve = analysis.energyCurve
+    if (curve.isEmpty()) return null
+    val introEnd = analysis.introEndTime.orZero()
+    var best: Double? = null
+    var bestEnergy = Double.NEGATIVE_INFINITY
+    for (point in curve) {
+        if (!point.time.isFinite() || !point.energy.isFinite()) continue
+        if (point.time < introEnd) continue
+        if (point.energy > bestEnergy) {
+            bestEnergy = point.energy
+            best = point.time
+        }
+    }
+    return best
+}
+
+/**
+ * Mixset outgoing anchor: [MIXSET_PLAY_SECONDS] past the track's best part,
+ * snapped to the nearest phrase boundary or downbeat inside
+ * ±[MIXSET_ANCHOR_SEARCH_SECONDS] whose surroundings sing the least. A rescue
+ * anchor just ahead of the playhead when it is already past the window —
+ * a manually started track plays from 0, not from its best cue, so the
+ * computed window can already be behind.
+ */
+fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Double): MixOutAnchor {
+    val rescue = MixOutAnchor(
+        time = min(length, playbackTime + 15.0).coerceAtLeast(0.0),
+        type = "mixset_rescue",
+        discardedMusicSeconds = 0.0,
+    )
+    val entry = bestPartCue(analysis) ?: return rescue
+    val base = entry + MIXSET_PLAY_SECONDS
+    if (playbackTime >= base - 10.0) return rescue
+    val from = max(0.0, base - MIXSET_ANCHOR_SEARCH_SECONDS)
+    val to = min(length, base + MIXSET_ANCHOR_SEARCH_SECONDS)
+    if (to <= from) return rescue
+    val grid = (analysis.phraseBoundaries + analysis.downbeats)
+        .filter { it.isFinite() && it in from..to }
+        .distinct()
+    // A calm landing matters more than exact seconds: singing over the cut is
+    // what makes a mixset transition sound late. Measured-calm wins, unknown
+    // is second choice, singing is last.
+    val chosen = grid.minByOrNull { candidate ->
+        val vocal = vocalActivityBetween(analysis, candidate - 2.0, candidate + 2.0)
+        val penalty = when {
+            vocal == null -> 2.0
+            vocal < 0.4 -> 0.0
+            else -> 8.0
+        }
+        abs(candidate - base) + penalty
+    } ?: base.coerceIn(from, to)
+    val time = chosen.coerceIn(0.0, max(0.0, length - 2.0))
+    return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
+}
+
 /**
  * Blueprint §5.4 drop detection: the first local energy maximum past the
  * intro that clears 1.5x the track mean — where LOOP_CUT_DROP enters the
