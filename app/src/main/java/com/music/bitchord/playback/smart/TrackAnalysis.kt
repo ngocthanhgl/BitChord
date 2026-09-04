@@ -103,6 +103,21 @@ data class TrackAnalysis(
     val vocalPitchMedianHz: Double = 0.0,
     /** Mean confidence over the same voiced frames, 0..1. Trusted at 0.5. */
     val pitchConfidence: Double = 0.0,
+    /**
+     * v2 §2b: structural section labels over the full track, ascending.
+     * Computed once by [StructureDetector] from the transient fine curves and
+     * persisted — the fine curves themselves are never stored. Empty until a
+     * whole-track analysis has run; callers fall back to energy heuristics.
+     */
+    val structureMap: List<StructureLabel> = emptyList(),
+    /** v2 §2b: first DROP label start, else null (see `firstDropSec`). */
+    val structuredDropSec: Double? = null,
+    /** v2 §2b: first BREAK label start, else null. */
+    val structuredBreakSec: Double? = null,
+    /** v2 §2b: first OUTRO label start, else null. */
+    val structuredOutroSec: Double? = null,
+    /** v2 §4: §4-gradient buildup foot, else null (see `buildupStart`). */
+    val structuredBuildupSec: Double? = null,
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing
@@ -124,6 +139,12 @@ data class TrackAnalysis(
 
 /** One point on an energy curve. [energy] is in whatever scale the analyzer chose. */
 data class EnergySample(val time: Double, val energy: Double)
+
+/** v2 §2b: one structural section label. Times are track-timeline seconds. */
+data class StructureLabel(val start: Double, val end: Double, val type: StructureSectionType)
+
+/** v2 §2b: the eight section kinds the detector emits, first-match-wins. */
+enum class StructureSectionType { DROP, BUILD, BREAK, VERSE, CHORUS, INTRO, OUTRO, AMBIENT }
 
 /**
  * A candidate point for a transition to enter or leave on. [score] is the
@@ -160,6 +181,8 @@ data class TransitionPolicyVerdict(
     /** Ordered most-disqualifying first, so `reasons.first()` is the routing verdict. */
     val reasons: List<String>,
     val beatConfidence: Double,
+    /** v2 §5a: harmonic tempo ratio locking bpmA onto bpmB (1.0 = unison). 1.0 by default. */
+    val matchedRatio: Double = 1.0,
 )
 
 /**
@@ -169,6 +192,11 @@ data class TransitionPolicyVerdict(
 enum class TransitionTier {
     /** Both grids trusted and the tempi sit within the transparent stretch window. */
     BEATMATCHED,
+
+    /** v2 §1: tempi lock through a harmonic ratio (3:2, 4:3, half/double...),
+     * not unison — both decks stretch to a shared BPM. Sits between
+     * BEATMATCHED and DJ_ASSISTED: beat math is allowed, unison math is not. */
+    HALF_TIME,
 
     /** Beat-quantized anchors and EQ handoffs are allowed; time-stretching is not. */
     DJ_ASSISTED,
