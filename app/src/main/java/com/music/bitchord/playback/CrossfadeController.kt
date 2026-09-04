@@ -1376,7 +1376,9 @@ class CrossfadeController(
                 // incoming track waits out its delay before ramping in.
                 val freezeAt = render.reverbFreezeAtSec
                 if (freezeAt != null && freezeAt.isFinite()) {
-                    val spanSec = max(1f, render.spanMs / 1000f)
+                    // No span field on Render: the plan stamps the overlap it
+                    // sized into overlapSeconds, and the rides read it back.
+                    val spanSec = render.overlapSeconds.toFloat().coerceAtLeast(1f)
                     val wetRamp = (progress * spanSec / HEAVY_CLASH_WET_RAMP_SEC).coerceIn(0f, 1f)
                     val frozen = progress * spanSec >= freezeAt.toFloat()
                     filters.outgoing(20000f, 20f)
@@ -1388,7 +1390,7 @@ class CrossfadeController(
                     filters.incoming(20000f, 600f * (1f - bOpen) + 20f * bOpen)
                     echoFilters.outgoing(HEAVY_CLASH_ECHO_WET * wetRamp, render.echoBeatSeconds.toFloat())
                     echoFilters.incoming(0f, 0f)
-                    reverbFilters.outgoing(render.reverbAmount * wetRamp, frozen)
+                    reverbFilters.outgoing((render.reverbAmount * wetRamp).toFloat(), frozen)
                     reverbFilters.incoming(0f, false)
                 } else {
                     val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
@@ -1442,13 +1444,13 @@ class CrossfadeController(
                 // the gap (nothing musical lives there anyway), the incoming
                 // bass fades linearly over 2 s — a tilt, not a swap.
                 filters.outgoing(20000f, 200f)
-                val spanSec = max(1f, render.spanMs / 1000f)
+                val spanSec = render.overlapSeconds.toFloat().coerceAtLeast(1f)
                 val bassOpen = (progress * spanSec / 2f).coerceIn(0f, 1f)
                 filters.incoming(20000f, 200f * (1f - bassOpen) + 20f * bassOpen)
                 val outWet = if (progress < 0.5f) {
-                    render.reverbAmount * (progress / 0.5f)
+                    (render.reverbAmount * (progress / 0.5f)).toFloat()
                 } else {
-                    render.reverbAmount
+                    render.reverbAmount.toFloat()
                 }
                 reverbFilters.outgoing(outWet, false)
                 val inWet = (PLAIN_DISSOLVE_IN_WET -

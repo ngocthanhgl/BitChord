@@ -1,7 +1,6 @@
 package com.music.bitchord.playback.smart
 
 import kotlin.math.abs
-import kotlin.math.maxOf
 
 /**
  * v2 §2b structural section detector. Pure Kotlin, no PCM, no Android — every
@@ -105,7 +104,7 @@ object StructureDetector {
         val trackPeak = windows.maxOf { it.rmsMean }
 
         fun slopeBack(index: Int, windowsBack: Int, pick: (WindowStats) -> Double): Double {
-            val from = maxOf(0, index - windowsBack)
+            val from = (index - windowsBack).coerceAtLeast(0)
             val xs = (from..index).map { windows[it].start }
             val ys = (from..index).map { pick(windows[it]) }
             return linearSlope(xs, ys)
@@ -175,7 +174,7 @@ object StructureDetector {
      * above-mean rms in the 4 windows back.
      */
     private fun precededByHighEnergy(windows: List<WindowStats>, index: Int, trackMean: Double): Boolean {
-        for (i in maxOf(0, index - 4) until index) {
+        for (i in (index - 4).coerceAtLeast(0) until index) {
             if (windows[i].rmsMean > 1.05 * trackMean) return true
         }
         return false
@@ -184,7 +183,7 @@ object StructureDetector {
     private fun outroFalling(windows: List<WindowStats>, index: Int): Boolean {
         // DEVIATION: strict monotonic fall over 16 bars never holds on noisy
         // data — use negative linear slope plus last-means-below-first.
-        val from = maxOf(0, index - 15)
+        val from = (index - 15).coerceAtLeast(0)
         val xs = (from..index).map { windows[it].start }
         val ys = (from..index).map { windows[it].rmsMean }
         if (linearSlope(xs, ys) >= 0) return false
@@ -197,7 +196,7 @@ object StructureDetector {
         for (label in drop(1)) {
             val last = out.last()
             if (label.type == last.type && label.start <= last.end + 0.01) {
-                out[out.lastIndex] = last.copy(end = maxOf(last.end, label.end))
+                out[out.lastIndex] = last.copy(end = last.end.coerceAtLeast(label.end))
             } else {
                 out += label
             }
