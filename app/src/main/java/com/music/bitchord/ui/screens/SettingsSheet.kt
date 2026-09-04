@@ -327,22 +327,9 @@ fun SettingsScreen(
         }
 
         SettingsGroup(header = stringResource(R.string.playback)) {
-            // Automix decides its own length from each pair of tracks —
-            // tempo, key, structure — so it replaces the manual slider rather
-            // than needing it set to anything first.
-            if (!smartFade) {
-                SliderRow(
-                    icon = Icons.Rounded.Waves,
-                    title = stringResource(R.string.crossfade),
-                    subtitle = stringResource(R.string.crossfade_subtitle),
-                    value = if (crossfade == 0) stringResource(R.string.off) else "${crossfade}s",
-                    sliderValue = crossfade.toFloat(),
-                    onSliderValue = { AppSettings.setCrossfadeSeconds(it.roundToInt()) },
-                    valueRange = 0f..12f,
-                    steps = 11,
-                )
-                RowDivider()
-            }
+            // Automix first: it decides its own length from each pair of
+            // tracks — tempo, key, structure — so it replaces the manual
+            // slider rather than needing it set to anything first.
             SettingsRow(
                 icon = Icons.Rounded.AutoAwesome,
                 title = stringResource(R.string.automix),
@@ -364,6 +351,21 @@ fun SettingsScreen(
                 onClick = { AppSettings.setSmartFadeEnabled(!smartFade) },
             )
             RowDivider()
+            // Manual fallback, only when Automix is off — it has nothing to
+            // add while Automix is timing the transition itself.
+            if (!smartFade) {
+                SliderRow(
+                    icon = Icons.Rounded.Waves,
+                    title = stringResource(R.string.crossfade),
+                    subtitle = stringResource(R.string.crossfade_subtitle),
+                    value = if (crossfade == 0) stringResource(R.string.off) else "${crossfade}s",
+                    sliderValue = crossfade.toFloat(),
+                    onSliderValue = { AppSettings.setCrossfadeSeconds(it.roundToInt()) },
+                    valueRange = 0f..12f,
+                    steps = 11,
+                )
+                RowDivider()
+            }
             SettingsRow(
                 icon = Icons.AutoMirrored.Rounded.VolumeOff,
                 title = stringResource(R.string.skip_silence),
