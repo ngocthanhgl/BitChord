@@ -153,6 +153,14 @@ class PlaybackService : MediaSessionService() {
     private var activeEcho: EchoSendProcessor = echoSendA
     private var spareEcho: EchoSendProcessor = echoSendB
 
+    // v2 §9: one reverb send per player, after the echo send so the tail
+    // holds the echo wash too. Same role-swap contract as filters/echo.
+    private val reverbSendA = ReverbProcessor()
+    private val reverbSendB = ReverbProcessor()
+
+    private var activeReverb: ReverbProcessor = reverbSendA
+    private var spareReverb: ReverbProcessor = reverbSendB
+
     /** Automix's DSP analyzer — see [com.music.bitchord.playback.smart.TrackAnalyzer]. */
     private val trackAnalyzer = com.music.bitchord.playback.smart.TrackAnalyzer(this, AudioCache)
 
@@ -833,8 +841,8 @@ class PlaybackService : MediaSessionService() {
         mediaSourceFactory = DefaultMediaSourceFactory(AudioCache.playbackFactory(defaultDataSourceFactory))
             .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
 
-        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, ownsSession = true)
-        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, ownsSession = false)
+        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, ownsSession = true)
+        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, ownsSession = false)
         player = exoPlayer
         spare = sparePlayer
         // Both sinks feed the same session id, so the system equalizer and any
@@ -904,6 +912,15 @@ class PlaybackService : MediaSessionService() {
 
                 override fun outgoing(wet: Float, delaySeconds: Float) =
                     spareEcho.setEcho(wet, delaySeconds)
+            },
+            // Same role wiring as echo: after the handoff the incoming track
+            // sits on the session player and the outgoing one on the spare.
+            reverbFilters = object : ReverbFilters {
+                override fun incoming(wet: Float, freeze: Boolean) =
+                    activeReverb.setReverb(wet, freeze)
+
+                override fun outgoing(wet: Float, freeze: Boolean) =
+                    spareReverb.setReverb(wet, freeze)
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
@@ -1122,9 +1139,10 @@ class PlaybackService : MediaSessionService() {
         spatial: SpatialAudioProcessor,
         filter: TransitionFilterProcessor,
         echo: EchoSendProcessor,
+        reverb: ReverbProcessor,
         ownsSession: Boolean,
     ): ExoPlayer = ExoPlayer.Builder(this)
-        .setRenderersFactory(silenceSkippingRenderers(spatial, filter, echo))
+        .setRenderersFactory(silenceSkippingRenderers(spatial, filter, echo, reverb))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
         .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
@@ -1159,6 +1177,9 @@ class PlaybackService : MediaSessionService() {
         val heldEcho = activeEcho
         activeEcho = spareEcho
         spareEcho = heldEcho
+        val heldReverb = activeReverb
+        activeReverb = spareReverb
+        spareReverb = heldReverb
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
@@ -2891,6 +2912,7 @@ class PlaybackService : MediaSessionService() {
         spatial: SpatialAudioProcessor,
         transition: TransitionFilterProcessor,
         echo: EchoSendProcessor,
+        reverb: ReverbProcessor,
     ) = object : DefaultRenderersFactory(this) {
         override fun buildAudioSink(
             context: Context,
@@ -2905,8 +2927,10 @@ class PlaybackService : MediaSessionService() {
                     // property of the track, and a bass swap that ran before it
                     // would have its own low end fed back in by the crossfeed.
                     // The echo send rides after the filter so the tail it throws
-                    // is the filtered signal, not the raw one.
-                    arrayOf(spatial, transition, echo),
+                    // is the filtered signal, not the raw one. The reverb send
+                    // rides after the echo (v2 §9) so its tail holds the echo
+                    // wash too — a dissolve-ending needs one space, not two.
+                    arrayOf(spatial, transition, echo, reverb),
                     SilenceSkippingAudioProcessor(
                         MIN_SILENCE_US,
                         SilenceSkippingAudioProcessor.DEFAULT_SILENCE_RETENTION_RATIO,
