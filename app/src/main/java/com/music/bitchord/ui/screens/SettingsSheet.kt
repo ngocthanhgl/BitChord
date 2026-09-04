@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Notes
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
+import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.Animation
 import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.AutoAwesome
@@ -155,6 +156,7 @@ fun SettingsScreen(
     val metered by AppSettings.meteredConnection.collectAsStateWithLifecycle()
     val crossfade by AppSettings.crossfadeSeconds.collectAsStateWithLifecycle()
     val smartFade by AppSettings.smartFadeEnabled.collectAsStateWithLifecycle()
+    val mixset by AppSettings.mixsetModeEnabled.collectAsStateWithLifecycle()
     val skipSilence by AppSettings.skipSilence.collectAsStateWithLifecycle()
     val spatialAudio by AppSettings.spatialAudio.collectAsStateWithLifecycle()
     val nerdStats by AppSettings.showNerdStats.collectAsStateWithLifecycle()
@@ -351,6 +353,28 @@ fun SettingsScreen(
                 onClick = { AppSettings.setSmartFadeEnabled(!smartFade) },
             )
             RowDivider()
+            // Mixset unfolds right below Automix while it is on: a full row
+            // with the album icon so its text lines up with the icon rows,
+            // not the indented sub-rows.
+            if (smartFade) {
+                SettingsRow(
+                    icon = Icons.Rounded.Album,
+                    title = stringResource(R.string.mixset),
+                    subtitle = stringResource(R.string.mixset_subtitle),
+                    trailing = {
+                        Switch(
+                            checked = mixset,
+                            onCheckedChange = AppSettings::setMixsetModeEnabled,
+                            colors = SwitchDefaults.colors(
+                                checkedTrackColor = MaterialTheme.colorScheme.primary,
+                                checkedBorderColor = MaterialTheme.colorScheme.primary,
+                            ),
+                        )
+                    },
+                    onClick = { AppSettings.setMixsetModeEnabled(!mixset) },
+                )
+                RowDivider()
+            }
             // Manual fallback, only when Automix is off — it has nothing to
             // add while Automix is timing the transition itself.
             if (!smartFade) {

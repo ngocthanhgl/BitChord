@@ -149,6 +149,12 @@ object AppSettings {
      * See [com.music.bitchord.playback.smart.TransitionPlanner].
      */
     val smartFadeEnabled = MutableStateFlow(false)
+    /**
+     * Mixset flavor of Automix: each track plays ~90 s of its highest-energy
+     * part, cued straight into it, then cuts to the next. Only read when
+     * [smartFadeEnabled] is on — the row itself only renders then.
+     */
+    val mixsetModeEnabled = MutableStateFlow(false)
     val skipSilence = MutableStateFlow(false)
 
     /**
@@ -444,6 +450,7 @@ object AppSettings {
         wifiOnlyDownloads.value = prefs.getBoolean(KEY_WIFI_ONLY_DOWNLOADS, true)
         crossfadeSeconds.value = prefs.getInt(KEY_CROSSFADE, 0)
         smartFadeEnabled.value = prefs.getBoolean(KEY_SMART_FADE, false)
+        mixsetModeEnabled.value = prefs.getBoolean(KEY_MIXSET_MODE, false)
         skipSilence.value = prefs.getBoolean(KEY_SKIP_SILENCE, false)
         spatialAudio.value = prefs.getBoolean(KEY_SPATIAL_AUDIO, false)
         playbackSpeed.value = prefs.getFloat(KEY_SPEED, 1.0f)
@@ -630,6 +637,11 @@ object AppSettings {
     fun setSmartFadeEnabled(value: Boolean) {
         smartFadeEnabled.value = value
         prefs.edit().putBoolean(KEY_SMART_FADE, value).apply()
+    }
+
+    fun setMixsetModeEnabled(value: Boolean) {
+        mixsetModeEnabled.value = value
+        prefs.edit().putBoolean(KEY_MIXSET_MODE, value).apply()
     }
 
     fun setSkipSilence(value: Boolean) {
@@ -1051,6 +1063,7 @@ object AppSettings {
     private const val KEY_LOSSLESS = "lossless_audio"
     private const val KEY_CROSSFADE = "crossfade_seconds"
     private const val KEY_SMART_FADE = "smart_fade_enabled"
+    private const val KEY_MIXSET_MODE = "mixset_mode_enabled"
     private const val KEY_SKIP_SILENCE = "skip_silence"
     private const val KEY_SPATIAL_AUDIO = "spatial_audio"
     private const val KEY_SPEED = "playback_speed"

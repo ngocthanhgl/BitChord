@@ -1,0 +1,240 @@
+package com.music.bitchord
+
+import com.music.bitchord.playback.smart.CrossfadeMode
+import com.music.bitchord.playback.smart.EnergySample
+import com.music.bitchord.playback.smart.MixCandidate
+import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.bestPartCue
+import com.music.bitchord.playback.smart.mixsetMixOutAnchor
+import com.music.bitchord.playback.smart.planTransition
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Part A (80/30 rules) + Part B (Mixset Mode) guarantees: a normal-mode pair
+ * plays the outgoing track's floor and enters the incoming track's opening
+ * stretch, while mixset cuts early off the best part with a capped entry.
+ * Pure JVM — synthetic curves and grids, no device, no analysis.
+ */
+class MixsetTest {
+
+    private fun curve(
+        length: Double,
+        step: Double = 1.0,
+        energyAt: (Double) -> Double = { 1.0 },
+    ): List<EnergySample> {
+        val points = mutableListOf<EnergySample>()
+        var t = 0.0
+        while (t <= length) {
+            points += EnergySample(t, energyAt(t))
+            t += step
+        }
+        return points
+    }
+
+    private fun calmMask(size: Int, value: Double = 0.1): List<Double> =
+        List(size) { value }
+
+    private fun strongPair(
+        outLength: Double = 200.0,
+        inLength: Double = 180.0,
+        outEnergyAt: (Double) -> Double = { t -> if (t < 170.0) 1.0 else 0.0 },
+        inDropAt: Double? = null,
+        inMixIn: List<MixCandidate> = listOf(MixCandidate(100.0, 1.0, "main_drop")),
+    ): Pair<TrackAnalysis, TrackAnalysis> {
+        val outCurve = curve(outLength, energyAt = outEnergyAt)
+        val out = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = outLength,
+            bpm = 120.0,
+            beatInterval = 0.5,
+            beatConfidence = 0.9,
+            downbeats = (0..(outLength / 2).toInt()).map { it * 2.0 },
+            phraseBoundaries = listOf(32.0, 64.0, 96.0, 128.0, 160.0),
+            firstBeat = 0.0,
+            key = "C major",
+            keyConfidence = 0.9,
+            audibleStartTime = 0.0,
+            pickupTime = 0.5,
+            introEndTime = 12.0,
+            contentEndTime = outLength,
+            mixInTime = 8.0,
+            mixOutCandidates = listOf(MixCandidate(170.0, 0.9, "energy_cliff")),
+            energyCurve = outCurve,
+            vocalActivityMask = calmMask(outCurve.size),
+        )
+        val inCurve = curve(inLength, energyAt = { t ->
+            if (inDropAt != null && t >= inDropAt - 1.0 && t <= inDropAt + 1.0) 3.0 else 1.0
+        })
+        val next = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = inLength,
+            bpm = 120.0,
+            beatInterval = 0.5,
+            beatConfidence = 0.9,
+            downbeats = (0..(inLength / 2).toInt()).map { it * 2.0 },
+            phraseBoundaries = listOf(32.0, 64.0, 96.0, 128.0),
+            firstBeat = 0.0,
+            key = "C major",
+            keyConfidence = 0.9,
+            audibleStartTime = 0.0,
+            pickupTime = 0.5,
+            introEndTime = 12.0,
+            contentEndTime = inLength,
+            mixInTime = 8.0,
+            mixInCandidates = inMixIn,
+            energyCurve = inCurve,
+            vocalActivityMask = calmMask(inCurve.size),
+        )
+        return out to next
+    }
+
+    // -- bestPartCue ----------------------------------------------------------
+
+    @Test
+    fun bestPartCue_returnsFirstDrop() {
+        val length = 200.0
+        // A lone local maximum clearing 1.5x the mean past the intro.
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 2.5 else 1.0 })
+        val analysis = TrackAnalysis(introEndTime = 10.0, energyCurve = points)
+        assertEquals(60.0, bestPartCue(analysis)!!, 1e-6)
+    }
+
+    @Test
+    fun bestPartCue_fallsBackToMaxEnergy() {
+        val length = 200.0
+        // Loudest moment stays under the 1.5x drop threshold: no drop, peak wins.
+        val points = curve(length, energyAt = { t -> if (t == 100.0) 1.2 else 1.0 })
+        val analysis = TrackAnalysis(introEndTime = 10.0, energyCurve = points)
+        assertEquals(100.0, bestPartCue(analysis)!!, 1e-6)
+    }
+
+    @Test
+    fun bestPartCue_fallsBackToMixInThenNull() {
+        assertEquals(
+            12.5,
+            bestPartCue(TrackAnalysis(mixInTime = 12.5))!!,
+            1e-6,
+        )
+        assertNull(bestPartCue(TrackAnalysis()))
+    }
+
+    // -- mixsetMixOutAnchor ----------------------------------------------------
+
+    @Test
+    fun mixsetAnchor_snapsNinetySecondsPastDrop() {
+        val length = 300.0
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..150).map { it * 2.0 },
+            phraseBoundaries = listOf(150.0),
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals("mixset_peak", anchor.type)
+        assertEquals(150.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_rescuesWhenPlayheadPassedWindow() {
+        val length = 300.0
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..150).map { it * 2.0 },
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 200.0)
+        assertEquals("mixset_rescue", anchor.type)
+        assertEquals(215.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_avoidsSingingLanding() {
+        val length = 300.0
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        // Singing around 150 and 160, calm at 140: the ±15 s grid holds all
+        // three, and the anchor must not land on a voice.
+        val mask = points.map { p ->
+            if (kotlin.math.abs(p.time - 150.0) <= 2.0 || kotlin.math.abs(p.time - 160.0) <= 2.0) 0.9 else 0.1
+        }
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = mask,
+            downbeats = listOf(140.0, 150.0, 160.0),
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals(140.0, anchor.time, 1e-6)
+    }
+
+    // -- Part A: 80/30 through the planner ------------------------------------
+
+    @Test
+    fun normalMode_playsEightyPercent_capsIncomingAtThirty() {
+        val (out, next) = strongPair()
+        val plan = planTransition(
+            analysis = out,
+            nextAnalysis = next,
+            duration = 200.0,
+            mode = CrossfadeMode.SMART,
+        )
+        // The mix-in candidate sits at 100 s (55%); the 30% ceiling pulls the
+        // entry back to ~54 s + one arrangement overlap.
+        assertTrue(
+            "transition starts at ${plan.transitionStart}, expected >= 159",
+            plan.transitionStart >= 159.0,
+        )
+        assertTrue(
+            "incoming cue at ${plan.incomingCueTime}, expected <= 60",
+            plan.incomingCueTime <= 60.0,
+        )
+        assertTrue(
+            "incoming handoff at ${plan.incomingHandoffTime}, expected <= 60",
+            plan.incomingHandoffTime <= 60.0,
+        )
+    }
+
+    // -- Part B: mixset through the planner -----------------------------------
+
+    @Test
+    fun mixsetMode_cutsEarly_offBestPart_withCappedEntry() {
+        // Outgoing drop at 60 -> anchor ~150 (below the 160 floor, by design).
+        // Incoming drop at 120 (66%) -> the 50% ceiling pulls it to ~90.
+        val (out, next) = strongPair(
+            outEnergyAt = { t ->
+                when {
+                    t >= 59.0 && t <= 61.0 -> 3.0
+                    t < 170.0 -> 1.0
+                    else -> 0.0
+                }
+            },
+            inDropAt = 120.0,
+            inMixIn = emptyList(),
+        )
+        val plan = planTransition(
+            analysis = out,
+            nextAnalysis = next,
+            duration = 200.0,
+            mode = CrossfadeMode.SMART,
+            mixset = true,
+        )
+        assertTrue(
+            "mixset should cut before the 80% floor, started at ${plan.transitionStart}",
+            plan.transitionStart < 160.0,
+        )
+        assertTrue(
+            "mixset cut should still be near the peak window, started at ${plan.transitionStart}",
+            plan.transitionStart >= 120.0,
+        )
+        assertTrue(
+            "mixset entry at ${plan.incomingHandoffTime}, expected <= 95 (50% + overlap)",
+            plan.incomingHandoffTime <= 95.0,
+        )
+    }
+}

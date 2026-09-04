@@ -179,6 +179,8 @@
     <string name="crossfade">Crossfade</string>
     <string name="crossfade_subtitle">Blends one track into the next</string>
     <string name="automix">Automix [BETA]</string>
+    <string name="mixset">Mixset Mode</string>
+    <string name="mixset_subtitle">Switches tracks faster — plays about 90 seconds of each song\'s highest-energy part before moving on</string>
     <string name="skip_silence">Skip silence</string>
     <string name="skip_silence_subtitle">Trim gaps longer than a second</string>
     <string name="equalizer">Equalizer</string>
