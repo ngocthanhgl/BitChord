@@ -1232,10 +1232,18 @@ fun planTransition(
         )
     }
     if (selectedType == TransitionType.LOOP_CUT_DROP && dropInB != null) {
-        return loopCutPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons,
-        )
+        // The 4-bar vamp plus 2-bar freeze needs room: at least 8 bars of
+        // tail below the anchor. Without it the loop is a fiction, and an
+        // honest cut beats a muddy short blend on a double-high pair.
+        val beatOutA = analysis.beatInterval.orZero().takeIf { it > 0 }
+            ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+        if (mixAnchor >= 32 * beatOutA) {
+            return loopCutPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons,
+            )
+        }
+        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
     }
     if (selectedType == TransitionType.HARD_CUT) {
         return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)

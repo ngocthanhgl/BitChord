@@ -1191,18 +1191,31 @@ class CrossfadeController(
                 echoFilters.outgoing(wash, render.echoBeatSeconds.toFloat())
                 echoFilters.incoming(0f, 0f)
             }
-            // Blueprint LOOP_CUT_DROP, P0 freeze: the spectrum holds open
-            // while the tail loops, then the outgoing track sinks behind a
-            // closing low-pass for the final quarter — the freeze before the
-            // cut, which finish() lands by retiring the outgoing player.
+            // Blueprint LOOP_CUT_DROP: the spectrum holds open while the tail
+            // vamps, then the outgoing track freezes behind a closing low-pass
+            // with a dub throw of itself — and the cut, which finish() lands
+            // by retiring the outgoing player, stays dry and absolute. The
+            // freeze point scales with the plan's loop: loopBars of vamp, then
+            // a 2-bar freeze. A literal player-level loop is deliberately not
+            // used: re-issuing media items on the outgoing player mid-transition
+            // re-prepares its decoder and risks the very seam the dual-player
+            // design exists to avoid; the extended overlap window IS the vamp.
             TransitionStyle.LOOP_CUT_DROP -> {
-                if (progress > 0.75f) {
-                    val freeze = ((progress - 0.75f) / 0.25f).coerceIn(0f, 1f)
+                val freezeAt = if (render.loopBars > 0) {
+                    render.loopBars.toFloat() / (render.loopBars + 2f)
+                } else {
+                    0.75f
+                }
+                if (progress > freezeAt) {
+                    val freeze = ((progress - freezeAt) / (1f - freezeAt)).coerceIn(0f, 1f)
                     filters.outgoing(20000f * (1f - freeze) + 300f * freeze, 20f)
+                    echoFilters.outgoing(0.5f * freeze, render.echoBeatSeconds.toFloat())
                 } else {
                     filters.open()
+                    echoFilters.outgoing(0f, 0f)
                 }
                 filters.incoming(20000f, 20f)
+                echoFilters.incoming(0f, 0f)
             }
             // Blueprint HARD_CUT: no blend, no spectrum edit — the 0.1 s
             // window and downbeat cue in the plan are the whole technique.
