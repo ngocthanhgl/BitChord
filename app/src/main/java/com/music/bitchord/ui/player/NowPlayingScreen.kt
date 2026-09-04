@@ -1843,12 +1843,12 @@ fun NowPlayingScreen(
                 // tracking a drag, and a sheen sweeping through that reads as a
                 // rendering glitch rather than as a signal.
                 mixing = mixing && !scrubbing,
-                // Hidden while scrubbing for the same reason as the sheen: the
-                // planner is still describing where the transition *would* be,
-                // and a marker sitting under a finger that is moving the
-                // playhead invites reading it as a drag target.
+                // Pinned while scrubbing: the marker is a non-interactive overlay
+                // describing where the transition *will* be, and holding it up
+                // while the playhead moves is exactly what lets a listener seek
+                // by the mix region instead of by blind time.
                 transitionWindow = transitionWindow
-                    ?.takeIf { !scrubbing && it.end > it.start }
+                    ?.takeIf { it.end > it.start }
                     ?.let { it.start..it.end },
             )
             val wifiQuality by AppSettings.audioQualityWifi.collectAsStateWithLifecycle()

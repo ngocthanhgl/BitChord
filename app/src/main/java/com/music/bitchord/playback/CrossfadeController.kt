@@ -302,6 +302,22 @@ class CrossfadeController(
     private var lastPlanVerdict = ""
 
     /**
+     * The last published marker and the pair it was planned for. A tick whose
+     * plan dips transiently unmarkable (outgoing back to REFINING while its
+     * whole-track pass re-runs, one blocked flicker) must not blank a window
+     * that was correct a quarter-second ago — the latch below keeps it until
+     * the pair itself changes or the plan says the pair is structurally
+     * unmixable. Cleared wherever the window is cleared for real.
+     */
+    private var lastMarkedPair: String? = null
+    private var lastMarkedWindow: TransitionWindow? = null
+
+    private fun clearMarkerLatch() {
+        lastMarkedPair = null
+        lastMarkedWindow = null
+    }
+
+    /**
      * True while a transition is armed or running.
      *
      * For callers about to do something that would otherwise fight this class
@@ -458,6 +474,7 @@ class CrossfadeController(
         // claiming both songs are measured.
         if (!player.hasNextMediaItem()) {
             AppSettings.smartTransitionWindow.value = null
+            clearMarkerLatch()
             return
         }
 
@@ -484,6 +501,7 @@ class CrossfadeController(
             // planned for this pair before the loop went on, at a point the
             // playhead now runs past on every lap without anything happening.
             AppSettings.smartTransitionWindow.value = null
+            clearMarkerLatch()
             return
         }
 
@@ -603,12 +621,13 @@ class CrossfadeController(
         // window that was already correct. Since the incoming track is now
         // routinely analysed from its opening long before it plays, that was
         // most of the time the marker was missing.
+        val pairKey = "${currentItem.mediaId}→${nextItem.mediaId}"
         val markable = !plan.blocked &&
             plan.markerVisible &&
             duration > 0L &&
             analysisState.current == TrackAnalysisState.ANALYSED &&
             analysisState.next in MEASURED_ENOUGH_TO_ENTER_ON
-        AppSettings.smartTransitionWindow.value = if (markable) {
+        val window = if (markable) {
             TransitionWindow(
                 start = (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
                 end = (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
@@ -616,6 +635,20 @@ class CrossfadeController(
         } else {
             null
         }
+        if (window != null) {
+            lastMarkedPair = pairKey
+            lastMarkedWindow = window
+        } else if (plan.blocked || pairKey != lastMarkedPair) {
+            // Structural (too short to mix, nothing measurable) or a new pair:
+            // nothing valid to show, so the latch goes with it. Backing into an
+            // old pair re-latches from scratch the first markable tick.
+            clearMarkerLatch()
+        }
+        // Otherwise a transient dip on the same pair — the latched window
+        // outlives it, which is what makes the marker appear once both tracks
+        // are measured and then stay put until the mix.
+        AppSettings.smartTransitionWindow.value =
+            window ?: lastMarkedWindow?.takeIf { pairKey == lastMarkedPair }
 
         if (plan.blocked) return
 
@@ -929,6 +962,7 @@ class CrossfadeController(
         // The queue has just moved on, so the marker's fractions now refer to a
         // track the session player is no longer showing a position for.
         AppSettings.smartTransitionWindow.value = null
+        clearMarkerLatch()
         phase = Phase.FADING
     }
 
