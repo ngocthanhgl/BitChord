@@ -91,6 +91,18 @@ data class TrackAnalysis(
     val vocalActivityMask: List<Double> = emptyList(),
     /** Whole-track vocal likelihood, distinct from the per-sample [vocalActivityMask]. */
     val vocalProbability: Double = 0.0,
+    /**
+     * Median fundamental over the head window's voiced frames, in Hz — the
+     * only measurement that can contradict [key] before a pitch shift is
+     * committed. 0 means "unmeasured", which vetoes nothing.
+     *
+     * A scalar rather than the full curve: the planner only ever asks "does
+     * this track sing near its detected key", and a 10 ms curve would cost
+     * kilobytes per stored entry for a question one number answers.
+     */
+    val vocalPitchMedianHz: Double = 0.0,
+    /** Mean confidence over the same voiced frames, 0..1. Trusted at 0.5. */
+    val pitchConfidence: Double = 0.0,
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing

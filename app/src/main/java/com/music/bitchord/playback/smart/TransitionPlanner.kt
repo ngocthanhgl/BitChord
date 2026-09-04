@@ -1225,6 +1225,18 @@ fun planTransition(
     val highEnergyA = isHighEnergyAt(analysis, mixAnchor)
     val highEnergyB = isHighEnergyAt(nextAnalysis, proxyEntry)
     val selectedType = selectTransitionType(proxyScore, highEnergyA, highEnergyB, dropInB != null)
+    // Blueprint §9 anti-monotony: a long blend between two tracks that are
+    // the same tempo, the same key, AND sing the same median pitch is a
+    // six-minute song nobody asked for. A clean cut says "next track".
+    if ((selectedType == TransitionType.SMOOTH_CROSSFADE || selectedType == TransitionType.HARMONIC_BLEND) &&
+        proxyScore.bpm >= 0.95 && proxyScore.key >= 0.95 &&
+        analysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
+        nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
+        (PitchTracker.pitchSemitoneGap(analysis.vocalPitchMedianHz, nextAnalysis.vocalPitchMedianHz)
+            ?: Double.POSITIVE_INFINITY) < 0.5
+    ) {
+        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+    }
     if (selectedType == TransitionType.ECHO_REVERB_OUT) {
         return echoOutPlan(
             analysis, nextAnalysis, length, nextLength,
@@ -1367,7 +1379,11 @@ fun planTransition(
     // hopeless cases, which is exactly when no shift applies).
     val keyShift = if (!sameBeatBlend &&
         analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
-        keyScore(analysis.key, nextAnalysis.key) in 0.45..0.75
+        keyScore(analysis.key, nextAnalysis.key) in 0.45..0.75 &&
+        // A trusted F0 that contradicts the incoming key cancels the shift:
+        // retuning toward a misdetected key lands in a worse one.
+        !(nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
+            pitchVetoesShift(nextAnalysis.vocalPitchMedianHz, nextAnalysis.key))
     ) {
         semitonesToShift(analysis.key, nextAnalysis.key)
     } else {

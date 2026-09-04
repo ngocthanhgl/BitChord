@@ -162,6 +162,8 @@ class AnalysisStore(private val context: Context) {
         val lowEnergyCurve: List<StoredEnergy> = emptyList(),
         val vocalActivityMask: List<Double> = emptyList(),
         val vocalProbability: Double = 0.0,
+        val vocalPitchMedianHz: Double = 0.0,
+        val pitchConfidence: Double = 0.0,
     ) {
         fun toAnalysis(trackId: String) = TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
@@ -188,6 +190,8 @@ class AnalysisStore(private val context: Context) {
             lowEnergyCurve = lowEnergyCurve.map { it.toSample() },
             vocalActivityMask = vocalActivityMask,
             vocalProbability = vocalProbability,
+            vocalPitchMedianHz = vocalPitchMedianHz,
+            pitchConfidence = pitchConfidence,
         )
 
         companion object {
@@ -214,6 +218,8 @@ class AnalysisStore(private val context: Context) {
                 lowEnergyCurve = analysis.lowEnergyCurve.map(StoredEnergy::of),
                 vocalActivityMask = analysis.vocalActivityMask.map(::round),
                 vocalProbability = analysis.vocalProbability,
+                vocalPitchMedianHz = round(analysis.vocalPitchMedianHz),
+                pitchConfidence = analysis.pitchConfidence,
             )
         }
     }
@@ -246,7 +252,7 @@ class AnalysisStore(private val context: Context) {
          * re-analysis costs seconds, and a beat grid interpreted under the wrong
          * assumptions is silently wrong for the life of the file.
          */
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
 
         /** A few thousand tracks' worth, at tens of kilobytes each. */
         const val MAX_ENTRIES = 2_000

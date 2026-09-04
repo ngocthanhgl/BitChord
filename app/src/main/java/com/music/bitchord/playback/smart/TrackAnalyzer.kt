@@ -49,6 +49,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private val tracker = BeatTracker(context)
     private val vocals = VocalTracker(context)
+    private val pitch = PitchTracker(context)
 
     /**
      * Resolved on first use, not at construction, for the reason [AnalysisStore]
@@ -376,6 +377,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 if (running.isEmpty()) {
                     tracker.release()
                     vocals.release()
+                    pitch.release()
                 }
             }
         }
@@ -884,7 +886,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // stereo buffer is paid for once.
         val window = BeatTracker.WINDOW_SECONDS
         val tailStart = max(0.0, effectiveDuration - window)
-        val head = region(openSource, 0.0, minOf(window, effectiveDuration), features)
+        val head = region(openSource, 0.0, minOf(window, effectiveDuration), features, trackPitch = true)
         val tail = if (tailStart > window / 2) region(openSource, tailStart, effectiveDuration, features) else null
 
         val headGrid = head?.grid
@@ -936,6 +938,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 vocalActivityMask = mergeMasks(features.energyCurve.size, head?.vocalMask, tail?.vocalMask)
                     ?: features.vocalActivityMask,
                 vocalProbability = features.vocalProbability,
+                vocalPitchMedianHz = head?.pitch?.voicedMedianHz() ?: 0.0,
+                pitchConfidence = head?.pitch?.voicedMeanConfidence() ?: 0.0,
             ),
         )
     }
@@ -951,6 +955,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val seconds: Double,
         /** Only populated when the caller asked for it; see [region]'s `deriveFeatures`. */
         val features: TrackFeatures.Features? = null,
+        /** Only populated when the caller asked for it; see [region]'s `trackPitch`. */
+        val pitch: PitchTracker.PitchCurve? = null,
     )
 
     /**
@@ -973,6 +979,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         endSeconds: Double,
         features: TrackFeatures.Features?,
         deriveFeatures: Boolean = false,
+        trackPitch: Boolean = false,
     ): Region? {
         val decoded = openSource()?.use { AudioDecoder.decodeRegionStereo(it, startSeconds, endSeconds) }
             ?: run {
@@ -1001,11 +1008,23 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // process was dying. Same reasoning [derived] already had, one level further out.
         val inputs = regionInputs(stereo, seconds, deriveFeatures)
 
+        // Pitch reads the head only, resampled off the beat model's own input
+        // rather than a second downmix: the planner verifies the *incoming*
+        // track's key against it, and nothing downstream of the head ever asks.
+        val pitchCurve = if (trackPitch) {
+            inputs.forModel
+                ?.let { MelSpectrogram.resample(it, MelSpectrogram.sampleRate, PitchTracker.SAMPLE_RATE.toDouble()) }
+                ?.let { pitch.track(it, offsetSeconds = actualStart) }
+        } else {
+            null
+        }
+
         return Region(
             grid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) },
             vocalMask = features?.let { vocalMask(stereo, it, actualStart) },
             seconds = seconds,
             features = inputs.derived,
+            pitch = pitchCurve,
         )
     }
 
@@ -1124,6 +1143,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         discarded.clear()
         tracker.release()
         vocals.release()
+        pitch.release()
     }
 
     private companion object {

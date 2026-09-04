@@ -23,8 +23,10 @@ package com.music.bitchord.playback.smart
 
 import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.log2
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * The confidence-aware transition policy.
@@ -573,6 +575,13 @@ const val SCORE_GOOD = 0.60
 const val SCORE_ACCEPTABLE = 0.40
 
 /**
+ * Measured-F0 confidence below this means the pitch tracker abstains and a
+ * key shift stands on the detected key alone. Mirrors the gate the tracker
+ * itself decodes with.
+ */
+const val TRUSTED_PITCH_CONFIDENCE = 0.5
+
+/**
  * Blueprint §5.5: a transition may not start inside a vocal phrase, nor
  * within this long after one ends.
  */
@@ -678,6 +687,28 @@ fun semitonesToShift(fromKey: String, toKey: String): Int {
 private fun camelotMajorNumber(pitchIndex: Int, minor: Boolean): Int {
     val majorIndex = if (minor) (pitchIndex + 3) % 12 else pitchIndex
     return (((7 + (7 * majorIndex) % 12) % 12) + 1)
+}
+
+/** Pitch-class index (C = 0) of a detected [key], or null when unparseable. */
+fun keyRootIndex(key: String): Int? =
+    PITCH_CLASS_INDEX[key.trim().split(' ').firstOrNull()]
+
+/**
+ * Whether a trusted measured median F0 contradicts the incoming track's own
+ * detected key badly enough to cancel its pitch shift: more than three
+ * semitones from the key root means the key detector, not the singer, is
+ * probably wrong, and shifting on a wrong key lands in a worse one.
+ *
+ * Returns false whenever there is nothing to contradict with — unmeasured
+ * median, unparseable key — so a missing pitch track changes nothing.
+ */
+fun pitchVetoesShift(medianHz: Double, detectedKey: String): Boolean {
+    if (medianHz <= 0 || !medianHz.isFinite()) return false
+    val root = keyRootIndex(detectedKey) ?: return false
+    val midi = (69 + 12 * log2(medianHz / 440.0)).roundToInt()
+    val pitchClass = ((midi % 12) + 12) % 12
+    val distance = min((pitchClass - root + 12) % 12, (root - pitchClass + 12) % 12)
+    return distance > 3
 }
 
 /** Nearest energy-curve sample to [time], or null with no usable curve. */
