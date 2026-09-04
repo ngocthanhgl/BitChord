@@ -17,6 +17,7 @@ import com.music.bitchord.playback.smart.CrossfadeMode
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.TransitionStyle
 import com.music.bitchord.playback.smart.TransitionTrackInfo
+import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
@@ -259,6 +260,11 @@ class CrossfadeController(
         val bassSwapFraction: Double = 0.7,
         val filterSweep: Double = 0.0,
         val vocalOverlap: Double = 0.0,
+        val volumeCurve: VolumeCurve = VolumeCurve.S_CURVE,
+        /** Blueprint ECHO_REVERB_OUT: peak echo/reverb wet 0..1 on the outgoing track. */
+        val echoAmount: Double = 0.0,
+        /** Blueprint LOOP_CUT_DROP: bars of outgoing tail looped before the freeze-and-cut. */
+        val loopBars: Int = 0,
     )
 
     private var fadeStartedAt = 0L
@@ -624,6 +630,9 @@ class CrossfadeController(
                 bassSwapFraction = plan.bassSwapFraction,
                 filterSweep = plan.filterSweep,
                 vocalOverlap = plan.vocalOverlap,
+                volumeCurve = plan.volumeCurve,
+                echoAmount = plan.echoAmount,
+                loopBars = plan.loopBars,
             ),
         )
     }
@@ -957,8 +966,23 @@ class CrossfadeController(
         val elapsed = (player.currentPosition - incomingCueTimeMs).coerceAtLeast(0L)
         val progress = (elapsed.toFloat() / span).coerceIn(0f, 1f)
 
-        player.volume = riseGain(progress)
-        out.volume = fallGain(progress)
+        // Blueprint §4 volume curves. The equal-power pair holds every blend;
+        // LOGARITHMIC drops the outgoing track fast while its echo tail covers
+        // the hole; INSTANT holds both sides until the cut lands at progress 1.
+        when (render.volumeCurve) {
+            VolumeCurve.LOGARITHMIC -> {
+                player.volume = riseGain(progress)
+                out.volume = (1f - progress).pow(2f)
+            }
+            VolumeCurve.INSTANT -> {
+                player.volume = if (progress >= 1f) 1f else 0f
+                out.volume = if (progress >= 1f) 0f else 1f
+            }
+            VolumeCurve.S_CURVE -> {
+                player.volume = riseGain(progress)
+                out.volume = fallGain(progress)
+            }
+        }
         // Only from here, never during ARMING: the standby is silent until the
         // handoff, and [filters] describes the split between the track arriving
         // and the track leaving, which only exists once both are audible.
@@ -1140,6 +1164,31 @@ class CrossfadeController(
             // full vocals over each other, because the weak half of the evidence
             // was silencing the strong half.
             TransitionStyle.EQUAL_POWER -> rideVocalSeparation(progress)
+            // Blueprint ECHO_REVERB_OUT, P0 wash: the outgoing track sinks
+            // behind a closing low-pass scaled by the plan's wet amount while
+            // the incoming one opens dry. The dedicated echo send (P1) rides
+            // on top of this; the wash alone already decays, never clashes.
+            TransitionStyle.ECHO_REVERB_OUT -> {
+                val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
+                filters.outgoing(20000f * (1f - wash) + 300f * wash, 20f)
+                filters.incoming(20000f, 20f)
+            }
+            // Blueprint LOOP_CUT_DROP, P0 freeze: the spectrum holds open
+            // while the tail loops, then the outgoing track sinks behind a
+            // closing low-pass for the final quarter — the freeze before the
+            // cut, which finish() lands by retiring the outgoing player.
+            TransitionStyle.LOOP_CUT_DROP -> {
+                if (progress > 0.75f) {
+                    val freeze = ((progress - 0.75f) / 0.25f).coerceIn(0f, 1f)
+                    filters.outgoing(20000f * (1f - freeze) + 300f * freeze, 20f)
+                } else {
+                    filters.open()
+                }
+                filters.incoming(20000f, 20f)
+            }
+            // Blueprint HARD_CUT: no blend, no spectrum edit — the 0.1 s
+            // window and downbeat cue in the plan are the whole technique.
+            TransitionStyle.HARD_CUT -> filters.open()
         }
     }
 
@@ -1352,6 +1401,9 @@ class CrossfadeController(
     private fun isRealMix(): Boolean = smartFadeActive && (
         render.style == TransitionStyle.DJ_BLEND ||
             render.style == TransitionStyle.DJ_FILTER ||
+            render.style == TransitionStyle.ECHO_REVERB_OUT ||
+            render.style == TransitionStyle.LOOP_CUT_DROP ||
+            render.style == TransitionStyle.HARD_CUT ||
             incomingCueTimeMs > 0L ||
             incomingPlaybackRate != 1.0
         )

@@ -101,7 +101,17 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
     "interior_mix_out" to 0.95,
     "outro_start" to 0.9,
     "content_end" to 0.75,
+    "vocal_exit" to 0.6,
+    "low_energy" to 0.5,
+    "blueprint_fallback" to 0.35,
 )
+
+/**
+ * When blueprint §7 candidates are active, the mix-out may end far earlier
+ * than the old 12 s tail budget allows — the length-60 s fallback alone can
+ * skip a minute of music. The windowed budget covers exactly that.
+ */
+const val BLUEPRINT_WINDOW_DISCARD_BUDGET = 75.0
 
 /** Non-finite guards, matching the desktop planner's coercion of `NaN`/`Infinity` to zero. */
 internal fun Double.orZero(): Double = if (isFinite()) this else 0.0
@@ -381,10 +391,23 @@ fun rankMixOutCandidates(
     analysis: TrackAnalysis,
     contentEnd: Double = 0.0,
     duration: Double = 0.0,
+    allowedWindow: ClosedRange<Double>? = null,
 ): List<RankedMixCandidate> {
     val end = resolveContentEnd(analysis, contentEnd, duration)
     if (end <= 0) return emptyList()
-    return mixOutCandidatesOf(analysis, end)
+    val beatSeconds = analysis.beatInterval.orZero()
+        .takeIf { it > 0 }
+        ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+    val base = mixOutCandidatesOf(analysis, end)
+    // Blueprint §7 steps 3–4: low-energy points and vocal-phrase exits inside
+    // the window join the analyzer's structural candidates; step 6 dedupes.
+    val augmented = if (allowedWindow != null) {
+        base + augmentMixOutCandidates(analysis, base, allowedWindow, beatSeconds)
+    } else {
+        base
+    }
+    val budget = if (allowedWindow != null) BLUEPRINT_WINDOW_DISCARD_BUDGET else MAX_DISCARDED_MUSIC_SECONDS
+    return augmented
         .map { candidate ->
             val measured = audibleSecondsBetween(analysis, candidate.time, end)
             // With no energy curve there is no way to tell skipped music from skipped silence, so
@@ -398,8 +421,47 @@ fun rankMixOutCandidates(
                 measured = measured != null,
             )
         }
-        .filter { it.discardedMusicSeconds <= MAX_DISCARDED_MUSIC_SECONDS }
+        .filter { it.discardedMusicSeconds <= budget }
         .sortedWith(compareByDescending<RankedMixCandidate> { it.rankScore }.thenByDescending { it.time })
+}
+
+/**
+ * Blueprint §7 steps 3–4 and 6: the five lowest-energy points in [window]
+ * plus one point just after every vocal phrase ends, each dropped when it
+ * sits within 8 bars of an analyzer candidate or an earlier extra.
+ */
+private fun augmentMixOutCandidates(
+    analysis: TrackAnalysis,
+    existing: List<MixCandidate>,
+    window: ClosedRange<Double>,
+    beatSeconds: Double,
+): List<MixCandidate> {
+    val bar8 = (if (beatSeconds > 0) beatSeconds else 0.5) * 32
+    val extras = mutableListOf<MixCandidate>()
+    fun tooClose(time: Double): Boolean =
+        existing.any { abs(it.time - time) < bar8 } || extras.any { abs(it.time - time) < bar8 }
+    analysis.energyCurve
+        .filter { it.time.isFinite() && it.energy.isFinite() && it.time in window }
+        .sortedBy { it.energy }
+        .forEach { point ->
+            if (extras.size >= 5) return@forEach
+            if (!tooClose(point.time)) extras += MixCandidate(point.time, 0.5, "low_energy")
+        }
+    val mask = analysis.vocalActivityMask
+    val curve = analysis.energyCurve
+    if (mask.size == curve.size && mask.isNotEmpty()) {
+        for (i in 1 until mask.size) {
+            val wasActive = mask[i - 1].isFinite() && mask[i - 1] >= VOCAL_ACTIVE_THRESHOLD
+            val nowQuiet = !mask[i].isFinite() || mask[i] < VOCAL_ACTIVE_THRESHOLD
+            if (wasActive && nowQuiet) {
+                val exit = curve[i].time + VOCAL_EXIT_BUFFER_SECONDS
+                if (exit.isFinite() && exit in window && !tooClose(exit)) {
+                    extras += MixCandidate(exit, 0.6, "vocal_exit")
+                }
+            }
+        }
+    }
+    return extras
 }
 
 /**
@@ -411,14 +473,38 @@ fun resolveMixOutAnchor(
     analysis: TrackAnalysis,
     contentEnd: Double = 0.0,
     duration: Double = 0.0,
+    allowedWindow: ClosedRange<Double>? = null,
+    fallbackTime: Double? = null,
 ): MixOutAnchor {
     val end = resolveContentEnd(analysis, contentEnd, duration)
-    val best = rankMixOutCandidates(analysis, end, duration).firstOrNull()
-    return MixOutAnchor(
-        time = best?.time ?: end,
-        type = best?.type ?: "content_end",
-        discardedMusicSeconds = best?.discardedMusicSeconds ?: 0.0,
-    )
+    val best = rankMixOutCandidates(analysis, end, duration, allowedWindow).firstOrNull()
+    if (best != null) {
+        return MixOutAnchor(
+            time = best.time,
+            type = best.type,
+            discardedMusicSeconds = best.discardedMusicSeconds,
+        )
+    }
+    // Blueprint §7 step 9: when no candidate clears the bar, the transition
+    // opens at the fallback instead of clinging to the content end.
+    val fallback = fallbackTime?.takeIf { it.isFinite() && it > 0 && it < end }
+    if (fallback != null) {
+        val discarded = audibleSecondsBetween(analysis, fallback, end) ?: max(0.0, end - fallback)
+        return MixOutAnchor(time = fallback, type = "blueprint_fallback", discardedMusicSeconds = discarded)
+    }
+    return MixOutAnchor(time = end, type = "content_end", discardedMusicSeconds = 0.0)
+}
+
+/**
+ * Blueprint §5.6 energy gate. The blueprint assumes a 0..1 profile with a
+ * 0.70 high-energy line; this curve is raw RMS, so above-average reads as
+ * high instead. Same question, honest scale.
+ */
+fun isHighEnergyAt(analysis: TrackAnalysis, time: Double): Boolean {
+    val energy = energyAt(analysis, time) ?: return false
+    val mean = meanEnergy(analysis) ?: return false
+    if (mean <= 0) return false
+    return energy >= mean * 1.1
 }
 
 /**
@@ -463,4 +549,280 @@ fun assessTransitionTier(
         reasons = reasons,
         beatConfidence = floorConfidence,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Blueprint §4–§6: compatibility scoring.
+//
+// Five sub-scores in 0..1 plus their weighted overall. Every function here
+// reads stored analysis only — no PCM — mirroring the file's existing rule.
+// A missing measurement answers neutrally (never blocks), the same way a
+// null vocal mask does everywhere above.
+// ---------------------------------------------------------------------------
+
+/** Blueprint §6 weights: tempo matters most, vocals least. */
+const val WEIGHT_BPM_SCORE = 0.30
+const val WEIGHT_KEY_SCORE = 0.25
+const val WEIGHT_ENERGY_SCORE = 0.20
+const val WEIGHT_STRUCTURE_SCORE = 0.15
+const val WEIGHT_VOCAL_SCORE = 0.10
+
+/** Blueprint §6 decision thresholds on [CompatibilityScore.overall]. */
+const val SCORE_EXCELLENT = 0.80
+const val SCORE_GOOD = 0.60
+const val SCORE_ACCEPTABLE = 0.40
+
+/**
+ * Blueprint §5.5: a transition may not start inside a vocal phrase, nor
+ * within this long after one ends.
+ */
+const val VOCAL_EXIT_BUFFER_SECONDS = 0.5
+
+/** Blueprint §5.1 Rule 1: accepted harmonic tempo ratios, each ±[BPM_RATIO_TOLERANCE]. */
+private val BPM_HARMONIC_RATIOS = doubleArrayOf(1.0, 2.0, 0.5, 1.5, 2.0 / 3.0)
+const val BPM_RATIO_TOLERANCE = 0.03
+
+/** Blueprint §5.1 Rule 1. Scores only ratios inside tolerance; the best wins. */
+fun bpmScore(outgoingBpm: Double, incomingBpm: Double): Double {
+    if (outgoingBpm <= 0 || incomingBpm <= 0) return 0.0
+    var best = 0.0
+    for (ratio in BPM_HARMONIC_RATIOS) {
+        val diff = abs(outgoingBpm * ratio - incomingBpm) / incomingBpm
+        if (diff <= BPM_RATIO_TOLERANCE) {
+            best = max(best, (1.0 - diff * 10.0).coerceIn(0.0, 1.0))
+        }
+    }
+    return best
+}
+
+private val PITCH_CLASS_INDEX = mapOf(
+    "C" to 0, "C♯" to 1, "D♭" to 1, "D" to 2, "D♯" to 3, "E♭" to 3,
+    "E" to 4, "F" to 5, "F♯" to 6, "G♭" to 6, "G" to 7, "G♯" to 8,
+    "A♭" to 8, "A" to 9, "A♯" to 10, "B♭" to 10, "B" to 11,
+)
+
+/**
+ * Blueprint §5.2 mapping, derived arithmetically rather than tabulated: walk
+ * the circle of fifths from C (= 8B) in semitone steps of a fifth. Minor takes
+ * its relative major's number (A minor -> 8A via C major).
+ *
+ * @return number 1..12 plus minor flag, or null when the key is unparseable.
+ */
+fun camelotOf(key: String): Pair<Int, Boolean>? {
+    val parts = key.trim().split(' ')
+    val index = PITCH_CLASS_INDEX[parts.firstOrNull()] ?: return null
+    val minor = when (parts.getOrNull(1)?.lowercase()) {
+        "minor", "m" -> true
+        "major", "maj", "" -> false
+        null -> false
+        else -> return null
+    }
+    val majorIndex = if (minor) (index + 3) % 12 else index
+    val fifthSteps = (7 * majorIndex) % 12
+    return (((7 + fifthSteps) % 12) + 1) to minor
+}
+
+private fun keyScoreOf(
+    leftNumber: Int,
+    leftMinor: Boolean,
+    rightNumber: Int,
+    rightMinor: Boolean,
+): Double {
+    if (leftNumber == rightNumber && leftMinor == rightMinor) return 1.0
+    if (leftNumber == rightNumber) return 0.85
+    val step = min(abs(leftNumber - rightNumber), 12 - abs(leftNumber - rightNumber))
+    if (step == 1 && leftMinor == rightMinor) return 0.75
+    if (step == 1) return 0.45
+    return 0.0
+}
+
+/**
+ * Blueprint §5.2 compatibility table. An unparseable key is no key at all
+ * (0.0); a key without a parseable mode keeps its number but forfeits the
+ * relative-major credit.
+ */
+fun keyScore(leftKey: String, rightKey: String): Double {
+    val left = camelotOf(leftKey)
+    val right = camelotOf(rightKey)
+    if (left == null || right == null) return 0.0
+    return keyScoreOf(left.first, left.second, right.first, right.second)
+}
+
+/**
+ * Blueprint §5.2 pitch-shift rule: the signed semitone shift of the incoming
+ * track's key (positive = up) that first reaches Adjacent (0.75) or better,
+ * capped at ±[MAX_KEY_SHIFT_SEMITONES]. Zero when already there, or when no
+ * shift inside the cap gets there — the caller must mask with a filter sweep
+ * instead of shifting further.
+ */
+const val MAX_KEY_SHIFT_SEMITONES = 2
+
+fun semitonesToShift(fromKey: String, toKey: String): Int {
+    val from = camelotOf(fromKey) ?: return 0
+    val to = camelotOf(toKey) ?: return 0
+    if (keyScoreOf(from.first, from.second, to.first, to.second) >= 0.75) return 0
+    // Shifting pitch preserves mode, so only the pitch-class index moves and
+    // the Camelot number is re-derived per candidate shift, smallest first.
+    val toIndex = PITCH_CLASS_INDEX[toKey.trim().split(' ').firstOrNull()] ?: return 0
+    for (magnitude in 1..MAX_KEY_SHIFT_SEMITONES) {
+        for (shift in listOf(magnitude, -magnitude)) {
+            val shifted = (toIndex + shift + 12) % 12
+            if (keyScoreOf(from.first, from.second, camelotMajorNumber(shifted, to.second), to.second) >= 0.75) {
+                return shift
+            }
+        }
+    }
+    return 0
+}
+
+private fun camelotMajorNumber(pitchIndex: Int, minor: Boolean): Int {
+    val majorIndex = if (minor) (pitchIndex + 3) % 12 else pitchIndex
+    return (((7 + (7 * majorIndex) % 12) % 12) + 1)
+}
+
+/** Nearest energy-curve sample to [time], or null with no usable curve. */
+fun energyAt(analysis: TrackAnalysis, time: Double): Double? {
+    val curve = analysis.energyCurve
+    if (curve.isEmpty() || !time.isFinite()) return null
+    var best: Double? = null
+    var bestDist = Double.POSITIVE_INFINITY
+    for (point in curve) {
+        if (!point.time.isFinite() || !point.energy.isFinite() || point.energy < 0) continue
+        val dist = abs(point.time - time)
+        if (dist < bestDist) {
+            bestDist = dist
+            best = point.energy
+        }
+    }
+    return best
+}
+
+private fun meanEnergy(analysis: TrackAnalysis): Double? {
+    val energies = analysis.energyCurve.map { it.energy }.filter { it.isFinite() && it >= 0 }
+    if (energies.isEmpty()) return null
+    return energies.sum() / energies.size
+}
+
+/** Blueprint §5.3 Rule 1. Null on either side is no evidence and answers neutrally. */
+fun energyScore(outgoingEnergy: Double?, incomingEnergy: Double?): Double {
+    if (outgoingEnergy == null || incomingEnergy == null) return 0.5
+    val peak = max(outgoingEnergy, incomingEnergy)
+    if (peak <= 0) return 0.5
+    return (1.0 - abs(outgoingEnergy - incomingEnergy) / peak).coerceIn(0.0, 1.0)
+}
+
+private enum class StructureRole { INTRO, OUTRO, BREAK, OTHER }
+
+/**
+ * Blueprint §5.4 section roles, derived from measured anchors: OUTRO past the
+ * outro/content markers, INTRO inside the opening, BREAK on a low-energy
+ * passage (below half the track mean), everything else OTHER (verse/chorus).
+ */
+private fun structureRoleOf(analysis: TrackAnalysis, time: Double, isOutgoing: Boolean): StructureRole {
+    val mean = meanEnergy(analysis)
+    val energy = energyAt(analysis, time)
+    if (mean != null && energy != null && energy < mean * 0.5) return StructureRole.BREAK
+    if (isOutgoing) {
+        val outro = analysis.outroStartTime.orZero()
+        if (outro > 0 && time >= outro) return StructureRole.OUTRO
+        val contentEnd = analysis.contentEndTime.orZero()
+        if (contentEnd > 0 && time >= contentEnd - 1.0) return StructureRole.OUTRO
+    } else {
+        val introEnd = analysis.introEndTime.orZero()
+        if (introEnd > 0 && time <= introEnd) return StructureRole.INTRO
+        if (introEnd <= 0 && time <= 32.0) return StructureRole.INTRO
+    }
+    return StructureRole.OTHER
+}
+
+/** Blueprint §5.4 section-pair table. */
+fun structureScore(analysis: TrackAnalysis, next: TrackAnalysis, transitionTime: Double, entryTime: Double): Double {
+    val out = structureRoleOf(analysis, transitionTime, isOutgoing = true)
+    val incoming = structureRoleOf(next, entryTime, isOutgoing = false)
+    return when {
+        out == StructureRole.OUTRO && incoming == StructureRole.INTRO -> 1.0
+        out == StructureRole.BREAK && incoming == StructureRole.INTRO -> 0.85
+        out == StructureRole.BREAK -> 0.70
+        out == StructureRole.OUTRO -> 0.65
+        out == StructureRole.OTHER && incoming == StructureRole.INTRO -> 0.45
+        else -> 0.25
+    }
+}
+
+/**
+ * Blueprint §5.5: 0.2 when [time] sits inside a vocal phrase or within
+ * [VOCAL_EXIT_BUFFER_SECONDS] after one ends, 1.0 otherwise. No mask is no
+ * evidence and answers 1.0 — nothing may punish a fallback analysis.
+ */
+fun vocalScoreAt(analysis: TrackAnalysis, time: Double): Double {
+    val mask = analysis.vocalActivityMask
+    val curve = analysis.energyCurve
+    if (mask.isEmpty() || mask.size != curve.size || !time.isFinite()) return 1.0
+    for (index in mask.indices) {
+        val sample = curve[index].time
+        if (!sample.isFinite() || sample > time || sample < time - VOCAL_EXIT_BUFFER_SECONDS) continue
+        if (mask[index].isFinite() && mask[index] >= VOCAL_ACTIVE_THRESHOLD) return 0.2
+    }
+    return 1.0
+}
+
+/** Blueprint §4 compatibility model. */
+data class CompatibilityScore(
+    val bpm: Double = 0.0,
+    val key: Double = 0.0,
+    val energy: Double = 0.0,
+    val structure: Double = 0.0,
+    val vocal: Double = 0.0,
+    val overall: Double = 0.0,
+)
+
+/** Blueprint §6 weighted overall for one pair at one candidate point. */
+fun scoreCompatibility(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    transitionTime: Double,
+    entryTime: Double,
+): CompatibilityScore {
+    val bpm = bpmScore(analysis.bpm.orZero(), nextAnalysis.bpm.orZero())
+    val key = if (analysis.key.isBlank() || nextAnalysis.key.isBlank()) {
+        0.5
+    } else {
+        keyScore(analysis.key, nextAnalysis.key).let {
+            if (analysis.keyConfidence.orZero() < 0.25 || nextAnalysis.keyConfidence.orZero() < 0.25) it * 0.6 else it
+        }
+    }
+    val energy = energyScore(energyAt(analysis, transitionTime), energyAt(nextAnalysis, entryTime))
+    val structure = structureScore(analysis, nextAnalysis, transitionTime, entryTime)
+    val vocal = min(vocalScoreAt(analysis, transitionTime), vocalScoreAt(nextAnalysis, entryTime))
+    val overall = bpm * WEIGHT_BPM_SCORE +
+        key * WEIGHT_KEY_SCORE +
+        energy * WEIGHT_ENERGY_SCORE +
+        structure * WEIGHT_STRUCTURE_SCORE +
+        vocal * WEIGHT_VOCAL_SCORE
+    return CompatibilityScore(bpm, key, energy, structure, vocal, overall)
+}
+
+/**
+ * Blueprint §5.4 drop detection: the first local energy maximum past the
+ * intro that clears 1.5x the track mean — where LOOP_CUT_DROP enters the
+ * incoming track. Null when the curve cannot support the claim.
+ */
+fun firstDropSec(analysis: TrackAnalysis): Double? {
+    val curve = analysis.energyCurve
+    if (curve.size < 3) return null
+    val mean = meanEnergy(analysis) ?: return null
+    if (mean <= 0) return null
+    val threshold = mean * 1.5
+    val introEnd = analysis.introEndTime.orZero()
+    for (i in 1 until curve.size - 1) {
+        val point = curve[i]
+        if (!point.time.isFinite() || point.time < introEnd) continue
+        if (point.energy >= threshold &&
+            point.energy >= curve[i - 1].energy &&
+            point.energy >= curve[i + 1].energy
+        ) {
+            return point.time
+        }
+    }
+    return null
 }

@@ -79,6 +79,24 @@ private const val AUTO_FALLBACK_SECONDS = 8.0
 /** Below this a track would spend too much of itself transitioning to be worth planning. */
 private const val MIN_SMART_DURATION_SECONDS = 45.0
 
+/**
+ * Blueprint §5.7 per-archetype duration budgets, in beats. The old single
+ * ceiling (16 beats / 12 s) would strangle the blueprint's long blends — a
+ * 32-bar harmonic blend alone is 128 beats — so each archetype gets its own
+ * budget and the rails below stay as the safety net.
+ */
+private fun maxBeatsFor(type: TransitionType): Double = when (type) {
+    TransitionType.SMOOTH_CROSSFADE -> 128.0
+    TransitionType.HARMONIC_BLEND -> 256.0
+    TransitionType.FILTER_SWEEP -> 64.0
+    TransitionType.ECHO_REVERB_OUT -> 48.0
+    TransitionType.LOOP_CUT_DROP -> 24.0
+    TransitionType.HARD_CUT -> 1.0
+}
+
+/** Hard safety net no transition may exceed, however generous its budget. */
+private const val ABSOLUTE_MAX_TRANSITION_SECONDS = 90.0
+
 /** Leave enough incoming material after a calibrated handoff to avoid landing in its outro. */
 private const val MIN_INCOMING_CLEARANCE_SECONDS = 5.0
 
@@ -107,6 +125,52 @@ enum class TransitionStyle {
 
     /** Filtered handoff for tempi too far apart to blend flat. */
     DJ_FILTER,
+
+    /** Blueprint §5.7: the pair cannot sync, so the outgoing track decays
+     * behind echo/reverb while the incoming one fades in dry. */
+    ECHO_REVERB_OUT,
+
+    /** Blueprint §5.7: both tracks at full energy — loop the outgoing tail,
+     * freeze it, cut, and land the incoming track on its drop. */
+    LOOP_CUT_DROP,
+
+    /** Blueprint §5.7: no blend at all — a click-free cut exactly on a downbeat. */
+    HARD_CUT,
+}
+
+/**
+ * Blueprint §4: the six DJ transition archetypes. The planner decides the
+ * archetype ([TransitionType]); [TransitionStyle] is how the renderer voices
+ * it. The two stay separate so one archetype can change rendering without
+ * re-planning the pair.
+ */
+enum class TransitionType {
+    SMOOTH_CROSSFADE,
+    HARMONIC_BLEND,
+    FILTER_SWEEP,
+    ECHO_REVERB_OUT,
+    LOOP_CUT_DROP,
+    HARD_CUT,
+}
+
+/** Blueprint §4 volume automation shapes. */
+enum class VolumeCurve {
+    /** The existing equal-power sin/cos ride. */
+    S_CURVE,
+
+    /** Fast early decay of the outgoing track; the echo tail covers the hole. */
+    LOGARITHMIC,
+
+    /** Volumes step at the cut point; the 0.1s window itself stays click-free. */
+    INSTANT,
+}
+
+/** Blueprint §4 EQ automation shapes. */
+enum class EQCurve {
+    EQ_SWAP,
+    BASS_SWAP,
+    TREBLE_SWAP,
+    NONE,
 }
 
 /**
@@ -157,6 +221,22 @@ data class TransitionPlan(
      * rendering exactly as it did before this existed.
      */
     val vocalOverlap: Double = 0.0,
+    /** Blueprint §5.6: which archetype this plan implements. */
+    val type: TransitionType = TransitionType.SMOOTH_CROSSFADE,
+    /** Blueprint §6: the five sub-scores and weighted overall behind [type]. */
+    val score: CompatibilityScore = CompatibilityScore(),
+    /** Blueprint §5.7 ECHO_REVERB_OUT: peak echo/reverb wet 0..1 on the outgoing track. */
+    val echoAmount: Double = 0.0,
+    /** Blueprint §5.7 LOOP_CUT_DROP: how many bars of the outgoing tail loop before the freeze. */
+    val loopBars: Int = 0,
+    /** Blueprint §5.7 LOOP_CUT_DROP: where the incoming track lands, on its own timeline. */
+    val dropCueTime: Double = 0.0,
+    /** Blueprint §5.2: semitone shift of the incoming track (±[MAX_KEY_SHIFT_SEMITONES]), 0 = none. */
+    val keyShiftSemitones: Int = 0,
+    /** Blueprint §4 volume automation shape for this plan. */
+    val volumeCurve: VolumeCurve = VolumeCurve.S_CURVE,
+    /** Blueprint §4 EQ automation shape for this plan. */
+    val eqCurve: EQCurve = EQCurve.NONE,
     /**
      * The tempi the overlap is built on, which are **not** the analyses' raw
      * BPMs: the incoming one has been folded into the outgoing one's octave.
@@ -178,6 +258,180 @@ private fun blocked(reason: String, transitionStart: Double = 0.0, transitionEnd
         transitionStart = transitionStart,
         transitionEnd = transitionEnd,
     )
+
+/**
+ * Blueprint §5.6 decision matrix, verbatim order: loop the double-high pair
+ * with a drop ahead, echo out the unsyncable one, blend the harmonic one,
+ * smooth the clean one, filter the clashing one, cut the rest.
+ */
+fun selectTransitionType(
+    score: CompatibilityScore,
+    highEnergyA: Boolean,
+    highEnergyB: Boolean,
+    hasDropInB: Boolean,
+): TransitionType = when {
+    highEnergyA && highEnergyB && hasDropInB -> TransitionType.LOOP_CUT_DROP
+    score.bpm < 0.50 -> TransitionType.ECHO_REVERB_OUT
+    score.key >= 0.85 && score.bpm >= 0.70 -> TransitionType.HARMONIC_BLEND
+    score.key >= 0.70 && score.bpm >= 0.70 && score.vocal >= 0.60 -> TransitionType.SMOOTH_CROSSFADE
+    score.bpm >= 0.70 && score.key < 0.70 -> TransitionType.FILTER_SWEEP
+    else -> TransitionType.HARD_CUT
+}
+
+/**
+ * Blueprint §5.7 HARD_CUT: no blend — a click-free 0.1 s handoff exactly on
+ * the outgoing track's nearest downbeat. The renderer voices this with open
+ * filters and a stepped volume curve.
+ */
+private fun hardCutPlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    playbackTime: Double,
+    mixAnchor: Double,
+    score: CompatibilityScore,
+    policyReasons: List<String>,
+): TransitionPlan {
+    val beatSeconds = analysis.beatInterval.orZero().takeIf { it > 0 }
+        ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+    val cutAt = nearestTimedValue(analysis.downbeats, mixAnchor, tolerance = beatSeconds * 2)
+        ?.coerceIn(0.0, length) ?: mixAnchor.coerceIn(0.0, length)
+    val cue = incomingStartPoint(nextAnalysis)
+    val started = playbackTime >= cutAt
+    return TransitionPlan(
+        shouldStart = started,
+        markerVisible = true,
+        transitionStart = cutAt,
+        transitionEnd = cutAt + 0.1,
+        fadeSeconds = 0.1,
+        transitionStyle = TransitionStyle.HARD_CUT,
+        type = TransitionType.HARD_CUT,
+        score = score,
+        incomingCueTime = cue,
+        incomingHandoffTime = cue,
+        incomingPlaybackRate = 1.0,
+        volumeCurve = VolumeCurve.INSTANT,
+        eqCurve = EQCurve.NONE,
+        policyReasons = policyReasons,
+        reason = if (started) "smart-hard-cut" else "before-hard-cut-window",
+    )
+}
+
+/**
+ * Blueprint §5.7 ECHO_REVERB_OUT: an 8–12 bar decay on the outgoing grid
+ * while the incoming track fades in running natural — no time-stretch, the
+ * tempi are too far apart to sync. Wet scales with the tempo distance.
+ */
+private fun echoOutPlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    nextLength: Double,
+    playbackTime: Double,
+    mixAnchor: Double,
+    score: CompatibilityScore,
+    policyReasons: List<String>,
+): TransitionPlan {
+    val bpmOut = analysis.bpm.orZero()
+    val beatSeconds = if (bpmOut > 0) 60 / bpmOut else 0.5
+    val fade = min(32.0 * beatSeconds, min(mixAnchor * 0.6, ABSOLUTE_MAX_TRANSITION_SECONDS))
+        .coerceAtLeast(1.0)
+    val targetStart = max(0.0, mixAnchor - fade)
+    val transitionStart = alignedTransitionStart(
+        analysis, targetStart, mixAnchor - 0.05,
+        preferEarlier = true, minimum = targetStart,
+    )
+    val cue = incomingStartPoint(nextAnalysis)
+    val maxHandoff = nextLength - MIN_INCOMING_CLEARANCE_SECONDS
+    val handoff = if (nextLength > 0 && maxHandoff >= cue) min(cue, maxHandoff) else cue
+    val started = playbackTime >= transitionStart
+    val echoAmount = ((0.50 - score.bpm) / 0.50).coerceIn(0.3, 1.0)
+    return TransitionPlan(
+        shouldStart = started,
+        markerVisible = true,
+        transitionStart = transitionStart,
+        transitionEnd = mixAnchor,
+        fadeSeconds = (mixAnchor - transitionStart).coerceAtLeast(0.1),
+        transitionStyle = TransitionStyle.ECHO_REVERB_OUT,
+        type = TransitionType.ECHO_REVERB_OUT,
+        score = score,
+        echoAmount = echoAmount,
+        incomingCueTime = cue,
+        incomingHandoffTime = handoff,
+        incomingPlaybackRate = 1.0,
+        transitionBeats = 32,
+        bassSwap = false,
+        filterSweep = 0.0,
+        volumeCurve = VolumeCurve.LOGARITHMIC,
+        eqCurve = EQCurve.EQ_SWAP,
+        vocalOverlap = plannedVocalOverlap(analysis, nextAnalysis, transitionStart, mixAnchor, cue, 1.0),
+        outgoingBpm = bpmOut,
+        incomingBpm = 0.0,
+        policyReasons = policyReasons,
+        reason = if (started) "smart-echo-out" else "before-echo-out-window",
+    )
+}
+
+/**
+ * Blueprint §5.7 LOOP_CUT_DROP: the outgoing track loops its last 4 bars,
+ * freezes for 2, then cuts; the incoming track starts early enough to ARRIVE
+ * at its drop exactly at the cut and takes over at full volume. Volumes stay
+ * stepped ([VolumeCurve.INSTANT]) — the renderer holds the outgoing at full
+ * and the incoming at zero until the cut lands.
+ */
+private fun loopCutPlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    nextLength: Double,
+    playbackTime: Double,
+    mixAnchor: Double,
+    dropTime: Double,
+    score: CompatibilityScore,
+    policyReasons: List<String>,
+): TransitionPlan {
+    val bpmOut = analysis.bpm.orZero()
+    val beatOut = if (bpmOut > 0) 60 / bpmOut else 0.5
+    val windowSec = min(6 * 4 * beatOut, min(mixAnchor * 0.6, ABSOLUTE_MAX_TRANSITION_SECONDS))
+        .coerceAtLeast(1.0)
+    val transitionStart = alignedTransitionStart(
+        analysis, max(0.0, mixAnchor - windowSec), mixAnchor - 0.05,
+        preferEarlier = true, minimum = max(0.0, mixAnchor - windowSec),
+    )
+    val bpmIn = nextAnalysis.bpm.orZero()
+    val ratio = if (bpmOut > 0 && bpmIn > 0) normalizedTempoRatio(bpmOut, bpmIn) else 1.0
+    val rate = if (ratio in 0.9..1.1) 1.0 / ratio else 1.0
+    val dropSnap = nearestTimedValue(nextAnalysis.downbeats, dropTime, tolerance = beatOut * 4)
+        ?: dropTime
+    val buildInSec = (mixAnchor - transitionStart) * rate
+    val cue = max(0.0, dropSnap - buildInSec)
+    val started = playbackTime >= transitionStart
+    return TransitionPlan(
+        shouldStart = started,
+        markerVisible = true,
+        transitionStart = transitionStart,
+        transitionEnd = mixAnchor,
+        fadeSeconds = (mixAnchor - transitionStart).coerceAtLeast(0.1),
+        transitionStyle = TransitionStyle.LOOP_CUT_DROP,
+        type = TransitionType.LOOP_CUT_DROP,
+        score = score,
+        loopBars = 4,
+        dropCueTime = dropSnap,
+        incomingCueTime = cue,
+        incomingHandoffTime = dropSnap,
+        incomingPlaybackRate = rate,
+        transitionBeats = 24,
+        bassSwap = false,
+        filterSweep = 0.0,
+        volumeCurve = VolumeCurve.INSTANT,
+        eqCurve = EQCurve.NONE,
+        vocalOverlap = plannedVocalOverlap(analysis, nextAnalysis, transitionStart, mixAnchor, cue, rate),
+        outgoingBpm = bpmOut,
+        incomingBpm = if (rate != 1.0) bpmIn / rate else 0.0,
+        policyReasons = policyReasons,
+        reason = if (started) "smart-loop-cut" else "before-loop-cut-window",
+    )
+}
 
 private fun trackDurationSeconds(track: TransitionTrackInfo?): Double =
     if (track == null || track.durationMs <= 0) 0.0 else track.durationMs / 1000.0
@@ -887,7 +1141,18 @@ fun planTransition(
     } else {
         length
     }
-    val mixOutAnchor = resolveMixOutAnchor(analysis, contentEnd = finalMixAnchor, duration = length)
+    // Blueprint §7: mix-out candidates live in [length-3min, length-30s] with a
+    // length-60s fallback. Tracks too short to survive either keep the old
+    // behavior exactly.
+    val candidateWindow = (max(0.0, length - 180.0)..(length - 30.0))
+        .takeIf { length >= 90.0 && it.start < it.endInclusive }
+    val mixOutAnchor = resolveMixOutAnchor(
+        analysis,
+        contentEnd = finalMixAnchor,
+        duration = length,
+        allowedWindow = candidateWindow,
+        fallbackTime = if (length >= 90.0) length - 60.0 else null,
+    )
     val hasInteriorMixOut = mixOutAnchor.time < finalMixAnchor - 1
 
     if (albumSequential && sameAlbum(currentTrack, nextTrack) && !hasInteriorMixOut) {
@@ -947,12 +1212,44 @@ fun planTransition(
 
     val nextLength = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
 
+    // Blueprint §5.6: score the pair once on proxy points, then route to the
+    // archetype's implementation. phraseSwitch below is the HARMONIC_BLEND
+    // engine and the adaptive tail is SMOOTH_CROSSFADE/FILTER_SWEEP; the other
+    // three archetypes branch to their own planners here and never reach them.
+    val proxyEntry = incomingCuePoint(nextAnalysis)
+    val proxyScore = scoreCompatibility(analysis, nextAnalysis, mixAnchor, proxyEntry)
+    if (proxyScore.overall < SCORE_ACCEPTABLE) {
+        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+    }
+    val dropInB = firstDropSec(nextAnalysis)
+    val highEnergyA = isHighEnergyAt(analysis, mixAnchor)
+    val highEnergyB = isHighEnergyAt(nextAnalysis, proxyEntry)
+    val selectedType = selectTransitionType(proxyScore, highEnergyA, highEnergyB, dropInB != null)
+    if (selectedType == TransitionType.ECHO_REVERB_OUT) {
+        return echoOutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyScore, policy.reasons,
+        )
+    }
+    if (selectedType == TransitionType.LOOP_CUT_DROP && dropInB != null) {
+        return loopCutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons,
+        )
+    }
+    if (selectedType == TransitionType.HARD_CUT) {
+        return hardCutPlan(analysis, nextAnalysis, length, playbackTime, mixAnchor, proxyScore, policy.reasons)
+    }
+
     phraseSwitch(analysis, nextAnalysis, length, nextLength)
         ?.takeIf { playbackTime < it.transitionEnd }
         ?.let { plan ->
             val started = playbackTime >= plan.transitionStart
             return plan.copy(
                 shouldStart = started,
+                type = TransitionType.HARMONIC_BLEND,
+                score = scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime),
+                eqCurve = EQCurve.BASS_SWAP,
                 policyReasons = policy.reasons,
                 reason = if (started) "smart-phrase-switch" else "before-phrase-switch",
             )
@@ -973,10 +1270,10 @@ fun planTransition(
         }
     val mixEnd = max(0.0, mixAnchor - outgoingArrangementOverlap)
     val maximumOverlap = minOf(
-        if (handoffBpm > 0) (AUTO_TRANSITION_MAX_BEATS * 60) / handoffBpm else AUTO_TRANSITION_MAX_SECONDS,
-        AUTO_TRANSITION_MAX_SECONDS,
-        mixEnd * 0.4,
-        if (nextLength > 0) nextLength * 0.4 else AUTO_TRANSITION_MAX_SECONDS,
+        if (handoffBpm > 0) (maxBeatsFor(selectedType) * 60) / handoffBpm else AUTO_TRANSITION_MAX_SECONDS,
+        ABSOLUTE_MAX_TRANSITION_SECONDS,
+        mixEnd * 0.6,
+        if (nextLength > 0) nextLength * 0.6 else AUTO_TRANSITION_MAX_SECONDS,
     )
     val handoffBeats = if (sameBeatBlend) 8 else 4
     val beatSeconds = if (handoffBpm > 0) 60 / handoffBpm else 0.5
@@ -1055,6 +1352,19 @@ fun planTransition(
 
     val alignedOverlap = mixEnd - transitionStart
     val hasBassContent = analysis.lowEnergyCurve.isNotEmpty() || nextAnalysis.lowEnergyCurve.isNotEmpty()
+    val finalScore = scoreCompatibility(analysis, nextAnalysis, transitionStart, finalIncomingCueTime)
+    // Blueprint §5.7 FILTER_SWEEP DSP rule: shift the incoming track toward
+    // the outgoing key when a small shift suffices, mask with the sweep when
+    // it does not (semitonesToShift answers 0 in both the done and the
+    // hopeless cases, which is exactly when no shift applies).
+    val keyShift = if (!sameBeatBlend &&
+        analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
+        keyScore(analysis.key, nextAnalysis.key) in 0.45..0.75
+    ) {
+        semitonesToShift(analysis.key, nextAnalysis.key)
+    } else {
+        0
+    }
     val started = playbackTime >= transitionStart
     return TransitionPlan(
         shouldStart = started,
@@ -1071,6 +1381,11 @@ fun planTransition(
         transitionBeats = transitionBeats,
         bassSwap = sameBeatBlend || hasBassContent,
         transitionStyle = if (sameBeatBlend) TransitionStyle.DJ_BLEND else TransitionStyle.DJ_FILTER,
+        type = if (sameBeatBlend) TransitionType.SMOOTH_CROSSFADE else TransitionType.FILTER_SWEEP,
+        score = finalScore,
+        keyShiftSemitones = keyShift,
+        volumeCurve = VolumeCurve.S_CURVE,
+        eqCurve = if (sameBeatBlend) EQCurve.BASS_SWAP else EQCurve.EQ_SWAP,
         // The two styles are alternatives, not a scale: a matched pair hands the
         // low end over on a beat and otherwise stays open, while an unmatched
         // pair has no shared grid to hand anything over on and instead pulls the
