@@ -4,6 +4,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
@@ -272,6 +273,8 @@ class CrossfadeController(
         val echoAmount: Double = 0.0,
         /** One bar of the outgoing grid in seconds: the echo repeat period. 0 parks the line. */
         val echoBeatSeconds: Double = 0.0,
+        /** Blueprint §5.2: semitone shift of the incoming track (±2). Rendered as pitch, not speed. */
+        val keyShiftSemitones: Int = 0,
         /** Blueprint LOOP_CUT_DROP: bars of outgoing tail looped before the freeze-and-cut. */
         val loopBars: Int = 0,
     )
@@ -643,6 +646,7 @@ class CrossfadeController(
                 echoAmount = plan.echoAmount,
                 echoBeatSeconds = plan.outgoingBpm.takeIf { it > 0 }?.let { 60.0 / it } ?: 0.0,
                 loopBars = plan.loopBars,
+                keyShiftSemitones = plan.keyShiftSemitones,
             ),
         )
     }
@@ -826,7 +830,16 @@ class CrossfadeController(
         // Stacks on top of the listener's speed control rather than replacing
         // it, so a beatmatched transition and "play everything at 1.25x" don't
         // fight each other. Undone in [finish].
-        into.setPlaybackSpeed((AppSettings.playbackSpeed.value * incomingPlaybackRate).toFloat())
+        // Blueprint §5.2: the key shift rides as pitch, independent of the
+        // tempo stretch — Sonic (already in the chain) renders both at once,
+        // and shifting pitch leaves the beat grid exactly where the stretch
+        // put it.
+        into.setPlaybackParameters(
+            PlaybackParameters(
+                (AppSettings.playbackSpeed.value * incomingPlaybackRate).toFloat(),
+                2.0.pow(render.keyShiftSemitones / 12.0).toFloat(),
+            ),
+        )
         into.volume = 0f
         into.setMediaItems(items, nextIndex, incomingCueTimeMs)
         // Buffers without sounding. Started for real in [startFade].
@@ -1087,10 +1100,12 @@ class CrossfadeController(
             // and owns the queue from here, and the outgoing one is spare.
             incoming?.let {
                 it.volume = 1f
-                // Undoes whatever [begin] stacked on for a beatmatched handoff.
+                // Undoes whatever [begin] stacked on for a beatmatched handoff —
+                // speed AND pitch. setPlaybackSpeed would leave a shifted pitch
+                // behind to leak into the next track, so both reset together.
                 // Unconditional and idempotent, so this is correct whether or
-                // not a stretch was ever actually applied.
-                it.setPlaybackSpeed(AppSettings.playbackSpeed.value)
+                // not a stretch or shift was ever actually applied.
+                it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
             }
             outgoing?.let(::retire)
         } else {
@@ -1128,7 +1143,9 @@ class CrossfadeController(
         player.stop()
         player.clearMediaItems()
         player.volume = 1f
-        player.setPlaybackSpeed(AppSettings.playbackSpeed.value)
+        // Parameters, not speed alone: a retired player may carry a key shift,
+        // and it is some future transition's incoming player.
+        player.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
     }
 
     // ---- Numbers ------------------------------------------------------------
