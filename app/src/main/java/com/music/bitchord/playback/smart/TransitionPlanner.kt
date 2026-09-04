@@ -464,7 +464,7 @@ private fun normalizedTempoRatio(currentBpm: Double, nextBpm: Double): Double {
 
 private fun splitKey(key: String): Pair<Int?, String?> {
     val parts = key.trim().split(' ')
-    return KEY_INDEX[parts.firstOrNull()] to parts.getOrNull(1)
+    return KEY_INDEX[canonicalKeyRoot(parts.firstOrNull())] to parts.getOrNull(1)
 }
 
 private fun keyDistance(left: String, right: String): Int? {

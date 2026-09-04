@@ -93,6 +93,11 @@ class PitchTrackerTest {
         assertEquals(0.85, keyScore("C major", "A minor"), 1e-9)
         assertEquals(9, keyRootIndex("A minor"))
         assertEquals(4, keyRootIndex("E minor"))
+        // The detector emits ASCII; the tables read Unicode. Both must parse.
+        assertEquals(camelotOf("F♯ major"), camelotOf("F# major"))
+        assertEquals(6, keyRootIndex("F# major"))
+        assertEquals(10, keyRootIndex("Bb major"))
+        assertEquals(1.0, keyScore("F# major", "F♯ major"), 1e-9)
     }
 
     @Test

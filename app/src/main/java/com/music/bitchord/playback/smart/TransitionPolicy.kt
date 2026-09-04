@@ -611,6 +611,21 @@ private val PITCH_CLASS_INDEX = mapOf(
 )
 
 /**
+ * The native detector emits ASCII accidentals ("C# minor", "Bb major") while
+ * every Kotlin table reads Unicode ("C♯", "B♭") — and JNI documents its
+ * strings as ASCII-only literals, so Unicode can never arrive. Canonicalize
+ * at the single lookup point all tables share: without it every sharp/flat
+ * key in production parses to null and silently disables key scoring,
+ * shifting and the pitch veto.
+ */
+fun canonicalKeyRoot(raw: String?): String? {
+    if (raw.isNullOrEmpty()) return null
+    if (raw.endsWith("#")) return raw.dropLast(1) + "♯"
+    if (raw.length == 2 && raw[0] in 'A'..'G' && raw[1] == 'b') return "${raw[0]}♭"
+    return raw
+}
+
+/**
  * Blueprint §5.2 mapping, derived arithmetically rather than tabulated: walk
  * the circle of fifths from C (= 8B) in semitone steps of a fifth. Minor takes
  * its relative major's number (A minor -> 8A via C major).
@@ -619,7 +634,7 @@ private val PITCH_CLASS_INDEX = mapOf(
  */
 fun camelotOf(key: String): Pair<Int, Boolean>? {
     val parts = key.trim().split(' ')
-    val index = PITCH_CLASS_INDEX[parts.firstOrNull()] ?: return null
+    val index = PITCH_CLASS_INDEX[canonicalKeyRoot(parts.firstOrNull())] ?: return null
     val minor = when (parts.getOrNull(1)?.lowercase()) {
         "minor", "m" -> true
         "major", "maj", "" -> false
@@ -672,7 +687,7 @@ fun semitonesToShift(fromKey: String, toKey: String): Int {
     if (keyScoreOf(from.first, from.second, to.first, to.second) >= 0.75) return 0
     // Shifting pitch preserves mode, so only the pitch-class index moves and
     // the Camelot number is re-derived per candidate shift, smallest first.
-    val toIndex = PITCH_CLASS_INDEX[toKey.trim().split(' ').firstOrNull()] ?: return 0
+    val toIndex = PITCH_CLASS_INDEX[canonicalKeyRoot(toKey.trim().split(' ').firstOrNull())] ?: return 0
     for (magnitude in 1..MAX_KEY_SHIFT_SEMITONES) {
         for (shift in listOf(magnitude, -magnitude)) {
             val shifted = (toIndex + shift + 12) % 12
@@ -691,7 +706,7 @@ private fun camelotMajorNumber(pitchIndex: Int, minor: Boolean): Int {
 
 /** Pitch-class index (C = 0) of a detected [key], or null when unparseable. */
 fun keyRootIndex(key: String): Int? =
-    PITCH_CLASS_INDEX[key.trim().split(' ').firstOrNull()]
+    PITCH_CLASS_INDEX[canonicalKeyRoot(key.trim().split(' ').firstOrNull())]
 
 /**
  * Whether a trusted measured median F0 contradicts the incoming track's own
