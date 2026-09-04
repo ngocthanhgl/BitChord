@@ -293,6 +293,12 @@ data class TransitionPlan(
      * Empty when no grid survives the stretch.
      */
     val halfTimeEmphasis: List<Double> = emptyList(),
+    /**
+     * v2 §7a/T6: overlap length in seconds, as the plan sized it. The render
+     * rides read it back (mid-kill gate, reverb envelope windows) because
+     * Render carries no span of its own.
+     */
+    val overlapSeconds: Double = 0.0,
 ) {
     /** Convenience for the engine, which schedules in milliseconds. */
     val fadeMs: Long get() = (fadeSeconds * 1000).roundToLong()
