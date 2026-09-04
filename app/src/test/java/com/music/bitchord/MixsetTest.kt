@@ -4,11 +4,14 @@ import com.music.bitchord.playback.smart.CrossfadeMode
 import com.music.bitchord.playback.smart.EnergySample
 import com.music.bitchord.playback.smart.MixCandidate
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.alignMixsetExitToIncomingDrop
 import com.music.bitchord.playback.smart.bestPartCue
 import com.music.bitchord.playback.smart.buildupStart
 import com.music.bitchord.playback.smart.mixsetEntryPoint
 import com.music.bitchord.playback.smart.mixsetMixOutAnchor
+import com.music.bitchord.playback.smart.phrase16Grid
 import com.music.bitchord.playback.smart.planTransition
+import com.music.bitchord.playback.smart.snapToPhrase16
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -121,6 +124,105 @@ class MixsetTest {
             1e-6,
         )
         assertNull(bestPartCue(TrackAnalysis()))
+    }
+
+    // -- Spec 16-bar grid + snap ------------------------------------------------
+
+    @Test
+    fun phrase16Grid_stridesSixteenDownbeats() {
+        val analysis = TrackAnalysis(
+            downbeats = (0..150).map { it * 2.0 },
+            beatInterval = 0.5,
+        )
+        assertEquals(listOf(0.0, 32.0, 64.0, 96.0), phrase16Grid(analysis).take(4))
+    }
+
+    @Test
+    fun snapToPhrase16_landsOnPhraseStart() {
+        val analysis = TrackAnalysis(
+            downbeats = (0..150).map { it * 2.0 },
+            beatInterval = 0.5,
+        )
+        // At-or-before by default: 100 sits inside the 96 phrase.
+        assertEquals(96.0, snapToPhrase16(analysis, 100.0), 1e-6)
+        // Nearest either side on request: 114 belongs to the 128 phrase.
+        assertEquals(128.0, snapToPhrase16(analysis, 114.0, preferEarlier = false), 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_tier2_dropPlusTwoPhrases() {
+        val length = 300.0
+        // Drop at 96 on a flat bed (no cooldown anywhere): tier 1 misses, so
+        // the anchor is Drop 1 + 2 spec phrases (2 x 30 s at 128 BPM),
+        // snapped to the nearest 16-bar start: 160.
+        val points = curve(length, energyAt = { t -> if (t == 96.0) 3.0 else 1.0 })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            bpm = 128.0,
+            beatInterval = 0.46875,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..150).map { it * 2.0 },
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals("mixset_peak", anchor.type)
+        assertEquals(160.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_tier3_escapesAllSingingWindow() {
+        val length = 320.0
+        // Drop at 60 on a flat bed with a voice over every grid point: the
+        // calm-aware fallback can only offer singing, so the blind spec 40%
+        // (128) wins over cutting on a vocal.
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = List(points.size) { 0.9 },
+            downbeats = (0..150).map { it * 2.0 },
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals("mixset_peak", anchor.type)
+        assertEquals(128.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun alignMixsetExit_pullsBackWithinNudge_only() {
+        val out = TrackAnalysis(
+            beatInterval = 0.5,
+            downbeats = (0..150).map { it * 2.0 },
+            energyCurve = curve(300.0),
+            vocalActivityMask = calmMask(301),
+        )
+        fun incomingWithDrop(dropAt: Double): TrackAnalysis {
+            val points = curve(240.0, energyAt = { t -> if (t == dropAt) 3.0 else 1.0 })
+            return TrackAnalysis(
+                introEndTime = 10.0,
+                energyCurve = points,
+                vocalActivityMask = calmMask(points.size),
+            )
+        }
+        // Drop at 130 while A exits at 134: pull back to the 128 phrase
+        // start, 6 s inside the nudge budget.
+        assertEquals(
+            128.0,
+            alignMixsetExitToIncomingDrop(out, incomingWithDrop(130.0), 134.0, mixset = true),
+            1e-6,
+        )
+        // Drop at 100 while A exits at 150: a 22 s jump is not a nudge, so
+        // A's comedown stands.
+        assertEquals(
+            150.0,
+            alignMixsetExitToIncomingDrop(out, incomingWithDrop(100.0), 150.0, mixset = true),
+            1e-6,
+        )
+        // Normal mode never aligns.
+        assertEquals(
+            134.0,
+            alignMixsetExitToIncomingDrop(out, incomingWithDrop(130.0), 134.0, mixset = false),
+            1e-6,
+        )
     }
 
     // -- mixsetMixOutAnchor ----------------------------------------------------
@@ -251,8 +353,8 @@ class MixsetTest {
     fun mixsetAnchor_landsOnFirstCooldown() {
         val length = 300.0
         // Drop at 60, then a cliff into a settled low stretch from 129:
-        // the anchor opens the cooldown at the 130 grid point instead of
-        // waiting for the 150 target.
+        // the cooldown opens at the 130 grid point, snapped back to the 128
+        // phrase start per spec — cuts land on phrase starts, never mid-phrase.
         val points = curve(length, energyAt = { t ->
             when {
                 t == 60.0 -> 3.0
@@ -269,7 +371,7 @@ class MixsetTest {
         )
         val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
         assertEquals("mixset_peak", anchor.type)
-        assertEquals(130.0, anchor.time, 1e-6)
+        assertEquals(128.0, anchor.time, 1e-6)
     }
 
     @Test
@@ -295,7 +397,7 @@ class MixsetTest {
             phraseBoundaries = listOf(130.0),
         )
         val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
-        assertEquals(130.0, anchor.time, 1e-6)
+        assertEquals(128.0, anchor.time, 1e-6)
     }
 
     @Test
@@ -314,7 +416,8 @@ class MixsetTest {
             downbeats = (0..100).map { it * 2.0 },
         )
         assertEquals(66.0, buildupStart(analysis, 120.0)!!, 1e-6)
-        assertEquals(66.0, mixsetEntryPoint(analysis)!!, 1e-6)
+        // The entry snaps the foot back to the phrase start per spec.
+        assertEquals(64.0, mixsetEntryPoint(analysis)!!, 1e-6)
     }
 
     @Test

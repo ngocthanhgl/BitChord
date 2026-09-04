@@ -1304,12 +1304,14 @@ fun planTransition(
     val preferredMixAnchor = min(length, mixOutAnchor.time)
     // A mixset anchor is interior by design — the playhead reaching it is the
     // transition arriving, not a missed window to abandon for the track end.
-    val mixAnchor =
+    val rawMixAnchor =
         if (!mixset && playbackTime >= preferredMixAnchor - 0.05 && preferredMixAnchor < finalMixAnchor - 1) {
             finalMixAnchor
         } else {
             preferredMixAnchor
         }
+    // Spec: the incoming drop lands after the outgoing track is gone.
+    val mixAnchor = alignMixsetExitToIncomingDrop(analysis, nextAnalysis, rawMixAnchor, mixset)
 
     val nextLength = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
 

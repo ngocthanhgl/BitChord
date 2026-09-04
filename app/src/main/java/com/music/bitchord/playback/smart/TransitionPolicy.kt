@@ -884,6 +884,78 @@ const val MIXSET_BUILDUP_MIN_SECONDS = 4.0
 const val MIXSET_BUILDUP_RISE_MARGIN = 0.5
 /** Mixset blends are cuts between peaks, never long beds: overlap ceiling in beats. */
 const val MIXSET_MAX_BEATS = 16.0
+/**
+ * Spec active-playtime ceiling: from one phrase before Drop 1 to the exit
+ * the listener should hear at most 3 minutes of a track. Past that the exit
+ * is pulled back to the nearest 16-bar start inside the budget.
+ */
+const val MIXSET_MAX_ACTIVE_PLAY_SECONDS = 180.0
+/**
+ * Spec phrase = 16 bars. The native analyzer emits 8-bar phrase boundaries,
+ * so the 16-bar grid is derived in Kotlin: every 16th downbeat (downbeats
+ * are bar starts), else every 2nd phrase boundary, else synthesized from
+ * firstBeat + k * 16 bars. Zero native/JNI cost.
+ */
+const val MIXSET_PHRASE_BARS = 16
+
+/**
+ * The spec's 16-bar grid for [analysis], ascending. Empty only when the
+ * analysis carries no timing at all (no downbeats, no phrases, no beat
+ * interval) — callers then fall back to the raw time.
+ */
+fun phrase16Grid(analysis: TrackAnalysis): List<Double> {
+    val downs = analysis.downbeats.filter { it.isFinite() }.sorted()
+    if (downs.size >= MIXSET_PHRASE_BARS * 2) {
+        return downs.filterIndexed { index, _ -> index % MIXSET_PHRASE_BARS == 0 }
+    }
+    val phrases = analysis.phraseBoundaries.filter { it.isFinite() }.sorted()
+    if (phrases.size >= 4) {
+        return phrases.filterIndexed { index, _ -> index % 2 == 0 }
+    }
+    val interval = analysis.beatInterval.orZero().takeIf { it > 0 }
+        ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.0
+    val first = analysis.firstBeat.orZero()
+    val duration = analysis.duration.orZero()
+    if (interval <= 0 || duration <= 0) return emptyList()
+    val step = interval * 4 * MIXSET_PHRASE_BARS
+    val grid = mutableListOf<Double>()
+    var t = first
+    while (t <= duration) {
+        grid.add(t)
+        t += step
+    }
+    return grid
+}
+
+/**
+ * Spec snap: the nearest 16-bar boundary at or before [time] when one is
+ * within [tolerance] (default one phrase), else [time]. Cuts land on phrase
+ * starts, never mid-phrase.
+ */
+fun snapToPhrase16(
+    analysis: TrackAnalysis,
+    time: Double,
+    tolerance: Double = Double.POSITIVE_INFINITY,
+    preferEarlier: Boolean = true,
+): Double {
+    if (!time.isFinite()) return time
+    val grid = phrase16Grid(analysis)
+    if (grid.isEmpty()) return time
+    val tol = if (tolerance.isFinite()) tolerance else {
+        val interval = analysis.beatInterval.orZero().takeIf { it > 0 }
+            ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+        interval * 4 * MIXSET_PHRASE_BARS
+    }
+    if (preferEarlier) {
+        val snapped = grid.filter { it <= time + 1e-6 }.maxOrNull()
+        if (snapped != null && time - snapped <= tol) return max(0.0, snapped)
+    } else {
+        val nearest = grid.minByOrNull { abs(it - time) }
+        if (nearest != null && abs(nearest - time) <= tol) return max(0.0, nearest)
+    }
+    val nearest = grid.minByOrNull { abs(it - time) } ?: return time
+    return if (abs(nearest - time) <= tol) max(0.0, nearest) else time
+}
 
 /**
  * The track's best part: its drop, else its loudest moment past the intro,
@@ -955,19 +1027,53 @@ fun buildupStart(analysis: TrackAnalysis, peakTime: Double): Double? {
  */
 fun mixsetEntryPoint(analysis: TrackAnalysis): Double? {
     val peak = bestPartCue(analysis) ?: return null
-    return buildupStart(analysis, peak) ?: peak
+    val entry = buildupStart(analysis, peak) ?: peak
+    // Spec: every entry decision happens at a phrase boundary.
+    return snapToPhrase16(analysis, entry)
 }
 
 /**
- * Mixset outgoing anchor: the first cooldown past the track's best part — a
- * low, settled stretch where the peak has audibly ended — inside the
- * 60–120 s window. Cutting on the comedown instead of at a fixed offset is
- * what keeps a long chorus from being cut mid-phrase. When the curve shows
- * no cooldown (a track that never comes down), the anchor falls back to the
- * calmest grid point near the 90 s target. A rescue anchor just ahead of the
- * playhead when it is already past the window — a manually started track
- * plays from 0, not from its best cue, so the computed window can already
- * be behind.
+ * Spec drop alignment (mixset only): the incoming track's drop must land
+ * after the outgoing track is gone. When B's drop fires while A is still
+ * up, pull A's exit back to the 16-bar start at/before the drop — but only
+ * a nudge, never a jump: a gap beyond the wait tolerance means B's
+ * structure doesn't fit the short overlap, and A's comedown wins over
+ * forcing the alignment.
+ */
+fun alignMixsetExitToIncomingDrop(
+    outgoing: TrackAnalysis,
+    incoming: TrackAnalysis,
+    anchor: Double,
+    mixset: Boolean,
+): Double {
+    if (!mixset || !anchor.isFinite()) return anchor
+    val dropB = firstDropSec(incoming) ?: return anchor
+    if (!dropB.isFinite() || dropB >= anchor) return anchor
+    val pulled = snapToPhrase16(outgoing, dropB)
+    if (pulled >= anchor || anchor - pulled > MIXSET_WAIT_TOLERANCE_SECONDS) return anchor
+    return max(0.0, pulled)
+}
+
+/**
+ * Spec 16-bar phrase length in seconds, from the beat interval. Null when the
+ * analysis carries no tempo — tier-2 exit then cannot be computed.
+ */
+fun phrase16Seconds(analysis: TrackAnalysis): Double? {
+    val interval = analysis.beatInterval.orZero().takeIf { it > 0 }
+        ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.0
+    return if (interval > 0) interval * 4 * MIXSET_PHRASE_BARS else null
+}
+
+/**
+ * Mixset outgoing anchor, spec exit rules: (1) BREAK start right after Drop 1
+ * — the first cooldown at/after the drop, snapped to the 16-bar grid;
+ * (2) Drop 1 + 2 spec phrases; (3) 40% of duration. The anchor stays inside
+ * the 60–120 s play window past the best part; when no spec tier lands in
+ * the window the calm-vocal fallback decides. A mid-DROP landing is pushed
+ * to the next 16-bar start — cutting inside the drop sounds like a power
+ * outage. A rescue anchor just ahead of the playhead when it is already
+ * past the window — a manually started track plays from 0, not from its
+ * best cue, so the computed window can already be behind.
  */
 fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Double): MixOutAnchor {
     val rescue = MixOutAnchor(
@@ -983,16 +1089,74 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
     val from = max(0.0, floor)
     val to = min(length, cap)
     if (to <= from) return rescue
+    val drop = firstDropSec(analysis)
+    // Tier 1: BREAK start after Drop 1.
+    val tier1From = if (drop != null && drop.isFinite()) max(from, drop) else from
+    var exit = cooldownLanding(analysis, tier1From, to)?.let { snapToPhrase16(analysis, it) }
+    // Tier 2: Drop 1 + 2 spec phrases, snapped to the nearest 16-bar start
+    // (either side — an at-or-before snap would slide under the play floor
+    // whenever the raw target sits right on it).
+    if (exit == null && drop != null && drop.isFinite()) {
+        val phrase16 = phrase16Seconds(analysis)
+        if (phrase16 != null) {
+            val tier2 = snapToPhrase16(analysis, drop + 2 * phrase16, preferEarlier = false)
+            if (tier2 in from..to) exit = tier2
+        }
+    }
     // Energy first: a quiet-but-singing cooldown still beats a loud calm
     // point, because the comedown is over and the blend has room. The vocal
     // penalty below only breaks ties the energy leaves.
-    cooldownLanding(analysis, from, to)?.let { landing ->
-        val time = landing.coerceIn(0.0, max(0.0, length - 2.0))
-        return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
-    }
-    val time = fallbackMixsetAnchor(analysis, from, to, base)
+    var time = (exit ?: fallbackMixsetAnchor(analysis, from, to, base))
         .coerceIn(0.0, max(0.0, length - 2.0))
+    if (exit == null) {
+        // Tier 3 (spec 40% fallback) as a vocal escape hatch: the calm-aware
+        // fallback stands whenever it lands off-voice, but a blind
+        // instrumental 40% beats cutting on top of a singing voice.
+        val anchorVocal = vocalActivityBetween(analysis, time - 2.0, time + 2.0)
+        if (anchorVocal != null && anchorVocal > 0.65) {
+            val tier3 = snapToPhrase16(analysis, 0.40 * length, preferEarlier = false)
+            if (tier3 in from..to) {
+                time = tier3.coerceIn(0.0, max(0.0, length - 2.0))
+            }
+        }
+    }
+    time = capActivePlaytime(analysis, entry, time, length)
+    time = pushPastDrop(analysis, time, drop, length)
     return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
+}
+
+/**
+ * Spec active playtime: what the listener hears runs from one phrase before
+ * the drop to the exit, at most 3 minutes. Past the budget the exit comes
+ * back to the nearest 16-bar start inside it — unless that would break the
+ * 60 s play floor, in which case the floor wins.
+ */
+private fun capActivePlaytime(analysis: TrackAnalysis, entry: Double, time: Double, length: Double): Double {
+    val drop = firstDropSec(analysis) ?: entry.takeIf { it.isFinite() } ?: return time
+    if (!drop.isFinite() || !time.isFinite()) return time
+    val phrase16 = phrase16Seconds(analysis) ?: return time
+    val listenStart = max(0.0, drop - phrase16)
+    if (time - listenStart <= MIXSET_MAX_ACTIVE_PLAY_SECONDS) return time
+    val capped = phrase16Grid(analysis).filter { it <= listenStart + MIXSET_MAX_ACTIVE_PLAY_SECONDS }.maxOrNull()
+        ?: return time
+    if (capped < entry + MIXSET_MIN_PLAY_SECONDS) return time
+    return capped.coerceIn(0.0, max(0.0, length - 2.0)).coerceAtMost(time)
+}
+
+/**
+ * Never cut mid-DROP: when the anchor sits inside drop-level energy at or
+ * past the drop, move it to the next 16-bar start. A single push — a track
+ * that never comes down still has to end somewhere.
+ */
+private fun pushPastDrop(analysis: TrackAnalysis, time: Double, drop: Double?, length: Double): Double {
+    if (drop == null || !drop.isFinite() || !time.isFinite()) return time
+    if (time < drop - 1.0) return time
+    val dropEnergy = energyAt(analysis, drop) ?: return time
+    if (dropEnergy <= 0) return time
+    val here = energyAt(analysis, time) ?: return time
+    if (here < dropEnergy * 0.8) return time
+    val next = phrase16Grid(analysis).firstOrNull { it > time + 1.0 } ?: return time
+    return next.coerceIn(0.0, max(0.0, length - 2.0))
 }
 
 /**
