@@ -124,9 +124,12 @@ class MixsetTest {
     // -- mixsetMixOutAnchor ----------------------------------------------------
 
     @Test
-    fun mixsetAnchor_snapsNinetySecondsPastDrop() {
+    fun mixsetAnchor_waitsPastTargetForNearestCalm() {
         val length = 300.0
         val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        // Drop at 60 -> floor 120, target 150, cap 180. The grid holds 150
+        // itself, but the anchor waits for 152 past the target instead of
+        // stopping on it: peaks get room to finish.
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
             energyCurve = points,
@@ -136,7 +139,47 @@ class MixsetTest {
         )
         val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
         assertEquals("mixset_peak", anchor.type)
-        assertEquals(150.0, anchor.time, 1e-6)
+        assertEquals(152.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_waitsForCalmLanding_afterTarget() {
+        val length = 300.0
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        // Singing 148-154, calm at the 156 phrase: 146 is closer to the 150
+        // target and calm, but the anchor waits the 6 extra seconds for the
+        // post-peak landing instead of cutting the chorus short.
+        val mask = points.map { p ->
+            if (p.time >= 148.0 && p.time <= 154.0) 0.9 else 0.1
+        }
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = mask,
+            downbeats = (60..90).map { it * 2.0 },
+            phraseBoundaries = listOf(146.0, 156.0),
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals("mixset_peak", anchor.type)
+        assertEquals(156.0, anchor.time, 1e-6)
+    }
+
+    @Test
+    fun mixsetAnchor_shortTrackFallsBackToRescue() {
+        // Entry at 60 pushes the 60 s floor past the 100 s track: no window
+        // exists, so the anchor degrades to just ahead of the playhead
+        // instead of cutting blindly or crashing.
+        val length = 100.0
+        val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
+        val analysis = TrackAnalysis(
+            introEndTime = 10.0,
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+            downbeats = (0..50).map { it * 2.0 },
+        )
+        val anchor = mixsetMixOutAnchor(analysis, length, playbackTime = 0.0)
+        assertEquals("mixset_rescue", anchor.type)
+        assertTrue(anchor.time in 0.0..length)
     }
 
     @Test

@@ -848,10 +848,26 @@ fun scoreCompatibility(
     return CompatibilityScore(bpm, key, energy, structure, vocal, overall)
 }
 
-/** Mixset Mode: each track plays about this long of its best part before the cut. */
-const val MIXSET_PLAY_SECONDS = 90.0
-/** How far around that point the anchor may wander for a phrase and calm vocal. */
-const val MIXSET_ANCHOR_SEARCH_SECONDS = 15.0
+/**
+ * Mixset Mode play window past the track's best part, in seconds: never cut
+ * before the minimum, aim for the target, and wait past it — up to the
+ * maximum — for a phrase boundary with a calm vocal. A peak gets room to
+ * finish instead of being cut mid-chorus at a fixed offset.
+ */
+const val MIXSET_MIN_PLAY_SECONDS = 60.0
+const val MIXSET_TARGET_PLAY_SECONDS = 90.0
+const val MIXSET_MAX_PLAY_SECONDS = 120.0
+/**
+ * How much longer (in score-seconds) the anchor may play past the target for
+ * a post-peak landing instead of taking a better-scoring point before it.
+ */
+const val MIXSET_WAIT_TOLERANCE_SECONDS = 8.0
+/**
+ * Landing on a singing voice costs more than any distance inside the window
+ * (at most 30 s each way): when any calm grid point exists, the anchor never
+ * lands on a vocal. Unknown stays cheap — absence of a mask is not evidence.
+ */
+const val MIXSET_SINGING_PENALTY = 40.0
 /** Mixset blends are cuts between peaks, never long beds: overlap ceiling in beats. */
 const val MIXSET_MAX_BEATS = 16.0
 
@@ -885,12 +901,14 @@ private fun maxEnergyTimeAfterIntro(analysis: TrackAnalysis): Double? {
 }
 
 /**
- * Mixset outgoing anchor: [MIXSET_PLAY_SECONDS] past the track's best part,
- * snapped to the nearest phrase boundary or downbeat inside
- * ±[MIXSET_ANCHOR_SEARCH_SECONDS] whose surroundings sing the least. A rescue
- * anchor just ahead of the playhead when it is already past the window —
- * a manually started track plays from 0, not from its best cue, so the
- * computed window can already be behind.
+ * Mixset outgoing anchor: at least [MIXSET_MIN_PLAY_SECONDS] past the track's
+ * best part, aiming for [MIXSET_TARGET_PLAY_SECONDS], but waiting past the
+ * target — up to [MIXSET_MAX_PLAY_SECONDS] — for a phrase boundary or
+ * downbeat whose surroundings sing the least. Cutting at a fixed offset
+ * lands mid-chorus whenever the peak runs long; waiting for the peak to end
+ * is what a DJ does. A rescue anchor just ahead of the playhead when it is
+ * already past the window — a manually started track plays from 0, not from
+ * its best cue, so the computed window can already be behind.
  */
 fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Double): MixOutAnchor {
     val rescue = MixOutAnchor(
@@ -899,25 +917,39 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
         discardedMusicSeconds = 0.0,
     )
     val entry = bestPartCue(analysis) ?: return rescue
-    val base = entry + MIXSET_PLAY_SECONDS
-    if (playbackTime >= base - 10.0) return rescue
-    val from = max(0.0, base - MIXSET_ANCHOR_SEARCH_SECONDS)
-    val to = min(length, base + MIXSET_ANCHOR_SEARCH_SECONDS)
+    val floor = entry + MIXSET_MIN_PLAY_SECONDS
+    val base = entry + MIXSET_TARGET_PLAY_SECONDS
+    val cap = entry + MIXSET_MAX_PLAY_SECONDS
+    if (playbackTime >= cap - 10.0) return rescue
+    val from = max(0.0, floor)
+    val to = min(length, cap)
     if (to <= from) return rescue
-    val grid = (analysis.phraseBoundaries + analysis.downbeats)
-        .filter { it.isFinite() && it in from..to }
-        .distinct()
     // A calm landing matters more than exact seconds: singing over the cut is
     // what makes a mixset transition sound late. Measured-calm wins, unknown
-    // is second choice, singing is last.
-    val chosen = grid.minByOrNull { candidate ->
-        val vocal = vocalActivityBetween(analysis, candidate - 2.0, candidate + 2.0)
+    // is second choice, singing is last — and last by a margin no distance
+    // inside the window can overcome (see MIXSET_SINGING_PENALTY).
+    fun scored(time: Double): Double {
+        val vocal = vocalActivityBetween(analysis, time - 2.0, time + 2.0)
         val penalty = when {
             vocal == null -> 2.0
             vocal < 0.4 -> 0.0
-            else -> 8.0
+            else -> MIXSET_SINGING_PENALTY
         }
-        abs(candidate - base) + penalty
+        return abs(time - base) + penalty
+    }
+    val grid = (analysis.phraseBoundaries + analysis.downbeats)
+        .filter { it.isFinite() && it in from..to }
+        .distinct()
+    // Prefer waiting past the target for the peak to end, within tolerance:
+    // a slightly worse landing after the target beats cutting the chorus
+    // short, but a calm point well before it beats riding far into vocals.
+    val early = grid.filter { it <= base }.minByOrNull(::scored)
+    val late = grid.filter { it > base }.minByOrNull(::scored)
+    val chosen = when {
+        late == null -> early
+        early == null -> late
+        scored(late) <= scored(early) + MIXSET_WAIT_TOLERANCE_SECONDS -> late
+        else -> early
     } ?: base.coerceIn(from, to)
     val time = chosen.coerceIn(0.0, max(0.0, length - 2.0))
     return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
