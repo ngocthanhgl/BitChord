@@ -22,6 +22,7 @@
 
 package com.music.bitchord.playback.smart
 
+import android.util.Log
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -29,6 +30,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+
+private const val PLANNER_TAG = "BitChordTransitionPlanner"
 
 /**
  * Turns stored analysis into a concrete transition plan for one pair of
@@ -99,6 +102,10 @@ private fun maxBeatsFor(type: TransitionType): Double = when (type) {
     TransitionType.ECHO_REVERB_OUT -> 48.0
     TransitionType.LOOP_CUT_DROP -> 24.0
     TransitionType.HARD_CUT -> 1.0
+    // v2 §5: HALF_TIME_BLEND runs 16–32 bars on the shared grid.
+    TransitionType.HALF_TIME_BLEND -> 128.0
+    // v2 §9a: a dissolve is a 2–4 s cut, never a bed.
+    TransitionType.PLAIN_DISSOLVE -> 16.0
 }
 
 /** Hard safety net no transition may exceed, however generous its budget. */
@@ -143,6 +150,11 @@ enum class TransitionStyle {
 
     /** Blueprint §5.7: no blend at all — a click-free cut exactly on a downbeat. */
     HARD_CUT,
+
+    /** Spec v2 §9a: mismatch dissolve — a linear 2–4 s fade across a silence
+     * gap or low-energy seam, carried by reverb rather than by beat sync.
+     * Filters stay open; the gains and the reverb sends do the work. */
+    PLAIN_DISSOLVE,
 }
 
 /**
@@ -158,6 +170,10 @@ enum class TransitionType {
     ECHO_REVERB_OUT,
     LOOP_CUT_DROP,
     HARD_CUT,
+    /** v2 §1: beat-synced blend across a harmonic tempo ratio, both decks on a shared BPM. */
+    HALF_TIME_BLEND,
+    /** v2 §9a: unsyncable pair cut at silence/a break point with a short linear dissolve. */
+    PLAIN_DISSOLVE,
 }
 
 /** Blueprint §4 volume automation shapes. */
@@ -170,6 +186,12 @@ enum class VolumeCurve {
 
     /** Volumes step at the cut point; the 0.1s window itself stays click-free. */
     INSTANT,
+
+    /**
+     * v2 §9a: straight-line dissolve for sync-less cuts. Equal-power over a
+     * silence gap sums to a loudness bump in the middle; linear doesn't.
+     */
+    LINEAR,
 }
 
 /** Blueprint §4 EQ automation shapes. */
@@ -253,6 +275,24 @@ data class TransitionPlan(
     val incomingBpm: Double = 0.0,
     /** Why the policy landed where it did, when it declined to be more ambitious. */
     val policyReasons: List<String> = emptyList(),
+    /** v2 §5a: harmonic tempo ratio locking the pair (1.0 = unison). */
+    val matchedRatio: Double = 1.0,
+    /** v2 §7d: outgoing deck speed for HALF_TIME (1.0 otherwise). */
+    val outgoingPlaybackRate: Double = 1.0,
+    /** v2 §9: peak reverb wet on the outgoing track (0 = dry). */
+    val reverbAmount: Double = 0.0,
+    /** v2 §9b: transition-relative second to freeze the reverb tail, null = no freeze. */
+    val reverbFreezeAtSec: Double? = null,
+    /** v2 §9b: seconds after transitionStart before the incoming track starts. */
+    val incomingStartDelaySec: Double = 0.0,
+    /** v2 §9b: seconds after transitionStart the outgoing track holds full level. */
+    val outgoingHoldSec: Double = 0.0,
+    /**
+     * v2 §7d: downbeat emphasis offsets in transition-elapsed seconds, on the
+     * ADJUSTED (stretched) grid — the executor pulses the low-pass there.
+     * Empty when no grid survives the stretch.
+     */
+    val halfTimeEmphasis: List<Double> = emptyList(),
 ) {
     /** Convenience for the engine, which schedules in milliseconds. */
     val fadeMs: Long get() = (fadeSeconds * 1000).roundToLong()
@@ -270,19 +310,286 @@ private fun blocked(reason: String, transitionStart: Double = 0.0, transitionEnd
  * Blueprint §5.6 decision matrix, verbatim order: loop the double-high pair
  * with a drop ahead, echo out the unsyncable one, blend the harmonic one,
  * smooth the clean one, filter the clashing one, cut the rest.
+ *
+ * v2 §5c: HALF_TIME pairs arm first (they beat-sync by construction), and the
+ * matrix only runs for BEATMATCHED + HALF_TIME — PLAIN is dissolved upstream
+ * and DJ_ASSISTED keeps the phrase/adaptive tail below. [highEnergyB] is read
+ * at the incoming buildup start, not at the proxy entry.
  */
 fun selectTransitionType(
     score: CompatibilityScore,
+    tier: TransitionTier,
     highEnergyA: Boolean,
     highEnergyB: Boolean,
     hasDropInB: Boolean,
 ): TransitionType = when {
+    tier == TransitionTier.HALF_TIME -> TransitionType.HALF_TIME_BLEND
     highEnergyA && highEnergyB && hasDropInB -> TransitionType.LOOP_CUT_DROP
     score.bpm < 0.50 -> TransitionType.ECHO_REVERB_OUT
     score.key >= 0.85 && score.bpm >= 0.70 -> TransitionType.HARMONIC_BLEND
     score.key >= 0.70 && score.bpm >= 0.70 && score.vocal >= 0.60 -> TransitionType.SMOOTH_CROSSFADE
     score.bpm >= 0.70 && score.key < 0.70 -> TransitionType.FILTER_SWEEP
     else -> TransitionType.HARD_CUT
+}
+
+/**
+ * v2 §7d: shared tempo and per-deck speeds for a HALF_TIME pair. The shared
+ * grid is the SLOWER tempo — the faster deck slows to it (Sonic stretches
+ * down cleaner than up) and the other stays at 1.0, which also minimises the
+ * total stretch magnitude (both directions cost the same log distance, so the
+ * tie breaks toward slowing down). Returns (sharedBpm, rateA, rateB).
+ * Pure — tested directly.
+ */
+fun halfTimeRates(bpmA: Double, bpmB: Double): Triple<Double, Double, Double> {
+    if (bpmA <= 0 || bpmB <= 0) return Triple(0.0, 1.0, 1.0)
+    val shared = min(bpmA, bpmB)
+    return Triple(shared, shared / bpmA, shared / bpmB)
+}
+
+/**
+ * Spec v2 §9a: the silence-gap cutter, pure and unit-testable. Scans
+ * [scanFrom]..[contentEnd] for (1) a silence gap (RMS below
+ * [SILENCE_RMS_THRESHOLD] for at least [SILENCE_MIN_DURATION_SECONDS]) —
+ * returns its start with a 2 s dissolve; (2) a structure-map BREAK label —
+ * its start, 2 s; (3) the minimum-energy 4-bar window — its start, 4 s;
+ * (4) otherwise contentEnd − 8 s with a 4 s dissolve.
+ *
+ * No grid snapping: a dissolve lands where the music stops, not where the
+ * grid says a bar should start.
+ *
+ * @return the cut point and the dissolve duration, both in seconds.
+ */
+fun findPlainCutPoint(analysis: TrackAnalysis, scanFrom: Double, contentEnd: Double): Pair<Double, Double> {
+    val curve = analysis.energyCurve.filter { it.time.isFinite() && it.energy.isFinite() && it.energy >= 0 }
+    if (curve.isEmpty() || contentEnd <= scanFrom) {
+        return (contentEnd - 8.0) to 4.0
+    }
+    // (1) Silence gap: first run of sub-threshold samples spanning the minimum.
+    var runStart: Double? = null
+    for (point in curve) {
+        if (point.time < scanFrom || point.time > contentEnd) continue
+        if (point.energy < SILENCE_RMS_THRESHOLD) {
+            if (runStart == null) runStart = point.time
+            if (point.time - runStart >= SILENCE_MIN_DURATION_SECONDS) {
+                return runStart to 2.0
+            }
+        } else {
+            runStart = null
+        }
+    }
+    // (2) Structure-map BREAK.
+    analysis.structureMap
+        .filter { it.type == StructureSectionType.BREAK && it.start.isFinite() }
+        .map { it.start }
+        .filter { it in scanFrom..contentEnd }
+        .minOrNull()
+        ?.let { return it to 2.0 }
+    // (3) Minimum-energy 4-bar window.
+    val beatSeconds = analysis.beatInterval.orZero()
+        .takeIf { it > 0 }
+        ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+    val window = beatSeconds * 16
+    var bestStart: Double? = null
+    var bestMean = Double.POSITIVE_INFINITY
+    var t = scanFrom
+    while (t + window <= contentEnd) {
+        val inWindow = curve.filter { it.time >= t && it.time < t + window }
+        if (inWindow.isNotEmpty()) {
+            val mean = inWindow.sumOf { it.energy } / inWindow.size
+            if (mean < bestMean) {
+                bestMean = mean
+                bestStart = t
+            }
+        }
+        t += window / 2
+    }
+    bestStart?.let { return it to 4.0 }
+    // (4) Last resort.
+    return (contentEnd - 8.0) to 4.0
+}
+
+/**
+ * Spec v2 §9a PLAIN_DISSOLVE (plan side; the LINEAR gains and reverb rides
+ * voice in T5/C6). For pairs the evidence cannot sync: cut at the gap,
+ * not on the grid.
+ */
+private fun plainDissolvePlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    nextLength: Double,
+    playbackTime: Double,
+    mixset: Boolean,
+    reasons: List<String>,
+    score: CompatibilityScore = CompatibilityScore(),
+): TransitionPlan {
+    val contentEnd = analysis.contentEndTime.orZero().takeIf { it > 0 } ?: length
+    val audibleStart = audibleStartOf(analysis)
+    val scanFrom = max(audibleStart + 0.5 * length, contentEnd - 45.0)
+    val (cutSec, dissolveSec) = findPlainCutPoint(analysis, scanFrom, contentEnd)
+    val transitionStart = max(0.0, cutSec - dissolveSec)
+    // Spec: the incoming track's entry is its audible start — in Mixset Mode
+    // the buildup point, which for an unsyncable pair is the same thing:
+    // wherever this track first makes sound.
+    val entry = if (mixset) {
+        mixsetEntryPoint(nextAnalysis) ?: incomingAudibleStart(nextAnalysis)
+    } else {
+        incomingAudibleStart(nextAnalysis)
+    }
+    val keyShift = if (analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
+        analysis.keyConfidence.orZero() >= TRUSTED_PITCH_CONFIDENCE &&
+        nextAnalysis.keyConfidence.orZero() >= TRUSTED_PITCH_CONFIDENCE &&
+        !pitchVetoesShift(nextAnalysis.vocalPitchMedianHz, nextAnalysis.key)
+    ) {
+        semitonesToShift(analysis.key, nextAnalysis.key)
+    } else {
+        0
+    }
+    val started = playbackTime >= transitionStart
+    return TransitionPlan(
+        shouldStart = started,
+        markerVisible = true,
+        transitionStart = transitionStart,
+        transitionEnd = cutSec,
+        fadeSeconds = cutSec - transitionStart,
+        transitionStyle = TransitionStyle.PLAIN_DISSOLVE,
+        incomingCueTime = entry,
+        incomingHandoffTime = entry,
+        handoffStartSeconds = transitionStart,
+        handoffDuration = dissolveSec,
+        type = TransitionType.PLAIN_DISSOLVE,
+        score = score,
+        reverbAmount = PLAIN_DISSOLVE_REVERB_WET,
+        keyShiftSemitones = keyShift,
+        volumeCurve = VolumeCurve.LINEAR,
+        policyReasons = reasons,
+        reason = if (started) "smart-plain-dissolve" else "before-plain-dissolve",
+    )
+}
+
+/**
+ * v2 §5/§7d HALF_TIME_BLEND planner. Both decks stretch to the shared BPM
+ * (see [halfTimeRates]); the overlap runs 24 bars full / 8 bars short on the
+ * 32 s safety rail, bass swaps normally, pitch shifts when the key pair sits
+ * in the shift window, and downbeat emphasis offsets ride along for the
+ * executor's low-pass pulse (§11.2: recomputed from the ADJUSTED grid, never
+ * the raw one, so stretched downbeats land on time).
+ */
+private fun halfTimeBlendPlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    nextLength: Double,
+    playbackTime: Double,
+    mixAnchor: Double,
+    entry: Double,
+    score: CompatibilityScore,
+    policy: TransitionPolicyVerdict,
+    short: Boolean,
+    mixset: Boolean,
+): TransitionPlan {
+    val bpmA = analysis.bpm.orZero()
+    val bpmB = nextAnalysis.bpm.orZero()
+    val (shared, rateA, rateB) = halfTimeRates(bpmA, bpmB)
+    if (shared <= 0) {
+        return hardCutPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, score, policy.reasons, mixset,
+        )
+    }
+    val bars = if (short) 8 else 24
+    val sharedBeat = 60.0 / shared
+    val fadeSec = minOf(bars * 4 * sharedBeat, AUTO_TRANSITION_MAX_SECONDS)
+        .coerceAtLeast(MIN_TRANSITION_OVERLAP_SECONDS)
+    val transitionStart = max(0.0, mixAnchor - fadeSec)
+    val keyShift = if (analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
+        keyScore(analysis.key, nextAnalysis.key) in 0.45..0.75 &&
+        !(nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
+            pitchVetoesShift(nextAnalysis.vocalPitchMedianHz, nextAnalysis.key))
+    ) {
+        semitonesToShift(analysis.key, nextAnalysis.key)
+    } else {
+        0
+    }
+    // Emphasis offsets in transition-elapsed seconds: B's phrase starts
+    // mapped through its deck rate (B-timeline advances rateB×real time).
+    val emphasis = phrase16Grid(nextAnalysis)
+        .filter { it.isFinite() && it >= entry && it <= entry + fadeSec * rateB + sharedBeat }
+        .map { (it - entry) / rateB }
+        .filter { it >= 0 }
+    val started = playbackTime >= transitionStart
+    return TransitionPlan(
+        shouldStart = started,
+        markerVisible = true,
+        transitionStart = transitionStart,
+        transitionEnd = mixAnchor,
+        fadeSeconds = mixAnchor - transitionStart,
+        transitionStyle = TransitionStyle.DJ_BLEND,
+        incomingCueTime = entry,
+        incomingHandoffTime = entry,
+        incomingPlaybackRate = (rateB * 10000).roundToInt() / 10000.0,
+        outgoingPlaybackRate = (rateA * 10000).roundToInt() / 10000.0,
+        handoffStartSeconds = transitionStart + fadeSec * 0.25,
+        handoffDuration = fadeSec * 0.5,
+        transitionBeats = (fadeSec / sharedBeat).roundToInt(),
+        bassSwap = true,
+        type = TransitionType.HALF_TIME_BLEND,
+        score = score,
+        keyShiftSemitones = keyShift,
+        volumeCurve = VolumeCurve.S_CURVE,
+        eqCurve = EQCurve.BASS_SWAP,
+        outgoingBpm = shared,
+        incomingBpm = shared,
+        matchedRatio = policy.matchedRatio,
+        halfTimeEmphasis = emphasis,
+        policyReasons = policy.reasons,
+        reason = if (started) "smart-half-time-blend" else "before-half-time-blend",
+    )
+}
+
+/**
+ * v2 §9b heavy-clash forced echo-out (plan side; the envelope voices in T5).
+ * A holds full level 3 s, fades 3–6 s; B starts at +4 s and ramps 4 s; reverb
+ * rises to 0.80 with a freeze at +3 s. 8 s window ending at the anchor: the
+ * last 2 s of A's tail ring out as echo/reverb rather than content.
+ */
+private fun heavyClashPlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    nextLength: Double,
+    playbackTime: Double,
+    mixAnchor: Double,
+    entry: Double,
+    score: CompatibilityScore,
+    reasons: List<String>,
+    mixset: Boolean,
+): TransitionPlan {
+    val fadeSec = 8.0
+    val transitionStart = max(0.0, mixAnchor - fadeSec)
+    val started = playbackTime >= transitionStart
+    return TransitionPlan(
+        shouldStart = started,
+        markerVisible = true,
+        transitionStart = transitionStart,
+        transitionEnd = mixAnchor,
+        fadeSeconds = mixAnchor - transitionStart,
+        transitionStyle = TransitionStyle.ECHO_REVERB_OUT,
+        incomingCueTime = entry,
+        incomingHandoffTime = entry,
+        handoffStartSeconds = transitionStart + 4.0,
+        handoffDuration = 4.0,
+        type = TransitionType.ECHO_REVERB_OUT,
+        score = score,
+        echoAmount = HEAVY_CLASH_ECHO_AMOUNT,
+        reverbAmount = HEAVY_CLASH_REVERB_WET,
+        reverbFreezeAtSec = HEAVY_CLASH_FREEZE_OFFSET_SEC,
+        incomingStartDelaySec = 4.0,
+        outgoingHoldSec = 3.0,
+        volumeCurve = VolumeCurve.S_CURVE,
+        policyReasons = reasons,
+        reason = if (started) "smart-heavy-clash-echo" else "before-heavy-clash",
+    )
 }
 
 /**
@@ -1147,7 +1454,12 @@ private data class Overlap(
 )
 
 /** How long a mix should run when the tracks are related but not phrase-switchable. */
-private fun adaptiveOverlap(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): Overlap {
+private fun adaptiveOverlap(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    transitionPoint: Double,
+    entryPoint: Double,
+): Overlap {
     val currentBpm = analysis.bpm.orZero()
     val nextBpm = nextAnalysis.bpm.orZero()
     if (currentBpm <= 0 || nextBpm <= 0) {
@@ -1157,8 +1469,13 @@ private fun adaptiveOverlap(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis
     val ratio = normalizedTempoRatio(currentBpm, nextBpm)
     val distance = keyDistance(trustedKey(analysis), trustedKey(nextAnalysis))
     val vocalConflict = analysis.vocalProbability >= 0.62 && nextAnalysis.vocalProbability >= 0.62
-    val transitionBeats =
+    val baseBeats =
         if (!vocalConflict && (abs(1 - ratio) > 0.07 || (distance != null && distance > 4))) 16 else 8
+    // v2 §6: scale by arrangement energy direction — an outgoing track that
+    // falls while the incoming one rises is the ideal long blend; two risers
+    // fighting each other get tightened. Slopes over 16 bars each side.
+    val energyFactor = overlapEnergyFactor(analysis, nextAnalysis, transitionPoint, entryPoint)
+    val transitionBeats = (baseBeats * energyFactor).roundToInt().coerceIn(4, 32)
     val beatSeconds = 60 / currentBpm
     val minimumOverlap = if (currentBpm >= 140) AUTO_FAST_TRACK_MIN_SECONDS else AUTO_MIN_SECONDS
 
@@ -1171,6 +1488,44 @@ private fun adaptiveOverlap(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis
             1.0
         },
     )
+}
+
+/** v2 §6 energy-direction factor. Pure — shared with tests via [overlapEnergyFactorFor]. */
+private const val OVERLAP_SLOPE_EPSILON = 0.002
+
+private fun windowSlope(curve: List<EnergySample>, from: Double, to: Double): Double {
+    if (to <= from) return 0.0
+    val xs = mutableListOf<Double>()
+    val ys = mutableListOf<Double>()
+    for (point in curve) {
+        if (!point.time.isFinite() || !point.energy.isFinite()) continue
+        if (point.time < from || point.time > to) continue
+        xs += point.time
+        ys += point.energy
+    }
+    return StructureDetector.linearSlope(xs, ys)
+}
+
+private fun overlapEnergyFactor(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    transitionPoint: Double,
+    entryPoint: Double,
+): Double {
+    val intervalA = analysis.beatInterval.orZero()
+        .takeIf { it > 0 } ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+    val intervalB = nextAnalysis.beatInterval.orZero()
+        .takeIf { it > 0 } ?: if (nextAnalysis.bpm.orZero() > 0) 60 / nextAnalysis.bpm else 0.5
+    val slopeA = windowSlope(analysis.energyCurve, transitionPoint - 64 * intervalA, transitionPoint)
+    val slopeB = windowSlope(nextAnalysis.energyCurve, entryPoint, entryPoint + 64 * intervalB)
+    return overlapEnergyFactorFor(slopeA, slopeB)
+}
+
+/** v2 §6 table: A↓B↑ stretches, both↑ tightens, everything else holds. */
+fun overlapEnergyFactorFor(slopeA: Double, slopeB: Double): Double = when {
+    slopeA < -OVERLAP_SLOPE_EPSILON && slopeB > OVERLAP_SLOPE_EPSILON -> OVERLAP_ENERGY_STRETCH_FACTOR
+    slopeA > OVERLAP_SLOPE_EPSILON && slopeB > OVERLAP_SLOPE_EPSILON -> OVERLAP_ENERGY_TIGHTEN_FACTOR
+    else -> 1.0
 }
 
 private fun standardTransition(
@@ -1251,7 +1606,9 @@ fun planTransition(
     // fallback. Tracks too short to survive either keep the old behavior
     // exactly. Mixset Mode replaces the floor with its own early anchor, so
     // the floor below is zero when it is on.
-    val playFloorSeconds = if (mixset) 0.0 else 0.8 * length
+    // v2 §2c/§3: the detector's OUTRO can pull the floor earlier (see
+    // effectivePlayFloor) — the comedown has begun, don't burn low tail.
+    val playFloorSeconds = if (mixset) 0.0 else effectivePlayFloor(analysis, length)
     val candidateWindow = if (mixset) {
         null
     } else {
@@ -1317,33 +1674,13 @@ fun planTransition(
 
     val policy = assessTransitionTier(analysis, nextAnalysis)
     if (policy.tier == TransitionTier.PLAIN_CROSSFADE) {
-        // The floor never collapses a fade: when the anchor sits before it
-        // (short track, early content end, interior cliff) the mix plays
-        // early at full length instead of degrading to an instant cut. The
-        // floor clamp applies only when it leaves a real fade behind.
-        val rawStart = max(0.0, mixAnchor - standardFade)
-        val transitionStart = if (!mixset && mixAnchor > playFloorSeconds &&
-            mixAnchor - max(rawStart, playFloorSeconds) >= MIN_TRANSITION_OVERLAP_SECONDS
-        ) {
-            max(rawStart, playFloorSeconds)
-        } else {
-            rawStart
-        }
-        val started = playbackTime >= transitionStart
-        return TransitionPlan(
-            shouldStart = started,
-            markerVisible = true,
-            transitionStart = transitionStart,
-            transitionEnd = mixAnchor,
-            fadeSeconds = mixAnchor - transitionStart,
-            transitionStyle = TransitionStyle.EQUAL_POWER,
-            incomingCueTime = if (mixset) {
-                mixsetEntryCue(nextAnalysis, nextLength)
-            } else {
-                capIncomingEntry(incomingStartPoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
-            },
-            policyReasons = policy.reasons,
-            reason = if (started) "smart-plain-crossfade" else "before-plain-crossfade-window",
+        // v2 §9a: unsyncable pairs dissolve at silence/a break point instead
+        // of fading blindly over whatever happens to sit at the tail. The
+        // dissolve finds its own cut, so the tail anchor is irrelevant — and
+        // the score is the neutral default: nothing here was synchronised.
+        return plainDissolvePlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixset, policy.reasons,
         )
     }
 
@@ -1354,15 +1691,40 @@ fun planTransition(
     val proxyEntry = capIncomingEntry(incomingCuePoint(nextAnalysis), nextAnalysis, nextLength, mixset)
     val proxyScore = scoreCompatibility(analysis, nextAnalysis, mixAnchor, proxyEntry)
     if (proxyScore.overall < SCORE_ACCEPTABLE) {
-        return hardCutPlan(
+        // v2 §9: a weak pair never blends — the heavy clash gets a forced
+        // echo-out, a weak HALF_TIME lock a short 8-bar blend (§9 over §5c:
+        // keep beat-sync, only shorten the overlap).
+        Log.d(
+            PLANNER_TAG,
+            "Low score ${"%.2f".format(proxyScore.overall)} " +
+                "genres=${genreClass(analysis)}/${genreClass(nextAnalysis)} " +
+                "tier=${policy.tier} ratio=${policy.matchedRatio}",
+        )
+        if (policy.tier == TransitionTier.HALF_TIME) {
+            return halfTimeBlendPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = true, mixset = mixset,
+            )
+        }
+        return heavyClashPlan(
             analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+            playbackTime, mixAnchor, proxyEntry, proxyScore, policy.reasons, mixset,
         )
     }
     val dropInB = firstDropSec(nextAnalysis)
     val highEnergyA = isHighEnergyAt(analysis, mixAnchor)
-    val highEnergyB = isHighEnergyAt(nextAnalysis, proxyEntry)
-    val selectedType = selectTransitionType(proxyScore, highEnergyA, highEnergyB, dropInB != null)
+    // v2 §5c: B's energy is read at its buildup start — a drop-bound track
+    // entering on a quiet foot is not "high energy" even if its proxy cue is.
+    val buildupB = buildupStart(nextAnalysis, dropInB ?: proxyEntry) ?: proxyEntry
+    val highEnergyB = isHighEnergyAt(nextAnalysis, buildupB)
+    val beatOrHalf = policy.tier == TransitionTier.BEATMATCHED || policy.tier == TransitionTier.HALF_TIME
+    val selectedType = if (beatOrHalf) {
+        selectTransitionType(proxyScore, policy.tier, highEnergyA, highEnergyB, dropInB != null)
+    } else {
+        // v2 §5c: DJ_ASSISTED skips the matrix — no stretch may run, so the
+        // phrase/adaptive tail below (beat-quantized, unstretched) owns it.
+        TransitionType.SMOOTH_CROSSFADE
+    }
     // Blueprint §9 anti-monotony: a long blend between two tracks that are
     // the same tempo, the same key, AND sing the same median pitch is a
     // six-minute song nobody asked for. A clean cut says "next track".
@@ -1407,6 +1769,12 @@ fun planTransition(
             playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
         )
     }
+    if (selectedType == TransitionType.HALF_TIME_BLEND) {
+        return halfTimeBlendPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = false, mixset = mixset,
+        )
+    }
 
     phraseSwitch(analysis, nextAnalysis, length, nextLength, mixset, mixAnchor)
         ?.takeIf { playbackTime < it.transitionEnd }
@@ -1422,7 +1790,8 @@ fun planTransition(
             )
         }
 
-    val (overlap, transitionBeats, incomingPlaybackRate) = adaptiveOverlap(analysis, nextAnalysis)
+    val (overlap, transitionBeats, incomingPlaybackRate) =
+        adaptiveOverlap(analysis, nextAnalysis, mixAnchor, proxyEntry)
     val currentBpm = analysis.bpm.orZero()
     val nextBpm = nextAnalysis.bpm.orZero()
     val handoffBpm = if (currentBpm > 0) currentBpm else nextBpm
