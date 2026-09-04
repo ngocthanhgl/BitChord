@@ -15,9 +15,13 @@ import com.music.bitchord.data.settings.SmartAnalysis
 import com.music.bitchord.data.settings.TrackAnalysisState
 import com.music.bitchord.data.settings.TransitionWindow
 import com.music.bitchord.playback.smart.CrossfadeMode
+import com.music.bitchord.playback.smart.BASS_SWAP_WIDTH_V2
+import com.music.bitchord.playback.smart.MID_KILL_HP_HZ
+import com.music.bitchord.playback.smart.MID_KILL_LP_HZ
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.TransitionStyle
 import com.music.bitchord.playback.smart.TransitionTrackInfo
+import com.music.bitchord.playback.smart.TransitionType
 import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
 import kotlinx.coroutines.CoroutineScope
@@ -150,6 +154,12 @@ class CrossfadeController(
      */
     private val echoFilters: EchoFilters = EchoFilters.None,
     /**
+     * The Schroeder reverb send riding each side of a dissolve or heavy
+     * clash. Mirrors [echoFilters]. Defaults to [ReverbFilters.None], which
+     * renders those plans as dry linear fades.
+     */
+    private val reverbFilters: ReverbFilters = ReverbFilters.None,
+    /**
      * Whether a decode and inference for a media item is running right now.
      * Only feeds the stats line — nothing about a transition waits on it.
      */
@@ -277,9 +287,35 @@ class CrossfadeController(
         val keyShiftSemitones: Int = 0,
         /** Blueprint LOOP_CUT_DROP: bars of outgoing tail looped before the freeze-and-cut. */
         val loopBars: Int = 0,
+        /** v2 §5a: harmonic tempo ratio locking the pair (1.0 = unison). */
+        val matchedRatio: Double = 1.0,
+        /** v2 §7d: outgoing deck speed for HALF_TIME (1.0 otherwise). */
+        val outgoingPlaybackRate: Double = 1.0,
+        /** v2 §9: peak reverb wet on the outgoing track (0 = dry; T6 voices it). */
+        val reverbAmount: Double = 0.0,
+        /** v2 §9b: transition-relative second to freeze the reverb tail, null = no freeze. */
+        val reverbFreezeAtSec: Double? = null,
+        /** v2 §9b: seconds after transitionStart before the incoming track starts. */
+        val incomingStartDelaySec: Double = 0.0,
+        /** v2 §9b: seconds after transitionStart the outgoing track holds full level. */
+        val outgoingHoldSec: Double = 0.0,
+        /** v2 §7d: downbeat emphasis offsets in transition-elapsed seconds (adjusted grid). */
+        val halfTimeEmphasis: List<Double> = emptyList(),
+        /** v2 §7d: shared BPM of a HALF_TIME blend (0 = not half-time). */
+        val sharedBpm: Double = 0.0,
+        /** v2 §7a: key sub-score gating the virtual mid-kill. */
+        val keyScore: Double = 1.0,
+        /** v2 §7a: overlap length in seconds, gating the mid-kill. */
+        val overlapSeconds: Double = 0.0,
     )
 
     private var fadeStartedAt = 0L
+    // v2 §7d/§11.2: downbeat-emphasis cursor into render.halfTimeEmphasis.
+    // A pulse fires once per offset even across pause-parked ticks; the pulse
+    // itself is applied after rideFilters so it wins for exactly one tick
+    // (~30 ms, the 2-frame intent at 60 fps) before the ride reclaims the band.
+    private var emphasisIndex = 0
+    private var emphasisPulseArmed = false
     private var bailStartedAt = 0L
     private var armDeadline = 0L
 
@@ -704,9 +740,28 @@ class CrossfadeController(
                 vocalOverlap = plan.vocalOverlap,
                 volumeCurve = plan.volumeCurve,
                 echoAmount = plan.echoAmount,
-                echoBeatSeconds = plan.outgoingBpm.takeIf { it > 0 }?.let { 60.0 / it } ?: 0.0,
+                // v2 §7b: the dub throw repeats every HALF beat; a sync-less
+                // PLAIN pair gets a fixed 375 ms slapback instead of a grid it
+                // cannot hold.
+                echoBeatSeconds = when {
+                    plan.type == TransitionType.PLAIN_DISSOLVE -> 0.375
+                    plan.outgoingBpm > 0 -> 30.0 / plan.outgoingBpm
+                    else -> 0.0
+                },
                 loopBars = plan.loopBars,
                 keyShiftSemitones = plan.keyShiftSemitones,
+                matchedRatio = plan.matchedRatio,
+                outgoingPlaybackRate = plan.outgoingPlaybackRate,
+                reverbAmount = plan.reverbAmount,
+                reverbFreezeAtSec = plan.reverbFreezeAtSec,
+                incomingStartDelaySec = plan.incomingStartDelaySec,
+                outgoingHoldSec = plan.outgoingHoldSec,
+                halfTimeEmphasis = plan.halfTimeEmphasis,
+                // Only a half-time blend plays a tempo neither track owns;
+                // every other plan's outgoingBpm is just its folded grid.
+                sharedBpm = if (plan.type == TransitionType.HALF_TIME_BLEND) plan.outgoingBpm else 0.0,
+                keyScore = plan.score.key,
+                overlapSeconds = plan.fadeSeconds,
             ),
         )
     }
@@ -963,6 +1018,19 @@ class CrossfadeController(
         into.volume = 0f
         into.playWhenReady = true
         fadeStartedAt = SystemClock.elapsedRealtime()
+        emphasisIndex = 0
+        emphasisPulseArmed = false
+
+        // v2 §7d HALF_TIME: the outgoing deck joins the shared tempo it does
+        // not own — the incoming side was already stretched at arm time
+        // (begin, pre-audible). Unity means no call: ExoPlayer re-prepares
+        // its audio pipeline on parameter changes.
+        val outgoingRate = (AppSettings.playbackSpeed.value * render.outgoingPlaybackRate).toFloat()
+        if (render.outgoingPlaybackRate != 1.0) {
+            out.setPlaybackParameters(PlaybackParameters(outgoingRate, 1f))
+        }
+        // v2 §7d: the nerd-stats line shows the grid that won, if any.
+        AppSettings.sharedHalfTimeBpm.value = render.sharedBpm.takeIf { it > 0 }
 
         Log.d(TAG, "handoff at cue=${into.currentPosition}ms out=${out.currentPosition}ms")
 
@@ -1053,24 +1121,59 @@ class CrossfadeController(
         // Blueprint §4 volume curves. The equal-power pair holds every blend;
         // LOGARITHMIC drops the outgoing track fast while its echo tail covers
         // the hole; INSTANT holds both sides until the cut lands at progress 1.
+        // v2 §9a LINEAR is the sync-less dissolve: over a silence gap an
+        // equal-power pair sums to a bump in the middle, a straight line doesn't.
+        // v2 §9b: a held outgoing track (outgoingHoldSec) stays full until its
+        // hold elapses, then fades over the remaining span — the echo/reverb
+        // tail is the ending, not the content's last seconds.
+        val outProgress = if (render.outgoingHoldSec > 0 && span > 1L) {
+            val holdFraction = (render.outgoingHoldSec * 1000.0 / span).toFloat().coerceIn(0f, 1f)
+            ((progress - holdFraction) / (1f - holdFraction).coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
+        } else {
+            progress
+        }
+        // v2 §9b: a delayed incoming track is gated silent until its start
+        // offset, then ramps over the remaining span.
+        val inProgress = if (render.incomingStartDelaySec > 0 && span > 1L) {
+            val delayFraction = (render.incomingStartDelaySec * 1000.0 / span).toFloat().coerceIn(0f, 1f)
+            ((progress - delayFraction) / (1f - delayFraction).coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
+        } else {
+            progress
+        }
         when (render.volumeCurve) {
             VolumeCurve.LOGARITHMIC -> {
-                player.volume = riseGain(progress)
-                out.volume = (1f - progress).pow(2f)
+                player.volume = riseGain(inProgress)
+                out.volume = (1f - outProgress).pow(2f)
             }
             VolumeCurve.INSTANT -> {
-                player.volume = if (progress >= 1f) 1f else 0f
-                out.volume = if (progress >= 1f) 0f else 1f
+                player.volume = if (inProgress >= 1f) 1f else 0f
+                out.volume = if (outProgress >= 1f) 0f else 1f
+            }
+            VolumeCurve.LINEAR -> {
+                player.volume = inProgress
+                out.volume = 1f - outProgress
             }
             VolumeCurve.S_CURVE -> {
-                player.volume = riseGain(progress)
-                out.volume = fallGain(progress)
+                player.volume = riseGain(inProgress)
+                out.volume = fallGain(outProgress)
             }
         }
+        // Half-time downbeat emphasis (§11.2): a 2-frame low-pass pulse as the
+        // stretched grid crosses each planned phrase start. Tracked so a pulse
+        // fires once per offset even across pause-parked ticks.
+        rideHalfTimeEmphasis(elapsed / 1000.0)
         // Only from here, never during ARMING: the standby is silent until the
         // handoff, and [filters] describes the split between the track arriving
         // and the track leaving, which only exists once both are audible.
         rideFilters(progress)
+        // v2 §7d/§11.2: no shelf on the processor, so the "low-shelf +3dB"
+        // accent is a one-tick full-open of the incoming high-pass at each
+        // planned phrase start — a low-end thump exactly on the stretched
+        // downbeat. Applied after rideFilters so it wins for one tick only.
+        if (emphasisPulseArmed) {
+            emphasisPulseArmed = false
+            filters.incoming(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        }
 
         // Whichever comes first: the fade running its course, the old track
         // genuinely ending, the tail failing outright, or whichever setting
@@ -1122,6 +1225,7 @@ class CrossfadeController(
         if (phase == Phase.IDLE || phase == Phase.BAILING) return
         Log.d(TAG, "bail from $phase")
         AppSettings.smartMixInProgress.value = false
+        AppSettings.sharedHalfTimeBpm.value = null
         if (!handedOff) {
             // Nothing was ever audible; no ramp to run.
             finish()
@@ -1133,6 +1237,7 @@ class CrossfadeController(
         // the click this ramp exists to avoid.
         filters.open()
         echoFilters.open()
+        reverbFilters.open()
         incoming?.volume = 1f
         bailFromGain = outgoing?.volume ?: 0f
         bailStartedAt = SystemClock.elapsedRealtime()
@@ -1150,10 +1255,12 @@ class CrossfadeController(
             settledAt = SystemClock.elapsedRealtime()
         }
         AppSettings.smartMixInProgress.value = false
+        AppSettings.sharedHalfTimeBpm.value = null
         // Unconditional and idempotent, like the speed reset below: correct
         // whether or not this transition ever filtered anything.
         filters.open()
         echoFilters.open()
+        reverbFilters.open()
         render = Render()
 
         if (handedOff) {
@@ -1234,7 +1341,10 @@ class CrossfadeController(
      */
     private fun rideFilters(progress: Float) {
         when (render.style) {
-            TransitionStyle.DJ_FILTER -> rideFilterSweep(progress)
+            TransitionStyle.DJ_FILTER -> {
+                rideFilterSweep(progress)
+                rideMidKill(progress)
+            }
             TransitionStyle.DJ_BLEND ->
                 if (render.bassSwap) rideBassSwap(progress) else rideVocalSeparation(progress)
             // GAPLESS is an album being played through, where any filtering would
@@ -1259,15 +1369,39 @@ class CrossfadeController(
             // the incoming one opens dry. The dedicated echo send (P1) rides
             // on top of this; the wash alone already decays, never clashes.
             TransitionStyle.ECHO_REVERB_OUT -> {
-                val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
-                filters.outgoing(20000f * (1f - wash) + 300f * wash, 20f)
-                filters.incoming(20000f, 20f)
-                // The dub throw behind the wash: one-bar repeats of the
-                // filtered signal, riding up with the wash. The incoming side
-                // stays dry per the blueprint (reverb 30 %→0 % is the wash's
-                // absence, not a second send).
-                echoFilters.outgoing(wash, render.echoBeatSeconds.toFloat())
-                echoFilters.incoming(0f, 0f)
+                // Spec v2 §9b heavy clash: the plan carries a reverb freeze
+                // offset, and the envelope below replaces the P0 wash — the
+                // outgoing track holds full for 3 s, then sinks behind echo
+                // (1.0→0.70 wet) and reverb (→0.80, frozen at +3 s) while the
+                // incoming track waits out its delay before ramping in.
+                val freezeAt = render.reverbFreezeAtSec
+                if (freezeAt != null && freezeAt.isFinite()) {
+                    val spanSec = max(1f, render.spanMs / 1000f)
+                    val wetRamp = (progress * spanSec / HEAVY_CLASH_WET_RAMP_SEC).coerceIn(0f, 1f)
+                    val frozen = progress * spanSec >= freezeAt.toFloat()
+                    filters.outgoing(20000f, 20f)
+                    // Spec v2 §9b: B enters under a 600 Hz high-pass that
+                    // relaxes over 3 s from its start (4 s into the window),
+                    // so its low end never punches through the frozen tail.
+                    val bElapsed = progress * spanSec - 4f
+                    val bOpen = (bElapsed / 3f).coerceIn(0f, 1f)
+                    filters.incoming(20000f, 600f * (1f - bOpen) + 20f * bOpen)
+                    echoFilters.outgoing(HEAVY_CLASH_ECHO_WET * wetRamp, render.echoBeatSeconds.toFloat())
+                    echoFilters.incoming(0f, 0f)
+                    reverbFilters.outgoing(render.reverbAmount * wetRamp, frozen)
+                    reverbFilters.incoming(0f, false)
+                } else {
+                    val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
+                    filters.outgoing(20000f * (1f - wash) + 300f * wash, 20f)
+                    filters.incoming(20000f, 20f)
+                    // The dub throw behind the wash: one-bar repeats of the
+                    // filtered signal, riding up with the wash. The incoming side
+                    // stays dry per the blueprint (reverb 30 %→0 % is the wash's
+                    // absence, not a second send).
+                    echoFilters.outgoing(wash, render.echoBeatSeconds.toFloat())
+                    echoFilters.incoming(0f, 0f)
+                    reverbFilters.open()
+                }
             }
             // Blueprint LOOP_CUT_DROP: the spectrum holds open while the tail
             // vamps, then the outgoing track freezes behind a closing low-pass
@@ -1298,6 +1432,83 @@ class CrossfadeController(
             // Blueprint HARD_CUT: no blend, no spectrum edit — the 0.1 s
             // window and downbeat cue in the plan are the whole technique.
             TransitionStyle.HARD_CUT -> filters.open()
+            // Spec v2 §9a PLAIN_DISSOLVE: filters stay open — the cut sits on
+            // a silence gap or low-energy seam, so there is nothing to EQ
+            // around. The reverb sends carry it: the outgoing track blooms
+            // to the plan's wet over the first half, the incoming one drains
+            // its entry wet over 3 s. Gains ride LINEAR (see driveFade).
+            TransitionStyle.PLAIN_DISSOLVE -> {
+                // Spec v2 §9a: the outgoing bass hard-cuts below 200 Hz at
+                // the gap (nothing musical lives there anyway), the incoming
+                // bass fades linearly over 2 s — a tilt, not a swap.
+                filters.outgoing(20000f, 200f)
+                val spanSec = max(1f, render.spanMs / 1000f)
+                val bassOpen = (progress * spanSec / 2f).coerceIn(0f, 1f)
+                filters.incoming(20000f, 200f * (1f - bassOpen) + 20f * bassOpen)
+                val outWet = if (progress < 0.5f) {
+                    render.reverbAmount * (progress / 0.5f)
+                } else {
+                    render.reverbAmount
+                }
+                reverbFilters.outgoing(outWet, false)
+                val inWet = (PLAIN_DISSOLVE_IN_WET -
+                    PLAIN_DISSOLVE_IN_WET * (progress * spanSec / PLAIN_DISSOLVE_IN_DRAIN_SEC))
+                    .coerceIn(0f, PLAIN_DISSOLVE_IN_WET)
+                reverbFilters.incoming(inWet, false)
+                echoFilters.open()
+            }
+        }
+    }
+
+    /**
+     * v2 §7d/§11.2: advances the downbeat-emphasis cursor. The planner lays
+     * the offsets on the *stretched* grid (recomputed from the adjusted beat
+     * interval, never the raw grid — a >5 ms drift would fire the accent off
+     * the beat it is meant to mark). Elapsed here is incoming-track time,
+     * which is what the offsets are expressed in.
+     */
+    private fun rideHalfTimeEmphasis(elapsedSec: Double) {
+        emphasisPulseArmed = false
+        val offsets = render.halfTimeEmphasis
+        if (offsets.isEmpty()) {
+            emphasisIndex = 0
+            return
+        }
+        while (emphasisIndex < offsets.size && elapsedSec >= offsets[emphasisIndex]) {
+            emphasisIndex++
+            emphasisPulseArmed = true
+        }
+    }
+
+    /**
+     * v2 §7a virtual mid-kill: a fake kill-switch for FILTER_SWEEP pairs whose
+     * keys are close but not adjacent. Runs after [rideFilterSweep] and only
+     * overrides inside its window — outside 0.30..0.70 the sweep stands.
+     *
+     * Gate (§11.4): keyScore < 0.55 (too compatible needs nothing, too far
+     * gets a real sweep) and at least 6 s of overlap (a kill needs room to
+     * breathe; short sweeps stay untouched).
+     */
+    private fun rideMidKill(progress: Float) {
+        if (render.style != TransitionStyle.DJ_FILTER) return
+        if (render.keyScore >= 0.55 || render.overlapSeconds < 6.0) return
+        val p = progress.toDouble()
+        when {
+            p < 0.30 || p >= 0.70 -> Unit // sweep stands, relax after
+            p < 0.50 -> filters.outgoing(
+                MID_KILL_LP_HZ.toFloat(),
+                TransitionFilterProcessor.OFF_HZ,
+            )
+            else -> {
+                filters.outgoing(
+                    MID_KILL_LP_HZ.toFloat(),
+                    TransitionFilterProcessor.OFF_HZ,
+                )
+                filters.incoming(
+                    TransitionFilterProcessor.OPEN_HZ,
+                    MID_KILL_HP_HZ.toFloat(),
+                )
+            }
         }
     }
 
@@ -1513,6 +1724,7 @@ class CrossfadeController(
             render.style == TransitionStyle.ECHO_REVERB_OUT ||
             render.style == TransitionStyle.LOOP_CUT_DROP ||
             render.style == TransitionStyle.HARD_CUT ||
+            render.style == TransitionStyle.PLAIN_DISSOLVE ||
             incomingCueTimeMs > 0L ||
             incomingPlaybackRate != 1.0
         )
@@ -1544,6 +1756,21 @@ class CrossfadeController(
 
         /** Ramp used when a fade is interrupted. */
         const val BAIL_MS = 120L
+
+        /**
+         * Spec v2 §9b: the heavy-clash wet ramps ride over this many seconds
+         * of the 8 s window (echo 1.0→0.70, reverb →0.80), then hold.
+         */
+        const val HEAVY_CLASH_WET_RAMP_SEC = 3.0f
+
+        /** Spec v2 §9b: echo target at the end of the heavy-clash ramp. */
+        const val HEAVY_CLASH_ECHO_WET = 0.70f
+
+        /** Spec v2 §9a: incoming reverb entry wet, draining over the fade. */
+        const val PLAIN_DISSOLVE_IN_WET = 0.30f
+
+        /** Spec v2 §9a: seconds for the incoming wet to drain to zero. */
+        const val PLAIN_DISSOLVE_IN_DRAIN_SEC = 3.0f
 
         /**
          * Head start the standby gets to open the incoming track and buffer to
@@ -1618,7 +1845,7 @@ class CrossfadeController(
         const val BASS_SWAP_HZ = 200.0
 
         /** How much of the fade the low end takes to change hands. */
-        const val BASS_SWAP_WIDTH = 0.10
+        const val BASS_SWAP_WIDTH = BASS_SWAP_WIDTH_V2
 
         /**
          * Shape of the outgoing low-pass against fade progress, between

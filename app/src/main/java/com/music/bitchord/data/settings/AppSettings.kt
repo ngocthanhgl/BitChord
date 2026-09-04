@@ -383,6 +383,14 @@ object AppSettings {
     val smartMixInProgress = MutableStateFlow(false)
 
     /**
+     * v2 §7d: the shared BPM a HALF_TIME transition is actually playing at,
+     * for stats for nerds. Set at the handoff, cleared when the blend ends —
+     * null the rest of the time, so the line below stays dark outside a
+     * half-time blend.
+     */
+    val sharedHalfTimeBpm = MutableStateFlow<Double?>(null)
+
+    /**
      * How much of the *upcoming* transition has been analysed, for stats for
      * nerds. Published by the crossfade controller, which is the only thing
      * that knows which two tracks the next transition is between.

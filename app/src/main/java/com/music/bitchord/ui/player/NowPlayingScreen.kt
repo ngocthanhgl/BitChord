@@ -1298,6 +1298,7 @@ fun NowPlayingScreen(
             // collapse is a waste of a subscription.
             val smartFadeOn by AppSettings.smartFadeEnabled.collectAsStateWithLifecycle()
             val smartAnalysis by AppSettings.smartAnalysis.collectAsStateWithLifecycle()
+            val sharedHalfTimeBpm by AppSettings.sharedHalfTimeBpm.collectAsStateWithLifecycle()
             // Height the artwork block below turns out not to need, spent by the
             // controls at the foot of the screen. Filled in from inside the box,
             // where the sleeve's real size is known; see [lastControlSpread].
@@ -1601,7 +1602,12 @@ fun NowPlayingScreen(
                                     // without re-parsing the sentence.
                                     text = "Automix · this song " +
                                         smartAnalysis.current.label() +
-                                        " · next " + smartAnalysis.next.label(),
+                                        " · next " + smartAnalysis.next.label() +
+                                        // v2 §7d: half-time blends play neither
+                                        // track's own tempo — say which grid won.
+                                        (sharedHalfTimeBpm
+                                            ?.takeIf { it > 0 }
+                                            ?.let { " · shared ${"%.0f".format(it)} BPM" } ?: ""),
                                     style = nerdStyle,
                                     // Dimmer than the measured line above it: that
                                     // one describes the audio, this one describes
