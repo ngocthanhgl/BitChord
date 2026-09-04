@@ -250,6 +250,21 @@ TempoResult AnalyzeTempo(
   if (envelope.size() < 64) return result;
 
   const double frames_per_second = sample_rate / hop_size;
+
+  // v2 §2b: threshold the normalized envelope into onset times for the
+  // structural detector. Local maxima over ±3 frames above 0.35 (the envelope
+  // is peak-normalized with sqrt expansion, so this keeps genuine attacks
+  // while rejecting wash). Capped so pathological input cannot blow up the
+  // JSON; density is computed Kotlin-side per 4-bar window.
+  for (size_t frame = 3; frame + 3 < envelope.size() && result.onset_times.size() < 4096; ++frame) {
+    const double value = envelope[frame];
+    if (value < 0.35) continue;
+    bool peak = true;
+    for (size_t delta = 1; delta <= 3; ++delta) {
+      if (envelope[frame - delta] > value || envelope[frame + delta] > value) { peak = false; break; }
+    }
+    if (peak) result.onset_times.push_back(frame / frames_per_second);
+  }
   // The tempo search reads a bounded prefix; the tracking below reads all of it.
   const size_t search_limit = std::min(
     envelope.size(),

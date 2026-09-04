@@ -136,7 +136,7 @@ Java_com_music_bitchord_playback_smart_TrackFeatures_nativeAnalyze(
   std::string json;
   // A whole-track energy curve dominates the output; reserving up front keeps
   // this from repeatedly reallocating a string that reaches tens of kilobytes.
-  json.reserve(8192 + result.energy_curve.size() * 24);
+  json.reserve(8192 + (result.energy_curve.size() + result.energy_curve_fine.size()) * 24);
 
   json += '{';
   AppendField(json, "duration", result.duration, true);
@@ -162,6 +162,15 @@ Java_com_music_bitchord_playback_smart_TrackFeatures_nativeAnalyze(
   AppendDoubles(json, result.phrase_boundaries);
   json += ",\"vocalActivityMask\":";
   AppendDoubles(json, result.vocal_activity_mask);
+  // v2 §2b: detector inputs. Onset times are transient event ticks;
+  // centroid rides the compact energy grid; the fine curve keeps its native
+  // 250 ms grid for the buildup gradient.
+  json += ",\"onsetTimes\":";
+  AppendDoubles(json, result.onset_times);
+  json += ",\"spectralCentroidCurve\":";
+  AppendEnergyCurve(json, result.spectral_centroid_frames);
+  json += ",\"energyCurveFine\":";
+  AppendEnergyCurve(json, result.energy_curve_fine);
   json += ",\"energyCurve\":";
   AppendEnergyCurve(json, result.energy_curve);
   json += ",\"lowEnergyCurve\":";

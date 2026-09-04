@@ -905,6 +905,14 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 "vocalMask=${if (head?.vocalMask != null || tail?.vocalMask != null) "model" else "dsp"}",
         )
 
+        val mergedDownbeats = (headGrid?.downbeats.orEmpty() + tailGrid?.downbeats.orEmpty())
+            .ifEmpty { features.downbeats }
+            .sorted()
+        // v2 §2b: fold the transient fine curves into labels + scalars once,
+        // here, while they are still in memory. The store keeps only the
+        // outputs; the curves are released with `features` below.
+        val structure = detectStructure(features, mergedDownbeats, effectiveDuration)
+
         return WholeTrack(
                 TrackAnalysis(
                     status = TrackAnalysis.STATUS_READY,
@@ -914,9 +922,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     bpm = leading?.bpm ?: features.bpm,
                 beatInterval = leading?.beatInterval ?: features.beatInterval,
                 beatConfidence = leading?.beatConfidence ?: features.beatConfidence,
-                downbeats = (headGrid?.downbeats.orEmpty() + tailGrid?.downbeats.orEmpty())
-                    .ifEmpty { features.downbeats }
-                    .sorted(),
+                downbeats = mergedDownbeats,
                 firstBeat = headGrid?.firstBeat ?: features.firstBeat,
                 phraseBoundaries = features.phraseBoundaries,
                 key = features.key,
@@ -940,7 +946,80 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 vocalProbability = features.vocalProbability,
                 vocalPitchMedianHz = head?.pitch?.voicedMedianHz() ?: 0.0,
                 pitchConfidence = head?.pitch?.voicedMeanConfidence() ?: 0.0,
+                structureMap = structure.map,
+                structuredDropSec = structure.dropSec,
+                structuredBreakSec = structure.breakSec,
+                structuredOutroSec = structure.outroSec,
+                structuredBuildupSec = structure.buildupSec,
             ),
+        )
+    }
+
+    /** v2 §2b/§4 detector output: labels plus the scalars the planner reads. */
+    private data class DetectedStructure(
+        val map: List<StructureLabel> = emptyList(),
+        val dropSec: Double? = null,
+        val breakSec: Double? = null,
+        val outroSec: Double? = null,
+        val buildupSec: Double? = null,
+    )
+
+    /**
+     * Runs [StructureDetector] on the whole-track pass. Empty in, empty out:
+     * any missing input degrades to no labels and the planner keeps the v1
+     * heuristics (spec §2b fallback). Single O(n) pass over the fine curve.
+     */
+    private fun detectStructure(
+        features: TrackFeatures.Features,
+        downbeats: List<Double>,
+        duration: Double,
+    ): DetectedStructure {
+        val fine = features.energyCurveFine
+        if (fine.size < 8 || duration <= 0) return DetectedStructure()
+        val energies = fine.mapNotNull { it.energy.takeIf { e -> e.isFinite() && e >= 0 } }
+        if (energies.isEmpty()) return DetectedStructure()
+        val meanRms = energies.average()
+        if (meanRms <= 0) return DetectedStructure()
+        val onsets = features.onsetTimes.filter { it.isFinite() }
+        val meanOnset = if (duration > 0) onsets.size / duration else 0.0
+        // v2 §2b AMBIENT: no trusted grid and almost no attacks — the whole
+        // track is one ambient bed. Short-circuits the window classifier.
+        if (features.beatConfidence < 0.30 && meanOnset < 2.0 && duration > 0) {
+            return DetectedStructure(
+                map = listOf(StructureLabel(0.0, duration, StructureSectionType.AMBIENT)),
+            )
+        }
+        val interval = features.beatInterval.takeIf { it.isFinite() && it > 0 }
+            ?: if (features.bpm > 0) 60.0 / features.bpm else 0.0
+        val map = StructureDetector.detect(
+            fine = fine,
+            centroid = features.spectralCentroidCurve,
+            onsets = onsets,
+            downbeats = downbeats,
+            duration = duration,
+            meanRms = meanRms,
+            meanOnset = meanOnset,
+            beatInterval = interval,
+        )
+        val dropSec = map.firstOrNull { it.type == StructureSectionType.DROP }?.start
+        // §4 gradient anchors on the detector's DROP; without one there is no
+        // peak to walk back from, and buildupStart falls back downstream.
+        val buildupSec = if (dropSec != null && dropSec.isFinite()) {
+            val peak = fine.filter { it.time.isFinite() && abs(it.time - dropSec) <= 2.0 }
+                .mapNotNull { it.energy.takeIf { e -> e.isFinite() && e > 0 } }
+                .maxOrNull()
+            if (peak != null) StructureDetector.gradientBuildup(fine, dropSec, peak) else null
+        } else {
+            null
+        }
+        return DetectedStructure(
+            map = map,
+            dropSec = dropSec?.takeIf { it.isFinite() },
+            breakSec = map.firstOrNull { it.type == StructureSectionType.BREAK }?.start
+                ?.takeIf { it.isFinite() },
+            outroSec = map.firstOrNull { it.type == StructureSectionType.OUTRO }?.start
+                ?.takeIf { it.isFinite() },
+            buildupSec = buildupSec?.takeIf { it.isFinite() },
         )
     }
 

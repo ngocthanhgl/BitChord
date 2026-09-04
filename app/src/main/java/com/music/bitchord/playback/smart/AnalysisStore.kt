@@ -164,6 +164,12 @@ class AnalysisStore(private val context: Context) {
         val vocalProbability: Double = 0.0,
         val vocalPitchMedianHz: Double = 0.0,
         val pitchConfidence: Double = 0.0,
+        // v2 §2b: persisted detector output. Fine curves stay transient.
+        val structureMap: List<StoredStructure> = emptyList(),
+        val structuredDropSec: Double? = null,
+        val structuredBreakSec: Double? = null,
+        val structuredOutroSec: Double? = null,
+        val structuredBuildupSec: Double? = null,
     ) {
         fun toAnalysis(trackId: String) = TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
@@ -192,6 +198,11 @@ class AnalysisStore(private val context: Context) {
             vocalProbability = vocalProbability,
             vocalPitchMedianHz = vocalPitchMedianHz,
             pitchConfidence = pitchConfidence,
+            structureMap = structureMap.map { it.toLabel() },
+            structuredDropSec = structuredDropSec,
+            structuredBreakSec = structuredBreakSec,
+            structuredOutroSec = structuredOutroSec,
+            structuredBuildupSec = structuredBuildupSec,
         )
 
         companion object {
@@ -220,7 +231,26 @@ class AnalysisStore(private val context: Context) {
                 vocalProbability = analysis.vocalProbability,
                 vocalPitchMedianHz = round(analysis.vocalPitchMedianHz),
                 pitchConfidence = analysis.pitchConfidence,
+                structureMap = analysis.structureMap.map(StoredStructure::of),
+                structuredDropSec = analysis.structuredDropSec,
+                structuredBreakSec = analysis.structuredBreakSec,
+                structuredOutroSec = analysis.structuredOutroSec,
+                structuredBuildupSec = analysis.structuredBuildupSec,
             )
+        }
+    }
+
+    @Serializable
+    private data class StoredStructure(val start: Double, val end: Double, val type: String) {
+        fun toLabel() = StructureLabel(
+            start = start,
+            end = end,
+            type = runCatching { StructureSectionType.valueOf(type) }.getOrDefault(StructureSectionType.VERSE),
+        )
+
+        companion object {
+            fun of(label: StructureLabel) =
+                StoredStructure(round(label.start), round(label.end), label.type.name)
         }
     }
 
@@ -252,7 +282,7 @@ class AnalysisStore(private val context: Context) {
          * re-analysis costs seconds, and a beat grid interpreted under the wrong
          * assumptions is silently wrong for the life of the file.
          */
-        const val SCHEMA_VERSION = 2
+        const val SCHEMA_VERSION = 3
 
         /** A few thousand tracks' worth, at tens of kilobytes each. */
         const val MAX_ENTRIES = 2_000

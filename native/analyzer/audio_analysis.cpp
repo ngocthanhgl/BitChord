@@ -323,7 +323,9 @@ void AnalyzeKeyAndTimbre(
   double end_time,
   AnalysisResult& result,
   std::vector<EnergyPoint>& low_frames,
-  std::vector<EnergyPoint>& vocal_frames
+  std::vector<EnergyPoint>& vocal_frames,
+  // v2 §2b: per-frame spectral centroid in Hz, parallel to low/vocal frames.
+  std::vector<EnergyPoint>& centroid_frames
 ) {
   constexpr size_t frame_size = 4096;
   const size_t hop_size = std::max<size_t>(frame_size, sample_rate * 0.65);
@@ -357,10 +359,15 @@ void AnalyzeKeyAndTimbre(
     double frame_low = 0;
     double frame_vocal = 0;
     double frame_high = 0;
+    // v2 §2b: power-weighted mean frequency over the analysis band.
+    double centroid_num = 0;
+    double centroid_den = 0;
     for (size_t bin = 1; bin < frame_size / 2; ++bin) {
       const double frequency = bin * sample_rate / frame_size;
       if (frequency < 45 || frequency > std::min(5000.0, sample_rate * 0.48)) continue;
       const double power = std::norm(spectrum[bin]);
+      centroid_num += frequency * power;
+      centroid_den += power;
       const double perceptual_power = std::log1p(power);
       if (frequency < 250) frame_low += perceptual_power;
       else if (frequency <= 4000) {
@@ -390,6 +397,12 @@ void AnalyzeKeyAndTimbre(
     vocal_frames.push_back({
       (start + frame_size / 2.0) / sample_rate,
       VocalProbabilityFrom(frame_low, frame_vocal, frame_high, frame_flatness)
+    });
+    // Silent-gated like the band frames above: rms < 0.0025 frames never reach
+    // here (continue), so the denominator is only zero on all-DC input.
+    centroid_frames.push_back({
+      (start + frame_size / 2.0) / sample_rate,
+      centroid_den > 1e-12 ? centroid_num / centroid_den : 0.0
     });
     chroma_weight += std::max(1e-9, frame_chroma * rms);
     ++accepted_frames;
@@ -603,6 +616,8 @@ AnalysisResult AnalyzeAudio(
   result.beat_confidence = tempo.confidence;
   result.beats = tempo.beats;
   result.downbeats = tempo.downbeats;
+  // v2 §2b: hand the thresholded onsets to the result for JNI emission.
+  result.onset_times = tempo.onset_times;
 
   // This level estimate is RMS dBFS minus the conventional 0.691 offset. It is
   // intentionally not advertised as a gated, K-weighted loudness measurement;
@@ -636,6 +651,7 @@ AnalysisResult AnalyzeAudio(
   }
   std::vector<EnergyPoint> low_frames;
   std::vector<EnergyPoint> vocal_frames;
+  std::vector<EnergyPoint> centroid_frames;
   AnalyzeKeyAndTimbre(
     samples,
     sample_rate,
@@ -643,8 +659,30 @@ AnalysisResult AnalyzeAudio(
     envelope.content_end,
     result,
     low_frames,
-    vocal_frames
+    vocal_frames,
+    centroid_frames
   );
+  // v2 §2b: centroid rides the same nearest-frame resampling as the vocal
+  // mask below — raw Hz, no reference normalization (thresholds live Kotlin-side).
+  size_t centroid_cursor = 0;
+  for (const EnergyPoint& point : result.energy_curve) {
+    while (centroid_cursor + 1 < centroid_frames.size() &&
+           std::abs(centroid_frames[centroid_cursor + 1].time - point.time) <
+             std::abs(centroid_frames[centroid_cursor].time - point.time)) {
+      ++centroid_cursor;
+    }
+    const double centroid = centroid_frames.empty() ? 0.0 : centroid_frames[centroid_cursor].energy;
+    result.spectral_centroid_frames.push_back({point.time, centroid});
+  }
+  // v2 §2b/§4: full-resolution normalized energy (250 ms grid) for the
+  // detector and the buildup gradient. Transient — JNI emits it, Kotlin never
+  // persists it; labels and scalars are what the store keeps.
+  for (size_t index = 0; index < envelope.levels.size(); ++index) {
+    result.energy_curve_fine.push_back({
+      index * envelope.window_seconds,
+      Clamp(envelope.levels[index] / std::max(1e-6, envelope.reference), 0, 1.5)
+    });
+  }
   // Low-band frames come from actual FFT energy below 250 Hz. Resample them onto the compact
   // envelope grid so the mobile planner can compare the same track-relative timestamps without
   // storing another high-resolution curve. Silence remains zero rather than borrowing the nearest
