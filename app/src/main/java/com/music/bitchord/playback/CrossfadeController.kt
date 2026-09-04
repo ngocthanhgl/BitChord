@@ -142,6 +142,13 @@ class CrossfadeController(
      */
     private val filters: TransitionFilters = TransitionFilters.None,
     /**
+     * The tempo-synced echo send riding each side of an echo-out. Mirrors
+     * [filters]: what makes a plan's echo audible rather than advisory.
+     * Defaults to [EchoFilters.None], which renders echo plans as the P0
+     * filter wash alone.
+     */
+    private val echoFilters: EchoFilters = EchoFilters.None,
+    /**
      * Whether a decode and inference for a media item is running right now.
      * Only feeds the stats line — nothing about a transition waits on it.
      */
@@ -263,6 +270,8 @@ class CrossfadeController(
         val volumeCurve: VolumeCurve = VolumeCurve.S_CURVE,
         /** Blueprint ECHO_REVERB_OUT: peak echo/reverb wet 0..1 on the outgoing track. */
         val echoAmount: Double = 0.0,
+        /** One bar of the outgoing grid in seconds: the echo repeat period. 0 parks the line. */
+        val echoBeatSeconds: Double = 0.0,
         /** Blueprint LOOP_CUT_DROP: bars of outgoing tail looped before the freeze-and-cut. */
         val loopBars: Int = 0,
     )
@@ -632,6 +641,7 @@ class CrossfadeController(
                 vocalOverlap = plan.vocalOverlap,
                 volumeCurve = plan.volumeCurve,
                 echoAmount = plan.echoAmount,
+                echoBeatSeconds = plan.outgoingBpm.takeIf { it > 0 }?.let { 60.0 / it } ?: 0.0,
                 loopBars = plan.loopBars,
             ),
         )
@@ -1048,6 +1058,7 @@ class CrossfadeController(
         // currently lifted out. Dropping a 24 dB/octave filter in one buffer is
         // the click this ramp exists to avoid.
         filters.open()
+        echoFilters.open()
         incoming?.volume = 1f
         bailFromGain = outgoing?.volume ?: 0f
         bailStartedAt = SystemClock.elapsedRealtime()
@@ -1068,6 +1079,7 @@ class CrossfadeController(
         // Unconditional and idempotent, like the speed reset below: correct
         // whether or not this transition ever filtered anything.
         filters.open()
+        echoFilters.open()
         render = Render()
 
         if (handedOff) {
@@ -1172,6 +1184,12 @@ class CrossfadeController(
                 val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
                 filters.outgoing(20000f * (1f - wash) + 300f * wash, 20f)
                 filters.incoming(20000f, 20f)
+                // The dub throw behind the wash: one-bar repeats of the
+                // filtered signal, riding up with the wash. The incoming side
+                // stays dry per the blueprint (reverb 30 %→0 % is the wash's
+                // absence, not a second send).
+                echoFilters.outgoing(wash, render.echoBeatSeconds.toFloat())
+                echoFilters.incoming(0f, 0f)
             }
             // Blueprint LOOP_CUT_DROP, P0 freeze: the spectrum holds open
             // while the tail loops, then the outgoing track sinks behind a

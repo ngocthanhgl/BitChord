@@ -147,6 +147,12 @@ class PlaybackService : MediaSessionService() {
     private var activeFilter: TransitionFilterProcessor = transitionFilterA
     private var spareFilter: TransitionFilterProcessor = transitionFilterB
 
+    private val echoSendA = EchoSendProcessor()
+    private val echoSendB = EchoSendProcessor()
+
+    private var activeEcho: EchoSendProcessor = echoSendA
+    private var spareEcho: EchoSendProcessor = echoSendB
+
     /** Automix's DSP analyzer — see [com.music.bitchord.playback.smart.TrackAnalyzer]. */
     private val trackAnalyzer = com.music.bitchord.playback.smart.TrackAnalyzer(this, AudioCache)
 
@@ -827,8 +833,8 @@ class PlaybackService : MediaSessionService() {
         mediaSourceFactory = DefaultMediaSourceFactory(AudioCache.playbackFactory(defaultDataSourceFactory))
             .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
 
-        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, ownsSession = true)
-        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, ownsSession = false)
+        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, ownsSession = true)
+        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, ownsSession = false)
         player = exoPlayer
         spare = sparePlayer
         // Both sinks feed the same session id, so the system equalizer and any
@@ -888,6 +894,16 @@ class PlaybackService : MediaSessionService() {
 
                 override fun outgoing(lowPassHz: Float, highPassHz: Float) =
                     spareFilter.setCutoffs(lowPassHz, highPassHz)
+            },
+            // Same role wiring as the filters: the controller only ever rides
+            // sends after the handoff, when the incoming track sits on the
+            // session player and the outgoing one on the spare.
+            echoFilters = object : EchoFilters {
+                override fun incoming(wet: Float, delaySeconds: Float) =
+                    activeEcho.setEcho(wet, delaySeconds)
+
+                override fun outgoing(wet: Float, delaySeconds: Float) =
+                    spareEcho.setEcho(wet, delaySeconds)
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
@@ -1105,9 +1121,10 @@ class PlaybackService : MediaSessionService() {
     private fun buildPlayer(
         spatial: SpatialAudioProcessor,
         filter: TransitionFilterProcessor,
+        echo: EchoSendProcessor,
         ownsSession: Boolean,
     ): ExoPlayer = ExoPlayer.Builder(this)
-        .setRenderersFactory(silenceSkippingRenderers(spatial, filter))
+        .setRenderersFactory(silenceSkippingRenderers(spatial, filter, echo))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
         .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
@@ -1139,6 +1156,9 @@ class PlaybackService : MediaSessionService() {
         val heldFilter = activeFilter
         activeFilter = spareFilter
         spareFilter = heldFilter
+        val heldEcho = activeEcho
+        activeEcho = spareEcho
+        spareEcho = heldEcho
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
@@ -2870,6 +2890,7 @@ class PlaybackService : MediaSessionService() {
     private fun silenceSkippingRenderers(
         spatial: SpatialAudioProcessor,
         transition: TransitionFilterProcessor,
+        echo: EchoSendProcessor,
     ) = object : DefaultRenderersFactory(this) {
         override fun buildAudioSink(
             context: Context,
@@ -2883,7 +2904,9 @@ class PlaybackService : MediaSessionService() {
                     // Transition filtering last of the two: widening is a
                     // property of the track, and a bass swap that ran before it
                     // would have its own low end fed back in by the crossfeed.
-                    arrayOf(spatial, transition),
+                    // The echo send rides after the filter so the tail it throws
+                    // is the filtered signal, not the raw one.
+                    arrayOf(spatial, transition, echo),
                     SilenceSkippingAudioProcessor(
                         MIN_SILENCE_US,
                         SilenceSkippingAudioProcessor.DEFAULT_SILENCE_RETENTION_RATIO,
