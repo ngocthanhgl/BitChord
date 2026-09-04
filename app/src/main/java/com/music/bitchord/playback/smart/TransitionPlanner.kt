@@ -1317,10 +1317,18 @@ fun planTransition(
 
     val policy = assessTransitionTier(analysis, nextAnalysis)
     if (policy.tier == TransitionTier.PLAIN_CROSSFADE) {
-        // Even the fallback fade respects the play floor; if the anchor sits
-        // on the floor itself the fade degrades to zero rather than negative.
-        val transitionStart = max(0.0, mixAnchor - standardFade)
-            .coerceAtLeast(min(playFloorSeconds, mixAnchor))
+        // The floor never collapses a fade: when the anchor sits before it
+        // (short track, early content end, interior cliff) the mix plays
+        // early at full length instead of degrading to an instant cut. The
+        // floor clamp applies only when it leaves a real fade behind.
+        val rawStart = max(0.0, mixAnchor - standardFade)
+        val transitionStart = if (!mixset && mixAnchor > playFloorSeconds &&
+            mixAnchor - max(rawStart, playFloorSeconds) >= MIN_TRANSITION_OVERLAP_SECONDS
+        ) {
+            max(rawStart, playFloorSeconds)
+        } else {
+            rawStart
+        }
         val started = playbackTime >= transitionStart
         return TransitionPlan(
             shouldStart = started,

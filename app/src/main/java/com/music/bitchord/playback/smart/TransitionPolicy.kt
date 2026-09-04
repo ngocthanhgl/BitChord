@@ -410,6 +410,11 @@ fun rankMixOutCandidates(
     }
     val budget = if (allowedWindow != null) BLUEPRINT_WINDOW_DISCARD_BUDGET else MAX_DISCARDED_MUSIC_SECONDS
     return augmented
+        // A window is a hard constraint, not a suggestion: analyzer
+        // candidates outside it (mid-track cliffs) must not hijack an
+        // anchor the play floor was supposed to protect. Empty results
+        // fall through to the fallback chain in resolveMixOutAnchor.
+        .filter { allowedWindow == null || it.time in allowedWindow }
         .map { candidate ->
             val measured = audibleSecondsBetween(analysis, candidate.time, end)
             // With no energy curve there is no way to tell skipped music from skipped silence, so

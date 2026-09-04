@@ -312,9 +312,18 @@ class CrossfadeController(
     private var lastMarkedPair: String? = null
     private var lastMarkedWindow: TransitionWindow? = null
 
+    /**
+     * A playhead jump bigger than this between two ticks is a seek, not
+     * playback: the latched marker was planned under assumptions (notably
+     * the missed-anchor salvage) the new position invalidates.
+     */
+    private val seekJumpThresholdMs = 2000L
+    private var lastTickPositionMs = -1L
+
     private fun clearMarkerLatch() {
         lastMarkedPair = null
         lastMarkedWindow = null
+        lastTickPositionMs = -1L
     }
 
     /**
@@ -637,8 +646,16 @@ class CrossfadeController(
             null
         }
         if (window != null) {
-            lastMarkedPair = pairKey
-            lastMarkedWindow = window
+            if (pairKey != lastMarkedPair || lastMarkedWindow == null) {
+                lastMarkedPair = pairKey
+                lastMarkedWindow = window
+            }
+            // Same pair already latched: the marker is frozen. A re-planned
+            // window for the same pair (missed-anchor salvage after the
+            // playhead jumped, late evidence landing) must not slide the bar
+            // under the listener — the first markable plan is the truth the
+            // listener was shown. A real seek clears the latch above via the
+            // position jump, so the next markable tick re-latches fresh.
         } else if (plan.blocked || pairKey != lastMarkedPair) {
             // Structural (too short to mix, nothing measurable) or a new pair:
             // nothing valid to show, so the latch goes with it. Backing into an
@@ -648,8 +665,17 @@ class CrossfadeController(
         // Otherwise a transient dip on the same pair — the latched window
         // outlives it, which is what makes the marker appear once both tracks
         // are measured and then stay put until the mix.
+        val nowMs = player.currentPosition
+        if (lastTickPositionMs >= 0 && abs(nowMs - lastTickPositionMs) > seekJumpThresholdMs) {
+            clearMarkerLatch()
+            if (window != null) {
+                lastMarkedPair = pairKey
+                lastMarkedWindow = window
+            }
+        }
+        lastTickPositionMs = nowMs
         AppSettings.smartTransitionWindow.value =
-            window ?: lastMarkedWindow?.takeIf { pairKey == lastMarkedPair }
+            lastMarkedWindow?.takeIf { pairKey == lastMarkedPair } ?: window
 
         if (plan.blocked) return
 

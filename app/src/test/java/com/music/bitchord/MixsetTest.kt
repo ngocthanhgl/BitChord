@@ -11,6 +11,7 @@ import com.music.bitchord.playback.smart.mixsetEntryPoint
 import com.music.bitchord.playback.smart.mixsetMixOutAnchor
 import com.music.bitchord.playback.smart.phrase16Grid
 import com.music.bitchord.playback.smart.planTransition
+import com.music.bitchord.playback.smart.resolveMixOutAnchor
 import com.music.bitchord.playback.smart.snapToPhrase16
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -472,6 +473,99 @@ class MixsetTest {
         assertTrue(
             "mixset entry at ${plan.incomingHandoffTime}, expected <= 95 (50% + overlap)",
             plan.incomingHandoffTime <= 95.0,
+        )
+    }
+
+    // -- Bugfix: interior anchor must never zero the fade ---------------------
+
+    @Test
+    fun plainTier_interiorAnchor_keepsFullFade() {
+        // Regression: an interior energy cliff (50%) on a low-confidence
+        // pair collapsed the PLAIN fade to zero against the 80% floor — an
+        // instant cut with no mix and no effect. The floor must yield, not
+        // the fade: the mix plays early at full length.
+        val outCurve = curve(200.0)
+        val out = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = 200.0,
+            bpm = 120.0,
+            beatInterval = 0.5,
+            beatConfidence = 0.1,
+            downbeats = (0..100).map { it * 2.0 },
+            phraseBoundaries = listOf(32.0, 64.0, 96.0),
+            firstBeat = 0.0,
+            key = "",
+            keyConfidence = 0.0,
+            audibleStartTime = 0.0,
+            pickupTime = 0.5,
+            introEndTime = 12.0,
+            contentEndTime = 200.0,
+            mixInTime = 8.0,
+            mixOutCandidates = listOf(MixCandidate(100.0, 0.9, "energy_cliff")),
+            energyCurve = outCurve,
+            vocalActivityMask = calmMask(outCurve.size),
+        )
+        val inCurve = curve(180.0)
+        val next = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = 180.0,
+            bpm = 118.0,
+            beatInterval = 0.5,
+            beatConfidence = 0.1,
+            downbeats = (0..90).map { it * 2.0 },
+            phraseBoundaries = listOf(32.0, 64.0),
+            firstBeat = 0.0,
+            key = "",
+            keyConfidence = 0.0,
+            audibleStartTime = 0.0,
+            pickupTime = 0.5,
+            introEndTime = 10.0,
+            contentEndTime = 180.0,
+            mixInTime = 6.0,
+            energyCurve = inCurve,
+            vocalActivityMask = calmMask(inCurve.size),
+        )
+        val plan = planTransition(
+            analysis = out,
+            nextAnalysis = next,
+            duration = 200.0,
+            mode = CrossfadeMode.SMART,
+        )
+        assertTrue(
+            "fade was ${plan.fadeSeconds}, expected >= 4 (no instant cut)",
+            plan.fadeSeconds >= 4.0,
+        )
+        assertTrue(
+            "start ${plan.transitionStart} must precede end ${plan.transitionEnd}",
+            plan.transitionStart < plan.transitionEnd,
+        )
+    }
+
+    @Test
+    fun mixOutWindow_filtersInteriorCliff() {
+        // A loud interior cliff must not hijack the anchor out of the play
+        // window: with a window set, only in-window candidates compete and
+        // the rest fall through to the fallback chain.
+        val points = curve(200.0)
+        val analysis = TrackAnalysis(
+            contentEndTime = 200.0,
+            mixOutCandidates = listOf(
+                MixCandidate(100.0, 1.0, "energy_cliff"),
+                MixCandidate(170.0, 0.5, "energy_cliff"),
+            ),
+            energyCurve = points,
+            vocalActivityMask = calmMask(points.size),
+        )
+        val anchor = resolveMixOutAnchor(
+            analysis,
+            contentEnd = 200.0,
+            duration = 200.0,
+            allowedWindow = 160.0..185.0,
+            fallbackTime = 160.0,
+        )
+        assertTrue(
+            "anchor at ${anchor.time}, expected inside [160, 185]",
+            anchor.time in 160.0..185.0,
         )
     }
 }

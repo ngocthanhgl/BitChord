@@ -1824,6 +1824,15 @@ fun NowPlayingScreen(
             }
             val mixing by AppSettings.smartMixInProgress.collectAsStateWithLifecycle()
             val transitionWindow by AppSettings.smartTransitionWindow.collectAsStateWithLifecycle()
+            // Frozen under the finger: the controller may re-plan (and move
+            // the window) when the released seek lands, but mid-drag the
+            // marker must stay where the listener last saw it — a highlight
+            // that slides along with the playhead reads as a glitch.
+            var pinnedWindow by remember { mutableStateOf<ClosedFloatingPointRange<Float>?>(null) }
+            val liveWindow = transitionWindow
+                ?.takeIf { it.end > it.start }
+                ?.let { it.start..it.end }
+            if (!scrubbing) pinnedWindow = liveWindow
             ThinSlider(
                 value = shown,
                 onValueChange = {
@@ -1847,9 +1856,7 @@ fun NowPlayingScreen(
                 // describing where the transition *will* be, and holding it up
                 // while the playhead moves is exactly what lets a listener seek
                 // by the mix region instead of by blind time.
-                transitionWindow = transitionWindow
-                    ?.takeIf { it.end > it.start }
-                    ?.let { it.start..it.end },
+                transitionWindow = if (scrubbing) pinnedWindow else liveWindow,
             )
             val wifiQuality by AppSettings.audioQualityWifi.collectAsStateWithLifecycle()
             val cellularQuality by AppSettings.audioQualityCellular.collectAsStateWithLifecycle()
