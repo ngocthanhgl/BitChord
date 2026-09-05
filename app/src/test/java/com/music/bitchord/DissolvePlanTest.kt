@@ -20,12 +20,12 @@ class DissolvePlanTest {
     private fun curve(vararg points: Pair<Double, Double>): List<EnergySample> =
         points.map { EnergySample(it.first, it.second) }
 
-    /** Flat loud track with a 1 s hole at 150–151 s. */
+    /** Flat loud track with a 1.5 s hole at 150–151.5 s (spans ≥0.6 s). */
     private fun gapTrack(): TrackAnalysis {
         val pts = mutableListOf<Pair<Double, Double>>()
         var t = 100.0
         while (t <= 200.0) {
-            pts += t to if (t >= 150.0 && t < 151.0) 0.01 else 0.9
+            pts += t to if (t >= 150.0 && t < 151.5) 0.01 else 0.9
             t += 0.5
         }
         return TrackAnalysis(energyCurve = curve(*pts.toTypedArray()))

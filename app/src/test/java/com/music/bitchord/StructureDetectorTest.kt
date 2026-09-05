@@ -105,7 +105,10 @@ class StructureDetectorTest {
         val curve = fine(duration) { t ->
             if (t < 150.0) 1.1 else 1.1 - (t - 150.0) / 50.0 * 0.8 // 1.1 -> 0.3
         }
-        val cents = centroid(duration) { 2200.0 }
+        // The tail goes spectrally dark too: the finetune spectral gate
+        // (window centroid below 88% of the track mean) only lets genuine
+        // comedowns through, and a flat-bright bed is not one.
+        val cents = centroid(duration) { t -> if (t < 150.0) 2200.0 else 1500.0 }
         val map = StructureDetector.detect(
             fine = curve, centroid = cents, onsets = (0..100).map { it * 2.0 },
             downbeats = downs(duration), duration = duration,

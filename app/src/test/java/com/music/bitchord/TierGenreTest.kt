@@ -81,9 +81,9 @@ class TierGenreTest {
     }
 
     @Test
-    fun `octave pair still BEATMATCHED`() {
+    fun `octave pair locks HALF_TIME`() {
         val verdict = assessTransitionTier(track(64.0), track(128.0))
-        assertEquals(TransitionTier.BEATMATCHED, verdict.tier)
+        assertEquals(TransitionTier.HALF_TIME, verdict.tier)
         assertEquals(2.0, verdict.matchedRatio, 1e-9)
     }
 

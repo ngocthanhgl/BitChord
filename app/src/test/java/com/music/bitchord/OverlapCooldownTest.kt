@@ -57,19 +57,24 @@ class OverlapCooldownTest {
         )
 
     @Test
-    fun `falling quiet window lands the cooldown`() {
+    fun `still-falling window is not a landing`() {
+        // Spec finetune §6: the cooldown must be flat-stable (slope at/above
+        // −0.002). A 0.6→0.4 fall over 8 s is still moving, so no grid point
+        // qualifies even though the window runs low.
         val analysis = base(200.0) { t ->
             if (t in 100.0..108.0) 0.6 - (t - 100.0) * 0.025 else 1.0
         }
-        assertEquals(100.0, cooldownLanding(analysis, 90.0, 150.0)!!, 1e-9)
+        assertNull(cooldownLanding(analysis, 90.0, 150.0))
     }
 
     @Test
-    fun `flat quiet stretch is not a comedown`() {
+    fun `flat-stable quiet stretch lands the cooldown`() {
+        // The same shape settled flat IS a landing: low mean, tight spread,
+        // zero slope — the floor the next track can land on.
         val analysis = base(200.0) { t ->
             if (t in 100.0..108.0) 0.5 else 1.0
         }.copy(downbeats = listOf(100.0))
-        assertNull(cooldownLanding(analysis, 90.0, 150.0))
+        assertEquals(100.0, cooldownLanding(analysis, 90.0, 150.0)!!, 1e-9)
     }
 
     @Test

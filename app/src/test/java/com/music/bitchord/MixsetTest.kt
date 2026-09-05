@@ -234,11 +234,16 @@ class MixsetTest {
     fun mixsetAnchor_waitsPastTargetForNearestCalm() {
         val length = 300.0
         val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
-        // Drop at 60 -> floor 120, target 150, cap 180. The grid holds 150
-        // itself, but the anchor waits for 152 past the target instead of
-        // stopping on it: peaks get room to finish.
+        // Drop at 60 -> floor 120, target 150 (OTHER genre), cap 190. The
+        // grid holds 150 itself, but the calm-aware fallback waits for 152
+        // past the target instead of stopping on it: peaks get room to
+        // finish. beatConfidence keeps the genre out of AMBIENT (which
+        // would stretch the target +30 s); firstDropSec uses strict
+        // neighbors so the flat bed does not report a phantom drop.
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
+            bpm = 120.0,
+            beatConfidence = 0.9,
             energyCurve = points,
             vocalActivityMask = calmMask(points.size),
             downbeats = (0..150).map { it * 2.0 },
@@ -253,14 +258,17 @@ class MixsetTest {
     fun mixsetAnchor_waitsForCalmLanding_afterTarget() {
         val length = 300.0
         val points = curve(length, energyAt = { t -> if (t == 60.0) 3.0 else 1.0 })
-        // Singing 148-154, calm at the 156 phrase: 146 is closer to the 150
-        // target and calm, but the anchor waits the 6 extra seconds for the
-        // post-peak landing instead of cutting the chorus short.
+        // Singing 148-154 poisons the 150 target and the 152 landing, so the
+        // calm-aware fallback waits the extra seconds for the post-peak 156
+        // instead of cutting the chorus short (late 156 beats early 146
+        // inside the wait tolerance).
         val mask = points.map { p ->
             if (p.time >= 148.0 && p.time <= 154.0) 0.9 else 0.1
         }
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
+            bpm = 120.0,
+            beatConfidence = 0.9,
             energyCurve = points,
             vocalActivityMask = mask,
             downbeats = (60..90).map { it * 2.0 },
@@ -406,19 +414,20 @@ class MixsetTest {
     @Test
     fun buildupStart_findsFootOfRise() {
         val length = 200.0
-        // A steady climb from 40 to the 120 peak: the foot sits where the
-        // curve first clears 40% of the peak going back — about a third of
-        // the way up, not at the peak and not at the inaudible start.
+        // A steady climb from 40 to the 120 peak. Per the spec chain the foot
+        // is drop minus one phrase (120 − 32 = 88) snapped to the grid (64) —
+        // the legacy 40%-of-peak walk only serves dropless tracks now.
         val points = curve(length, energyAt = { t ->
             if (t in 40.0..120.0) 0.3 + (t - 40.0) * 2.7 / 80.0 else 0.3
         })
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
+            bpm = 120.0,
             energyCurve = points,
             vocalActivityMask = calmMask(points.size),
             downbeats = (0..100).map { it * 2.0 },
         )
-        assertEquals(66.0, buildupStart(analysis, 120.0)!!, 1e-6)
+        assertEquals(64.0, buildupStart(analysis, 120.0)!!, 1e-6)
         // The entry snaps the foot back to the phrase start per spec.
         assertEquals(64.0, mixsetEntryPoint(analysis)!!, 1e-6)
     }
@@ -575,14 +584,14 @@ class MixsetTest {
 
     @Test
     fun mixsetFireFloor_dissolveShortTrack_shiftsWholeWindow() {
-        // A 50 s track in mixset dissolves: the silence hole at 25–26 s sits
-        // exactly on scanFrom (max(0 + 25, 50 − 45)), so the raw cut lands at
-        // 25 with a 2 s fade — start 23, an audible skip. The floor shifts
-        // the whole window to start at 30, fade intact.
+        // A 50 s track in mixset dissolves: the silence hole at 25–26.5 s
+        // sits exactly on scanFrom (max(0 + 25, 50 − 45)), so the raw cut
+        // lands at 25 with a 2 s fade — start 23, an audible skip. The floor
+        // shifts the whole window to start at 30, fade intact.
         val pts = mutableListOf<EnergySample>()
         var t = 0.0
         while (t <= 50.0) {
-            pts += EnergySample(t, if (t >= 25.0 && t < 26.0) 0.01 else 0.9)
+            pts += EnergySample(t, if (t >= 25.0 && t < 26.5) 0.01 else 0.9)
             t += 0.5
         }
         val out = TrackAnalysis(

@@ -1612,9 +1612,13 @@ fun firstDropSec(analysis: TrackAnalysis): Double? {
     for (i in 1 until curve.size - 1) {
         val point = curve[i]
         if (!point.time.isFinite() || point.time < introEnd) continue
+        // Strict neighbors: a flat bed is not a drop — plateau edges are not
+        // onsets. Only a genuine spike (strictly above both neighbors)
+        // qualifies, so quiet flat tracks do not report a phantom drop at
+        // the intro boundary.
         if (point.energy >= threshold &&
-            point.energy >= curve[i - 1].energy &&
-            point.energy >= curve[i + 1].energy
+            point.energy > curve[i - 1].energy &&
+            point.energy > curve[i + 1].energy
         ) {
             return point.time
         }
