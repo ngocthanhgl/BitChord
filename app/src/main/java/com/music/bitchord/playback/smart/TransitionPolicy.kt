@@ -47,13 +47,18 @@ private const val POLICY_TAG = "BitChordPolicy"
 /**
  * Last mixset anchor verdict logged; the planner calls
  * [mixsetMixOutAnchor] every tick, so only distinct decisions are logged.
+ * The per-tick fields (t=, pos=) are stripped from the dedupe key — otherwise
+ * every 250 ms tick formats a novel string and the "once" never fires
+ * (field log 2026-09-05: 60+ rescue lines in 3 minutes).
  */
 private var lastMixsetAnchorLog: String? = null
 
+private val tickField = Regex(" (t|pos)=[0-9.]+")
+
 private fun logMixsetAnchorOnce(trackId: String, msg: String) {
-    val full = "$trackId|$msg"
-    if (full != lastMixsetAnchorLog) {
-        lastMixsetAnchorLog = full
+    val key = "$trackId|${tickField.replace(msg, "")}"
+    if (key != lastMixsetAnchorLog) {
+        lastMixsetAnchorLog = key
         TrackLog.d(POLICY_TAG, msg)
     }
 }

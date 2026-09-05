@@ -75,9 +75,11 @@ object StructureDetector {
         val bars = downbeats.filter { it.isFinite() }.sorted()
         if (bars.size < 8) return emptyList()
         // 4-bar windows, stepping one bar for boundary resolution.
+        // Bound is strict: bar+4 == size would read bars[size] past the end
+        // (crashed every track with >=8 downbeats on-device, 2026-09-05 log).
         val windows = mutableListOf<WindowStats>()
         var bar = 0
-        while (bar + 4 <= bars.size) {
+        while (bar + 4 < bars.size) {
             val start = bars[bar]
             val end = bars[bar + 4]
             if (end <= start || start < 0) {

@@ -166,4 +166,40 @@ class StructureDetectorTest {
         // Rise 0.15 < 0.25 x peak: a wobble, not a buildup.
         assertNull(StructureDetector.gradientBuildup(curve, dropSec = 100.0, peakEnergy = 1.0))
     }
+
+    // --- terminal-window regression (on-device AIOOBE 2026-09-05) ---
+
+    @Test
+    fun `twenty five downbeats do not overrun the last window`() {
+        // Mirrors the field crash: length=25, index=25 at the terminal window.
+        // downs(46.0) yields exactly t=0..45.0 step 1.875 -> 25 downbeats.
+        val downs25 = downs(46.0)
+        assertEquals(25, downs25.size)
+        val map = StructureDetector.detect(
+            fine = fine(46.0) { 1.0 }, centroid = centroid(46.0) { 2200.0 },
+            onsets = (0..20).map { it * 2.0 },
+            downbeats = downs25, duration = 46.0,
+            meanRms = 1.0, meanOnset = 1.0, beatInterval = beatInterval,
+        )
+        assertTrue(map.isNotEmpty())
+        assertTrue(map.all { it.start >= 0.0 && it.end <= downs25.last() })
+        assertEquals(downs25.last(), map.maxOf { it.end }, 1e-9)
+    }
+
+    @Test
+    fun `twelve downbeats do not overrun the last window`() {
+        // Second field crash shape: length=12, index=12.
+        // downs(21.0) yields exactly t=0..20.625 step 1.875 -> 12 downbeats.
+        val downs12 = downs(21.0)
+        assertEquals(12, downs12.size)
+        val map = StructureDetector.detect(
+            fine = fine(21.0) { 1.0 }, centroid = centroid(21.0) { 2200.0 },
+            onsets = (0..10).map { it * 2.0 },
+            downbeats = downs12, duration = 21.0,
+            meanRms = 1.0, meanOnset = 1.0, beatInterval = beatInterval,
+        )
+        assertTrue(map.isNotEmpty())
+        assertTrue(map.all { it.start >= 0.0 && it.end <= downs12.last() })
+        assertEquals(downs12.last(), map.maxOf { it.end }, 1e-9)
+    }
 }

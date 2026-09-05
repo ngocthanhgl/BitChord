@@ -1188,16 +1188,24 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         val interval = features.beatInterval.takeIf { it.isFinite() && it > 0 }
             ?: if (features.bpm > 0) 60.0 / features.bpm else 0.0
-        val map = StructureDetector.detect(
-            fine = fine,
-            centroid = features.spectralCentroidCurve,
-            onsets = onsets,
-            downbeats = downbeats,
-            duration = duration,
-            meanRms = meanRms,
-            meanOnset = meanOnset,
-            beatInterval = interval,
-        )
+        // Defense in depth (field crash 2026-09-05: an off-by-one in the
+        // classifier FAILED every whole-track analysis): section labels must
+        // never take down beat/vocal/pitch evidence already computed. Any
+        // detector throw degrades to an empty map (v1 energy heuristics).
+        val map = runCatching {
+            StructureDetector.detect(
+                fine = fine,
+                centroid = features.spectralCentroidCurve,
+                onsets = onsets,
+                downbeats = downbeats,
+                duration = duration,
+                meanRms = meanRms,
+                meanOnset = meanOnset,
+                beatInterval = interval,
+            )
+        }.onFailure {
+            TrackLog.w(TAG, "StructureDetector failed; degrading to v1 heuristics", it)
+        }.getOrDefault(emptyList())
         val dropSec = map.firstOrNull { it.type == StructureSectionType.DROP }?.start
         // §4 gradient anchors on the detector's DROP; without one there is no
         // peak to walk back from, and buildupStart falls back downstream.

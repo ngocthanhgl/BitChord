@@ -32,8 +32,8 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Run Unit Tests (incl. PitchTrackerTest)
-      run: ./gradlew testProdDebugUnitTest --tests "com.music.bitchord.PitchTrackerTest"
+    - name: Run Unit Tests (full suite — every test file must execute)
+      run: ./gradlew testProdDebugUnitTest
 
     - name: Build Signed Prod Release APK
       run: ./gradlew assembleProdRelease
