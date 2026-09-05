@@ -31,8 +31,10 @@ import androidx.media3.common.util.UnstableApi
 import com.music.bitchord.playback.AudioCache
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
@@ -50,9 +52,39 @@ import java.util.Locale
 @UnstableApi
 class TrackAnalyzer(private val context: Context, private val cache: AudioCache) {
 
-    private val tracker = BeatTracker(context)
-    private val vocals = VocalTracker(context)
-    private val pitch = PitchTracker(context)
+    /**
+     * Dual pinned lanes. The high lane serves the track queued to play next,
+     * the low lane everything else — and refine head passes ride whichever
+     * lane their track's priority selects, so track1 and track2 (heads
+     * included) genuinely overlap.
+     *
+     * Each lane owns its own model sessions. The ORT sessions assume
+     * single-thread confinement, so two workers sharing one session would
+     * race inference against release; per-lane triples remove that by
+     * construction, with no lock ordering and no close-while-inferring
+     * window. The global [running] set stays the cross-lane same-track
+     * mutex: a track never runs on both lanes at once, so a head pass can
+     * never overwrite a whole-track result.
+     */
+    private inner class Lane(
+        val laneName: String,
+        val tracker: BeatTracker,
+        val vocals: VocalTracker,
+        val pitch: PitchTracker,
+    ) {
+        val inFlight = AtomicInteger(0)
+        fun releaseModels() {
+            tracker.release()
+            vocals.release()
+            pitch.release()
+        }
+    }
+
+    private val highLane = Lane("high", BeatTracker(context), VocalTracker(context), PitchTracker(context))
+    private val lowLane = Lane("low", BeatTracker(context), VocalTracker(context), PitchTracker(context))
+
+    /** Lane executing the current job; set by [AnalysisJob.run]. */
+    private val currentLane = ThreadLocal<Lane>()
 
     /**
      * Resolved on first use, not at construction, for the reason [AnalysisStore]
@@ -159,12 +191,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     private fun discardsOf(key: String): Int = discarded[key] ?: 0
 
     /**
-     * One lane, two priorities. Still a single worker thread — analysis jobs
-     * are never concurrent with each other, which the model sessions assume —
-     * but a job for the track that is about to play now overtakes jobs for
-     * tracks further out. Before this, a slow head-of-line job (a full CREPE
-     * pass, a spinning decode) held every track behind it, and the next track
-     * sat at WAITING until its fade arrived. Within a lane, FIFO.
+     * Two lanes, two priorities. Each lane is still a single worker thread —
+     * jobs on the same lane never run concurrently — but the next track's
+     * job no longer waits behind the current track's. Priority selects the
+     * lane (see [submit]), and FIFO is per lane.
      *
      * The queue holds [AnalysisJob]s only; anything else submitted here is a
      * bug, and failing fast on it is better than a stuck comparator.
@@ -172,29 +202,61 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     private val jobSeq = AtomicLong(0)
 
     private inner class AnalysisJob(
+        val lane: Lane,
         val priority: Int,
         val block: () -> Unit,
     ) : Runnable, Comparable<AnalysisJob> {
         val seq = jobSeq.getAndIncrement()
-        override fun run() = block()
+        override fun run() {
+            currentLane.set(lane)
+            lane.inFlight.incrementAndGet()
+            try {
+                block()
+            } finally {
+                currentLane.remove()
+                // Lane-local idle release: the old global `running.isEmpty()`
+                // close could land while the other lane was mid-inference.
+                // Zero here means nothing submitted or running on this lane,
+                // so its sessions are safe to drop; a queued backlog on the
+                // lane keeps them warm instead of churning reloads. (A session
+                // holds its arena and parsed graph in native heap while open,
+                // which a backgrounded player cannot justify between
+                // transitions; reloading costs under a second against an
+                // analysis that already takes several.)
+                if (lane.inFlight.decrementAndGet() == 0) lane.releaseModels()
+            }
+        }
         override fun compareTo(other: AnalysisJob): Int =
             compareValuesBy(this, other, { -it.priority }, { it.seq })
     }
 
-    private fun submit(priority: Int, block: () -> Unit) {
-        executor.execute(AnalysisJob(priority, block))
+    private fun laneThreadFactory(name: String): ThreadFactory = ThreadFactory { runnable ->
+        Thread(runnable, name).apply {
+            isDaemon = true
+            priority = Thread.NORM_PRIORITY
+        }
     }
 
-    private val executor = ThreadPoolExecutor(
+    private val highExecutor = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
         PriorityBlockingQueue<Runnable>(),
-        { runnable ->
-            Thread(runnable, "bitchord-smart-analysis").apply {
-                isDaemon = true
-                priority = Thread.NORM_PRIORITY
-            }
-        },
+        laneThreadFactory("bitchord-smart-high"),
     )
+
+    private val lowExecutor = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        PriorityBlockingQueue<Runnable>(),
+        laneThreadFactory("bitchord-smart-low"),
+    )
+
+    private fun submit(priority: Int, block: () -> Unit) {
+        // Priority is the lane selector now, not just queue order: the next
+        // track's analysis must never queue behind a backlog of normals.
+        // RejectedExecutionException can only come from shutdown (see
+        // [release]), and at that point the process is going away anyway.
+        val lane = if (priority >= PRIORITY_NEXT) highLane else lowLane
+        (if (priority >= PRIORITY_NEXT) highExecutor else lowExecutor).execute(AnalysisJob(lane, priority, block))
+    }
 
     /**
      * What is known about [trackId] right now: never a computation, never a
@@ -350,24 +412,24 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             cache.requestAnalysisHead(uri)
             return
         }
-        // Stuck watchdog (P0/F5): a job that has occupied the single worker
-        // past STUCK_JOB_TIMEOUT_MS blocks every track behind it, including
-        // the next track whose fade is approaching. Reported once, never
-        // preempted — see the constant for why killing it is worse.
+        // Stuck watchdog (P0/F5): a job that has occupied its lane past
+        // STUCK_JOB_TIMEOUT_MS blocks that lane's queue, so the watchdog is
+        // per track but the blockage is per lane — the other lane keeps
+        // serving its own priority. Reported once, never preempted — see
+        // the constant for why killing it is worse.
         val started = jobStartMs[trackId]
         if (started != null && trackId in running &&
             System.currentTimeMillis() - started > STUCK_JOB_TIMEOUT_MS &&
             stuckLogged.add(trackId)
         ) {
-            Log.e(TAG, "Analysis job for $trackId stuck over ${STUCK_JOB_TIMEOUT_MS}ms on the single worker")
+            Log.e(TAG, "Analysis job for $trackId stuck over ${STUCK_JOB_TIMEOUT_MS}ms on its lane")
         }
         if (!running.add(trackId)) return
         jobStartMs[trackId] = System.currentTimeMillis()
 
         submit(priority) {
             try {
-                // [restoreOnce] queues onto this same single-threaded executor,
-                // so a stored result for this track has landed by now if there
+                // [restoreOnce] queues onto the lane executors, so a stored result for this track has landed by now if there
                 // was one — but the decision to get here was taken a tick
                 // earlier, when it had not. Without this check a track measured
                 // in an earlier session is restored and then immediately spends
@@ -453,15 +515,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 running.remove(trackId)
                 jobStartMs.remove(trackId)
                 stuckLogged.remove(trackId)
-                // The session holds the model's arena and a parsed ONNX graph in native heap for
-                // as long as it is open, which a backgrounded music player cannot justify between
-                // transitions. Released the moment nothing is in flight; reloading costs under a
-                // second against an analysis that already takes several.
-                if (running.isEmpty()) {
-                    tracker.release()
-                    vocals.release()
-                    pitch.release()
-                }
+                // Model sessions are released lane-locally in
+                // [AnalysisJob.run] once nothing is submitted or running on
+                // that lane — the old global `running.isEmpty()` close could
+                // land while the other lane was mid-inference.
             }
         }
     }
@@ -1224,6 +1281,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         deriveFeatures: Boolean = false,
         trackPitch: Boolean = false,
     ): Region? {
+        // Lane-local sessions: region() always runs inside an [AnalysisJob],
+        // so the executing lane is set; the low-lane fallback is paranoia for
+        // direct unit-test calls, never production.
+        val lane = currentLane.get() ?: lowLane
         val decoded = openSource()?.use { AudioDecoder.decodeRegionStereo(it, startSeconds, endSeconds) }
             ?: run {
                 // The two ways this comes back empty mean opposite things and
@@ -1262,7 +1323,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             runCatching {
                 inputs.forModel
                     ?.let { MelSpectrogram.resample(it, MelSpectrogram.sampleRate, PitchTracker.SAMPLE_RATE.toDouble()) }
-                    ?.let { pitch.track(it, offsetSeconds = actualStart) }
+                    ?.let { lane.pitch.track(it, offsetSeconds = actualStart) }
             }.getOrElse { error ->
                 Log.w(TAG, "Pitch pass degraded to none", error)
                 null
@@ -1272,7 +1333,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
 
         return Region(
-            grid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) },
+            grid = inputs.forModel?.let { lane.tracker.track(it, offsetSeconds = actualStart) },
             vocalMask = features?.let { vocalMask(stereo, it, actualStart) },
             seconds = seconds,
             features = inputs.derived,
@@ -1337,6 +1398,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         features: TrackFeatures.Features,
         actualStart: Double,
     ): DoubleArray? {
+        val lane = currentLane.get() ?: lowLane
         val curve = features.energyCurve
         if (curve.isEmpty() || !VocalSpectrogram.available) return null
 
@@ -1350,7 +1412,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val left = if (maxSamples < stereo.left.size) stereo.left.copyOf(maxSamples) else stereo.left
         val right = if (maxSamples < stereo.right.size) stereo.right.copyOf(maxSamples) else stereo.right
 
-        val values = vocals.track(left, right, stereo.sampleRate) ?: return null
+        val values = lane.vocals.track(left, right, stereo.sampleRate) ?: return null
 
         val mask = DoubleArray(curve.size) { NEUTRAL_VOCAL }
         for (index in curve.indices) {
@@ -1384,7 +1446,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     )
 
     fun release() {
-        executor.shutdownNow()
+        highExecutor.shutdownNow()
+        lowExecutor.shutdownNow()
         headAttempts.clear()
         headSkipLogged.clear()
         provisional.clear()
@@ -1393,9 +1456,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         badRenditions.clear()
         triedRenditions.clear()
         discarded.clear()
-        tracker.release()
-        vocals.release()
-        pitch.release()
+        highLane.releaseModels()
+        lowLane.releaseModels()
     }
 
     companion object {
@@ -1454,11 +1516,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         const val MAX_NO_DURATION_ATTEMPTS = 10
 
         /**
-         * How long a job may occupy the single worker before it is reported
+         * How long a job may occupy its lane before it is reported
          * stuck. Detection only, never preemption: MediaCodec calls are not
-         * reliably interruptible and the model sessions assume jobs never run
-         * concurrently, so killing the thread would trade a slow analysis for
-         * a leaked codec and a corrupted session.
+         * reliably interruptible, and killing the thread would trade a slow
+         * analysis for a leaked codec and a corrupted session.
          */
         const val STUCK_JOB_TIMEOUT_MS = 90_000L
 
