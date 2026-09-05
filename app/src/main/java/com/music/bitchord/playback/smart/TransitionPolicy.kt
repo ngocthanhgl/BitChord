@@ -27,6 +27,7 @@ import kotlin.math.log2
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import android.util.Log
 
 /**
  * The confidence-aware transition policy.
@@ -40,6 +41,22 @@ import kotlin.math.roundToInt
  * Every judgement here is made from stored analysis fields and their
  * confidences; nothing in this file touches PCM.
  */
+
+private const val POLICY_TAG = "BitChordPolicy"
+
+/**
+ * Last mixset anchor verdict logged; the planner calls
+ * [mixsetMixOutAnchor] every tick, so only distinct decisions are logged.
+ */
+private var lastMixsetAnchorLog: String? = null
+
+private fun logMixsetAnchorOnce(trackId: String, msg: String) {
+    val full = "$trackId|$msg"
+    if (full != lastMixsetAnchorLog) {
+        lastMixsetAnchorLog = full
+        Log.d(POLICY_TAG, msg)
+    }
+}
 
 /**
  * Below this the analyzer's beat grid is treated as a guess, and no renderer
@@ -1016,6 +1033,14 @@ fun scoreCompatibility(
  * finish instead of being cut mid-chorus at a fixed offset.
  */
 const val MIXSET_MIN_PLAY_SECONDS = 60.0
+/**
+ * No-evidence rescue floor: when [mixsetMixOutAnchor] has no best-part cue
+ * at all it used to anchor `playbackTime + 15`, so a freshly tapped track
+ * mixed ~20 s in. A mixset slot promises ~a minute of music, so the rescue
+ * never lands before this — real evidence, once it arrives, re-plans to the
+ * true anchor (the marker latch tracks anchor moves over 2 s).
+ */
+const val MIXSET_RESCUE_FLOOR_SECONDS = 60.0
 const val MIXSET_TARGET_PLAY_SECONDS = 90.0
 const val MIXSET_MAX_PLAY_SECONDS = 130.0
 /**
@@ -1394,18 +1419,28 @@ fun isColdOpen(analysis: TrackAnalysis, audibleStart: Double = audibleStartOf(an
  */
 fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Double): MixOutAnchor {
     val rescue = MixOutAnchor(
-        time = min(length, playbackTime + 15.0).coerceAtLeast(0.0),
+        time = min(length, max(playbackTime + 15.0, MIXSET_RESCUE_FLOOR_SECONDS)).coerceAtLeast(0.0),
         type = "mixset_rescue",
         discardedMusicSeconds = 0.0,
     )
-    val entry = bestPartCue(analysis) ?: return rescue
+    val entry = bestPartCue(analysis)
+    if (entry == null) {
+        logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(no-entry) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)}")
+        return rescue
+    }
     val floor = entry + MIXSET_MIN_PLAY_SECONDS
     val base = entry + mixsetTargetFor(genreClass(analysis))
     val cap = entry + MIXSET_MAX_PLAY_SECONDS
-    if (playbackTime >= cap - 10.0) return rescue
+    if (playbackTime >= cap - 10.0) {
+        logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(past-window) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)} cap=${"%.1f".format(cap)}")
+        return rescue
+    }
     val from = max(0.0, floor)
     val to = min(length, cap)
-    if (to <= from) return rescue
+    if (to <= from) {
+        logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(window-collapse) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)} from=${"%.1f".format(from)} to=${"%.1f".format(to)}")
+        return rescue
+    }
     val drop = firstDropSec(analysis)
     // Tier 1: BREAK start after Drop 1.
     val tier1From = if (drop != null && drop.isFinite()) max(from, drop) else from
@@ -1439,6 +1474,7 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
     }
     time = capActivePlaytime(analysis, entry, time, length)
     time = pushPastDrop(analysis, time, drop, length)
+    logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_peak t=${"%.1f".format(time)} len=${"%.1f".format(length)} entry=${"%.1f".format(entry)} floor=${"%.1f".format(floor)} cap=${"%.1f".format(cap)}")
     return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
 }
 

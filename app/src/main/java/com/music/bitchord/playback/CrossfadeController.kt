@@ -729,7 +729,10 @@ class CrossfadeController(
                     transitionStart = frozenAnchorStartSec,
                     transitionEnd = frozenAnchorEndSec,
                 )
-            } else if (remainingMs in 1..anchorFreezeAheadMs) {
+            } else if (remainingMs in 1..anchorFreezeAheadMs && currentAnalysis.isUsable) {
+                // Freeze only on measured evidence: a no-evidence rescue
+                // anchor must stay live so the true anchor, once analysed,
+                // replaces it instead of firing from a frozen guess.
                 frozenAnchorPair = pairKey
                 frozenAnchorStartSec = plan.transitionStart
                 frozenAnchorEndSec = plan.transitionEnd
