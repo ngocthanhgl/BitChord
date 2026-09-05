@@ -1276,7 +1276,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         pitch.release()
     }
 
-    private companion object {
+    companion object {
         const val TAG = "BitChordTrackAnalyzer"
 
         /** Lane for the track queued to play next. Everything else is 0. */
