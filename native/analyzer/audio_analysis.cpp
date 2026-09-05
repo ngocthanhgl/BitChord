@@ -270,8 +270,8 @@ double FindMixOutTime(
   }
   if (!best_index) return envelope.content_end;
 
-  const double cliff_threshold = std::max(silence_threshold * 2, envelope.reference * 0.65);
-  const size_t maximum_backtrack = static_cast<size_t>(4.0 / window_seconds);
+  const double cliff_threshold = std::max(silence_threshold * 2, envelope.reference * 0.60);
+  const size_t maximum_backtrack = static_cast<size_t>(5.0 / window_seconds);
   size_t cliff_start = best_index;
   while (cliff_start > search_start && best_index - cliff_start < maximum_backtrack &&
          levels[cliff_start - 1] < cliff_threshold) {
@@ -480,7 +480,7 @@ void BuildStructure(const EnvelopeResult& envelope, AnalysisResult& result) {
 
   double raw_outro = std::max(result.intro_end_time, envelope.content_end - phrase_seconds);
   const size_t search_start = static_cast<size_t>(
-    std::max(result.intro_end_time, envelope.content_end * 0.6) / envelope.window_seconds
+    std::max(result.intro_end_time, envelope.content_end * 0.55) / envelope.window_seconds
   );
   for (size_t index = search_start; index + four_seconds < envelope.levels.size(); ++index) {
     const double section_average = Average(envelope.levels, index, index + four_seconds);
@@ -544,7 +544,7 @@ void BuildStructure(const EnvelopeResult& envelope, AnalysisResult& result) {
     : result.intro_end_time;
   const double latest_cue = std::max(
     envelope.audible_start,
-    std::min(36.0, envelope.content_end * 0.28)
+    std::min(40.0, envelope.content_end * 0.26)
   );
   // The first eight-bar boundary is the useful dominance target. A later
   // energy-based intro boundary can describe the song structure, but seeking
