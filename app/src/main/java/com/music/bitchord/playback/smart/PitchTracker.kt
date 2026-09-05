@@ -145,7 +145,7 @@ class PitchTracker(private val context: Context) {
     companion object {
         private const val TAG = "BitChordPitchTracker"
         private const val MODEL_ASSET = "crepe_tiny.onnx"
-        private const val INFERENCE_THREADS = 1
+        private const val INFERENCE_THREADS = 2
         private const val INFERENCE_BATCH = 32
 
         /** CREPE reads 16 kHz mono, 1024-sample frames every 10 ms. */
