@@ -993,6 +993,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 structuredBreakSec = structure.breakSec,
                 structuredOutroSec = structure.outroSec,
                 structuredBuildupSec = structure.buildupSec,
+                plainCutBreathSec = structure.breathSec,
             ),
         )
     }
@@ -1004,6 +1005,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val breakSec: Double? = null,
         val outroSec: Double? = null,
         val buildupSec: Double? = null,
+        /** Spec finetune §7: breathing room before the cut (see TrackAnalysis). */
+        val breathSec: Double? = null,
     )
 
     /**
@@ -1026,7 +1029,17 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val meanOnset = if (duration > 0) onsets.size / duration else 0.0
         // v2 §2b AMBIENT: no trusted grid and almost no attacks — the whole
         // track is one ambient bed. Short-circuits the window classifier.
-        if (features.beatConfidence < 0.30 && meanOnset < 2.0 && duration > 0) {
+        // Finetune v1 §1.6: tighter gates (chill-beat 0.28–0.32 is NOT ambient)
+        // plus flat-dynamics check — a quiet-but-varied track is not ambient.
+        val variance = if (energies.size >= 2) {
+            val mean = energies.average()
+            energies.sumOf { (it - mean) * (it - mean) } / energies.size
+        } else {
+            Double.MAX_VALUE
+        }
+        if (features.beatConfidence < AMBIENT_BEAT_CONF && meanOnset < AMBIENT_ONSET_DENSITY &&
+            variance < AMBIENT_RMS_VARIANCE && duration > 0
+        ) {
             return DetectedStructure(
                 map = listOf(StructureLabel(0.0, duration, StructureSectionType.AMBIENT)),
             )
@@ -1062,7 +1075,37 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             outroSec = map.firstOrNull { it.type == StructureSectionType.OUTRO }?.start
                 ?.takeIf { it.isFinite() },
             buildupSec = buildupSec?.takeIf { it.isFinite() },
+            breathSec = longestTailBreath(onsets, duration, interval),
         )
+    }
+
+    /**
+     * Spec finetune §7: the longest onset gap (>0.25 s) inside the last 35% of
+     * the track, plus one beat of lookahead so the cut lands breathing room
+     * rather than on the silence edge itself. Null when the tail never
+     * breathes. Pure — shared with tests.
+     */
+    private fun longestTailBreath(
+        onsets: List<Double>,
+        duration: Double,
+        beatInterval: Double,
+    ): Double? {
+        if (duration <= 0) return null
+        val tailFrom = duration * 0.65
+        val tail = (onsets.filter { it.isFinite() && it >= tailFrom } + duration).sorted()
+        if (tail.size < 2) return null
+        var bestStart = -1.0
+        var bestGap = 0.25
+        for (i in 0 until tail.size - 1) {
+            val gap = tail[i + 1] - tail[i]
+            if (gap > bestGap) {
+                bestGap = gap
+                bestStart = tail[i]
+            }
+        }
+        if (bestStart < 0) return null
+        val lookahead = if (beatInterval.isFinite() && beatInterval > 0) beatInterval else 0.5
+        return (bestStart + lookahead).takeIf { it.isFinite() && it < duration }
     }
 
     /**

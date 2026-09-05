@@ -170,6 +170,7 @@ class AnalysisStore(private val context: Context) {
         val structuredBreakSec: Double? = null,
         val structuredOutroSec: Double? = null,
         val structuredBuildupSec: Double? = null,
+        val plainCutBreathSec: Double? = null,
     ) {
         fun toAnalysis(trackId: String) = TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
@@ -203,6 +204,7 @@ class AnalysisStore(private val context: Context) {
             structuredBreakSec = structuredBreakSec,
             structuredOutroSec = structuredOutroSec,
             structuredBuildupSec = structuredBuildupSec,
+            plainCutBreathSec = plainCutBreathSec,
         )
 
         companion object {
@@ -236,6 +238,7 @@ class AnalysisStore(private val context: Context) {
                 structuredBreakSec = analysis.structuredBreakSec,
                 structuredOutroSec = analysis.structuredOutroSec,
                 structuredBuildupSec = analysis.structuredBuildupSec,
+                plainCutBreathSec = analysis.plainCutBreathSec?.let(::round),
             )
         }
     }
@@ -282,7 +285,7 @@ class AnalysisStore(private val context: Context) {
          * re-analysis costs seconds, and a beat grid interpreted under the wrong
          * assumptions is silently wrong for the life of the file.
          */
-        const val SCHEMA_VERSION = 3
+        const val SCHEMA_VERSION = 4
 
         /** A few thousand tracks' worth, at tens of kilobytes each. */
         const val MAX_ENTRIES = 2_000

@@ -1375,10 +1375,10 @@ class CrossfadeController(
             // the incoming one opens dry. The dedicated echo send (P1) rides
             // on top of this; the wash alone already decays, never clashes.
             TransitionStyle.ECHO_REVERB_OUT -> {
-                // Spec v2 §9b heavy clash: the plan carries a reverb freeze
+                // Spec finetune §5 heavy clash: the plan carries a reverb freeze
                 // offset, and the envelope below replaces the P0 wash — the
                 // outgoing track holds full for 3 s, then sinks behind echo
-                // (1.0→0.70 wet) and reverb (→0.80, frozen at +3 s) while the
+                // (1.0→0.70 wet) and reverb (→0.75, frozen at +3.5 s) while the
                 // incoming track waits out its delay before ramping in.
                 val freezeAt = render.reverbFreezeAtSec
                 if (freezeAt != null && freezeAt.isFinite()) {
@@ -1388,12 +1388,12 @@ class CrossfadeController(
                     val wetRamp = (progress * spanSec / HEAVY_CLASH_WET_RAMP_SEC).coerceIn(0f, 1f)
                     val frozen = progress * spanSec >= freezeAt.toFloat()
                     filters.outgoing(20000f, 20f)
-                    // Spec v2 §9b: B enters under a 600 Hz high-pass that
-                    // relaxes over 3 s from its start (4 s into the window),
+                    // Spec finetune §5: B enters under a 500 Hz high-pass that
+                    // relaxes over 3.5 s from its start (4.5 s into the window),
                     // so its low end never punches through the frozen tail.
-                    val bElapsed = progress * spanSec - 4f
-                    val bOpen = (bElapsed / 3f).coerceIn(0f, 1f)
-                    filters.incoming(20000f, 600f * (1f - bOpen) + 20f * bOpen)
+                    val bElapsed = progress * spanSec - 4.5f
+                    val bOpen = (bElapsed / 3.5f).coerceIn(0f, 1f)
+                    filters.incoming(20000f, 500f * (1f - bOpen) + 20f * bOpen)
                     echoFilters.outgoing(HEAVY_CLASH_ECHO_WET * wetRamp, render.echoBeatSeconds.toFloat())
                     echoFilters.incoming(0f, 0f)
                     reverbFilters.outgoing((render.reverbAmount * wetRamp).toFloat(), frozen)
@@ -1493,13 +1493,13 @@ class CrossfadeController(
      * keys are close but not adjacent. Runs after [rideFilterSweep] and only
      * overrides inside its window — outside 0.30..0.70 the sweep stands.
      *
-     * Gate (§11.4): keyScore < 0.55 (too compatible needs nothing, too far
-     * gets a real sweep) and at least 6 s of overlap (a kill needs room to
+     * Gate (finetune §5): keyScore < 0.50 (too compatible needs nothing, too far
+     * gets a real sweep) and at least 8 s of overlap (a kill needs room to
      * breathe; short sweeps stay untouched).
      */
     private fun rideMidKill(progress: Float) {
         if (render.style != TransitionStyle.DJ_FILTER) return
-        if (render.keyScore >= 0.55 || render.overlapSeconds < 6.0) return
+        if (render.keyScore >= 0.50 || render.overlapSeconds < 8.0) return
         val p = progress.toDouble()
         when {
             p < 0.30 || p >= 0.70 -> Unit // sweep stands, relax after
@@ -1769,7 +1769,7 @@ class CrossfadeController(
          * Spec v2 §9b: the heavy-clash wet ramps ride over this many seconds
          * of the 8 s window (echo 1.0→0.70, reverb →0.80), then hold.
          */
-        const val HEAVY_CLASH_WET_RAMP_SEC = 3.0f
+        const val HEAVY_CLASH_WET_RAMP_SEC = 3.5f
 
         /** Spec v2 §9b: echo target at the end of the heavy-clash ramp. */
         const val HEAVY_CLASH_ECHO_WET = 0.70f

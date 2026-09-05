@@ -67,8 +67,11 @@ object StructureDetector {
         val barSeconds = if (beatInterval.isFinite() && beatInterval > 0) beatInterval * 4 else 2.0
         // Spec slopes are per bar; measured slopes are per second over window
         // starts, so divide by the bar length. Exact — no approximation.
-        val buildRmsSlope = 0.008 / barSeconds
-        val buildCentroidSlope = 80.0 / barSeconds
+        val buildRmsSlope = BUILD_RMS_SLOPE_PER_BAR / barSeconds
+        val buildCentroidSlope = BUILD_CENTROID_SLOPE_PER_BAR / barSeconds
+        // Finetune v1 §1.4: spectral gate needs the track centroid mean.
+        val finiteCents = centroid.filter { it.time.isFinite() && it.energy.isFinite() }.map { it.energy }
+        val trackCentroidMean = if (finiteCents.isEmpty()) 0.0 else finiteCents.average()
         val bars = downbeats.filter { it.isFinite() }.sorted()
         if (bars.size < 8) return emptyList()
         // 4-bar windows, stepping one bar for boundary resolution.
@@ -114,24 +117,37 @@ object StructureDetector {
         // two windows before, positive.
         return windows.mapIndexed { index, window ->
             val pos = window.start / duration
+            // Finetune v1 §1.1: 4-bar look-back, any 2 of 4 positive — gradual
+            // build-ups need a wider scan than 2 bars (~3.7 s @128 BPM).
+            val slopeWindow = positiveSlopeBars(windows, index)
             val type = when {
-                window.rmsMean > DROP_RMS_MULTIPLIER * meanRms &&
+                (window.rmsMean > DROP_RMS_MULTIPLIER * meanRms &&
                     window.onsetPerSec > DROP_ONSET_MULTIPLIER * meanOnset &&
                     window.centroidMean > DROP_CENTROID_HZ &&
-                    slopeBack(index, 2) { it.rmsMean } > 0 -> StructureSectionType.DROP
+                    slopeWindow >= DROP_SLOPE_MIN_POSITIVE_BARS) ||
+                    // Cold-open drop: starts at full energy, no build to slope
+                    // back on. A drop in the first 12% with hot rms+onset IS
+                    // the drop.
+                    (pos < DROP_COLD_OPEN_POSITION_FRACTION &&
+                        window.rmsMean > DROP_RMS_MULTIPLIER * meanRms &&
+                        window.onsetPerSec > DROP_ONSET_MULTIPLIER * meanOnset) ->
+                    StructureSectionType.DROP
                 slopeBack(index, 2) { it.rmsMean } > buildRmsSlope &&
                     slopeBack(index, 2) { it.centroidMean } > buildCentroidSlope &&
                     risingBars(windows, index) >= 8 -> StructureSectionType.BUILD
                 window.rmsMean < BREAK_RMS_FRACTION * meanRms &&
                     window.onsetPerSec < BREAK_ONSET_FRACTION * meanOnset &&
-                    lowRunBars(windows, index, trackMean) >= 8 &&
-                    precededByHighEnergy(windows, index, trackMean) -> StructureSectionType.BREAK
+                    lowRunBars(windows, index, trackMean) >= BREAK_MIN_BARS &&
+                    precededByHighEnergy(windows, index, trackMean, BREAK_PRIOR_HIGH_BARS) ->
+                    StructureSectionType.BREAK
                 pos > OUTRO_POSITION_FRACTION &&
                     outroFalling(windows, index) &&
-                    window.rmsMean < 0.85 * trackPeak -> StructureSectionType.OUTRO
+                    window.rmsMean < OUTRO_RMS_PEAK_FRACTION * trackPeak &&
+                    (trackCentroidMean <= 0 || window.centroidMean < OUTRO_SPECTRAL_RATIO * trackCentroidMean) ->
+                    StructureSectionType.OUTRO
                 pos < INTRO_POSITION_FRACTION &&
-                    window.rmsMean < 0.75 * meanRms &&
-                    window.centroidMean < 3000.0 -> StructureSectionType.INTRO
+                    window.rmsMean < INTRO_RMS_FRACTION * meanRms &&
+                    window.centroidMean < INTRO_CENTROID_HZ -> StructureSectionType.INTRO
                 window.rmsMean > 1.05 * meanRms -> StructureSectionType.CHORUS
                 else -> StructureSectionType.VERSE
             }
@@ -169,25 +185,49 @@ object StructureDetector {
     }
 
     /**
-     * Single-pass proxy for "preceded by DROP/CHORUS within 4 bars": labels
+     * Single-pass proxy for "preceded by DROP/CHORUS within N bars": labels
      * are assigned in this same pass, so a loud predecessor reads as
-     * above-mean rms in the 4 windows back.
+     * above-mean rms in the windows back. Finetune v1 §1.3: 4→8 bars — at
+     * 70 BPM 4 bars = 13.7 s, too narrow to link breaks after a long drop.
      */
-    private fun precededByHighEnergy(windows: List<WindowStats>, index: Int, trackMean: Double): Boolean {
-        for (i in (index - 4).coerceAtLeast(0) until index) {
+    private fun precededByHighEnergy(
+        windows: List<WindowStats>,
+        index: Int,
+        trackMean: Double,
+        windowBars: Int = BREAK_PRIOR_HIGH_BARS,
+    ): Boolean {
+        for (i in (index - windowBars).coerceAtLeast(0) until index) {
             if (windows[i].rmsMean > 1.05 * trackMean) return true
         }
         return false
     }
 
+    /**
+     * Finetune v1 §1.1: bars with positive rms slope in the look-back —
+     * gradual build-ups need "any 2 of 4 positive", not a single 2-bar slope.
+     */
+    private fun positiveSlopeBars(windows: List<WindowStats>, index: Int): Int {
+        var count = 0
+        val from = (index - DROP_SLOPE_LOOKBACK_BARS).coerceAtLeast(0)
+        for (i in (from + 1)..index) {
+            if (windows[i].rmsMean > windows[i - 1].rmsMean) count++
+        }
+        return count
+    }
+
+    /**
+     * Finetune v1 §1.4: the AND of slope<0 and last<first fails on real data
+     * (noted as bug) — OR instead: a measurable downward slope, or the last
+     * segment clearly quieter (12% drop) than the first.
+     */
     private fun outroFalling(windows: List<WindowStats>, index: Int): Boolean {
-        // DEVIATION: strict monotonic fall over 16 bars never holds on noisy
-        // data — use negative linear slope plus last-means-below-first.
         val from = (index - 15).coerceAtLeast(0)
         val xs = (from..index).map { windows[it].start }
         val ys = (from..index).map { windows[it].rmsMean }
-        if (linearSlope(xs, ys) >= 0) return false
-        return ys.takeLast(4).average() < ys.take(4).average()
+        if (linearSlope(xs, ys) < OUTRO_FALLING_SLOPE) return true
+        val first = ys.take(8).average()
+        val last = ys.takeLast(8).average()
+        return last < first * OUTRO_QUIET_RATIO
     }
 
     private fun List<StructureLabel>.mergeAdjacent(): List<StructureLabel> {
@@ -217,7 +257,21 @@ object StructureDetector {
         dropSec: Double,
         peakEnergy: Double,
     ): Double? {
-        if (!dropSec.isFinite() || peakEnergy <= 0 || fine.size < 8) return null
+        val flip = gradientInflection(fine, dropSec) ?: return null
+        val span = dropSec - flip
+        if (span < MIXSET_BUILDUP_MIN_SECONDS || span > MIXSET_BUILDUP_MAX_SECONDS) return null
+        if (!climbValid(fine, flip, dropSec, peakEnergy)) return null
+        return flip
+    }
+
+    /**
+     * Spec finetune §6.1 step 2: the raw inflection — nearest ≤0→>0 gradient
+     * flip scanning back from drop−8 s — with NO span/rise validation. The
+     * caller decides whether the climb earns it (validated) or merely leans
+     * up (monotonic). Null when the curve never turns upward before the drop.
+     */
+    fun gradientInflection(fine: List<EnergySample>, dropSec: Double): Double? {
+        if (!dropSec.isFinite() || fine.size < 8) return null
         val pts = fine.filter { it.time.isFinite() && it.energy.isFinite() }.sortedBy { it.time }
         if (pts.size < 8) return null
         val dt = (pts.last().time - pts.first().time) / (pts.size - 1)
@@ -227,32 +281,63 @@ object StructureDetector {
                 .coerceIn(0, pts.size - 1)
             return pts[i].energy
         }
-        val scanStart = dropSec - MIXSET_BUILDUP_MIN_SECONDS
+        var t = dropSec - MIXSET_BUILDUP_MIN_SECONDS
         val scanEnd = dropSec - MIXSET_BUILDUP_MAX_SECONDS
-        var t = scanStart
         while (t > scanEnd) {
             val g0 = energyAt(t) - energyAt(t - dt)
             val g1 = energyAt(t + dt) - energyAt(t)
-            if (g0 <= 0 && g1 > 0) {
-                val span = dropSec - t
-                if (span < MIXSET_BUILDUP_MIN_SECONDS || span > MIXSET_BUILDUP_MAX_SECONDS) {
-                    t -= dt
-                    continue
-                }
-                // Rise over the climb: mean energy from foot to drop vs foot.
-                var sum = 0.0
-                var n = 0
-                var tt = t
-                while (tt <= dropSec) {
-                    sum += energyAt(tt)
-                    n++
-                    tt += dt
-                }
-                val foot = energyAt(t)
-                if (n >= 2 && sum / n >= foot + MIXSET_BUILDUP_RISE_MARGIN * peakEnergy) return t
-            }
+            if (g0 <= 0 && g1 > 0) return t
             t -= dt
         }
         return null
+    }
+
+    /**
+     * Spec finetune §6.1 step 2 gate: more than half the fine windows from
+     * foot to drop slope upward. A monotonic lean earns the inflection even
+     * when the climb is too shallow to pass the rise threshold.
+     */
+    fun climbMonotonic(fine: List<EnergySample>, footSec: Double, dropSec: Double): Boolean {
+        val pts = fine.filter {
+            it.time.isFinite() && it.energy.isFinite() && it.time >= footSec && it.time <= dropSec
+        }.sortedBy { it.time }
+        if (pts.size < 4) return false
+        var up = 0
+        var total = 0
+        for (i in 1 until pts.size) {
+            total++
+            if (pts[i].energy > pts[i - 1].energy) up++
+        }
+        return total > 0 && up.toDouble() / total > 0.5
+    }
+
+    private fun climbValid(
+        fine: List<EnergySample>,
+        footSec: Double,
+        dropSec: Double,
+        peakEnergy: Double,
+    ): Boolean {
+        val pts = fine.filter { it.time.isFinite() && it.energy.isFinite() }.sortedBy { it.time }
+        if (pts.size < 8) return false
+        val dt = (pts.last().time - pts.first().time) / (pts.size - 1)
+        if (!(dt > 0)) return false
+        fun energyAt(t: Double): Double {
+            val i = pts.binarySearchBy(t) { it.time }.let { if (it < 0) -(it + 1) else it }
+                .coerceIn(0, pts.size - 1)
+            return pts[i].energy
+        }
+        val span = dropSec - footSec
+        if (span < MIXSET_BUILDUP_MIN_SECONDS || span > MIXSET_BUILDUP_MAX_SECONDS) return false
+        // Rise over the climb: mean energy from foot to drop vs foot.
+        var sum = 0.0
+        var n = 0
+        var tt = footSec
+        while (tt <= dropSec) {
+            sum += energyAt(tt)
+            n++
+            tt += dt
+        }
+        val foot = energyAt(footSec)
+        return n >= 2 && sum / n >= foot + MIXSET_BUILDUP_RISE_MARGIN * peakEnergy
     }
 }

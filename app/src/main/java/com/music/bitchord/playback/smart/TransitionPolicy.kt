@@ -88,10 +88,13 @@ private const val AUDIBLE_ENERGY_FRACTION = 0.1
  * "the file starts making sound" and a phrase boundary is only a grid line.
  */
 private val MIX_IN_TYPE_WEIGHT = mapOf(
-    "main_drop" to 0.5,
-    "intro_drop" to 0.4,
-    "pickup" to 0.15,
-    "phrase" to 0.1,
+    // Finetune v1 §3.2: normal automix should land BEFORE the drop (context
+    // first); the intro drop is the ideal entry. Mixset bypasses this ranking
+    // via buildupStart.
+    "main_drop" to 0.40,
+    "intro_drop" to 0.50,
+    "pickup" to 0.22,
+    "phrase" to 0.12,
 )
 
 /**
@@ -100,13 +103,16 @@ private val MIX_IN_TYPE_WEIGHT = mapOf(
  */
 private val MIX_OUT_TYPE_SCORE = mapOf(
     "energy_cliff" to 0.95,
-    "interior_mix_out" to 0.95,
-    "outro_start" to 0.9,
-    "content_end" to 0.75,
-    "vocal_exit" to 0.6,
-    "low_energy" to 0.5,
+    "interior_mix_out" to 0.90,
+    "outro_start" to 0.95,
+    "content_end" to 0.72,
+    "vocal_exit" to 0.65,
+    "low_energy" to 0.55,
     "blueprint_fallback" to 0.35,
 )
+
+/** Finetune v1 §2.3: low-energy candidate inside a BREAK scores near the top. */
+const val LOW_ENERGY_BREAK_BOOST_SCORE = 0.80
 
 /**
  * When blueprint §7 candidates are active, the mix-out may end far earlier
@@ -124,6 +130,12 @@ const val BLUEPRINT_WINDOW_DISCARD_BUDGET = 75.0
 const val VOCAL_DISCARD_THRESHOLD = 0.72
 /** v2 §10: soft vocal penalty starts slightly earlier than the old implied 0.60. */
 const val VOCAL_SOFT_PENALTY = 0.55
+/** Finetune v1 §2.1 P1: strong zone above 0.65 gets ×3.0; soft zone ×1.8. */
+const val VOCAL_STRONG_ZONE = 0.65
+const val VOCAL_STRONG_MULTIPLIER = 3.0
+const val VOCAL_SOFT_MULTIPLIER = 1.8
+/** Finetune v1 §2.1: timing buffer around each exit candidate. */
+const val VOCAL_EXIT_TIMING_WINDOW = 1.5
 /** v2 §10: key confidence floor for scoring; below it the key reads neutral. */
 const val MIN_KEY_CONFIDENCE_FOR_SCORING = 0.30
 /** v2 §10: an unconfident key must not veto the whole plan. */
@@ -135,20 +147,38 @@ const val OVERLAP_ENERGY_STRETCH_FACTOR = 1.50
 const val OVERLAP_ENERGY_TIGHTEN_FACTOR = 0.75
 
 /** v2 §10: wider bass-swap ramp, smoother handover. */
-const val BASS_SWAP_WIDTH_V2 = 0.15
-/** v2 §7a: virtual mid-kill upper LP (FILTER_SWEEP only, keyScore < 0.55). */
-const val MID_KILL_LP_HZ = 800.0
+const val BASS_SWAP_WIDTH_V2 = 0.20
+/** v2 §7a: virtual mid-kill upper LP (FILTER_SWEEP only, keyScore < 0.50). */
+const val MID_KILL_LP_HZ = 700.0
 /** v2 §7a: virtual mid-kill lower HP entry. */
-const val MID_KILL_HP_HZ = 400.0
+const val MID_KILL_HP_HZ = 350.0
 
-/** v2 §2b structural detector thresholds. */
-const val DROP_RMS_MULTIPLIER = 1.30
-const val DROP_ONSET_MULTIPLIER = 1.40
-const val DROP_CENTROID_HZ = 3500.0
-const val BREAK_RMS_FRACTION = 0.65
-const val BREAK_ONSET_FRACTION = 0.60
-const val OUTRO_POSITION_FRACTION = 0.72
-const val INTRO_POSITION_FRACTION = 0.18
+/** Finetune v1 §1: structural detector thresholds. */
+const val DROP_RMS_MULTIPLIER = 1.25
+const val DROP_ONSET_MULTIPLIER = 1.25
+const val DROP_CENTROID_HZ = 2500.0
+const val DROP_SLOPE_LOOKBACK_BARS = 4
+const val DROP_SLOPE_MIN_POSITIVE_BARS = 2
+const val DROP_COLD_OPEN_POSITION_FRACTION = 0.12
+const val BUILD_RMS_SLOPE_PER_BAR = 0.010
+const val BUILD_CENTROID_SLOPE_PER_BAR = 90.0
+const val BREAK_RMS_FRACTION = 0.68
+const val BREAK_ONSET_FRACTION = 0.72
+const val BREAK_MIN_BARS = 6
+const val BREAK_PRIOR_HIGH_BARS = 8
+const val OUTRO_POSITION_FRACTION = 0.65
+const val OUTRO_RMS_PEAK_FRACTION = 0.75
+const val OUTRO_FALLING_SLOPE = -0.0008
+const val OUTRO_QUIET_RATIO = 0.88
+const val OUTRO_SPECTRAL_RATIO = 0.88
+const val INTRO_POSITION_FRACTION = 0.22
+const val INTRO_RMS_FRACTION = 0.78
+const val INTRO_CENTROID_HZ = 3200.0
+const val COLD_OPEN_AUDIBLE_SECONDS = 1.5
+const val COLD_OPEN_RMS_FRACTION = 0.85
+const val AMBIENT_BEAT_CONF = 0.28
+const val AMBIENT_ONSET_DENSITY = 1.8
+const val AMBIENT_RMS_VARIANCE = 0.04
 
 /** v2 §8: replaces the unbounded buildup walk; 96 s = ~4 phrases. */
 const val MIXSET_BUILDUP_MAX_SECONDS = 96.0
@@ -161,10 +191,10 @@ const val SILENCE_MIN_DURATION_SECONDS = 0.6
 /** v2 §9a: PLAIN_DISSOLVE reverb wet on the outgoing track. */
 const val PLAIN_DISSOLVE_REVERB_WET = 0.55
 /** v2 §9b: heavy-clash forced echo/reverb amounts. */
-const val HEAVY_CLASH_REVERB_WET = 0.80
+const val HEAVY_CLASH_REVERB_WET = 0.75
 const val HEAVY_CLASH_ECHO_AMOUNT = 1.0
 /** v2 §9b: reverb freeze point after transition start. */
-const val HEAVY_CLASH_FREEZE_OFFSET_SEC = 3.0
+const val HEAVY_CLASH_FREEZE_OFFSET_SEC = 3.5
 
 /** Non-finite guards, matching the desktop planner's coercion of `NaN`/`Infinity` to zero. */
 internal fun Double.orZero(): Double = if (isFinite()) this else 0.0
@@ -373,12 +403,21 @@ fun rankMixInCandidates(analysis: TrackAnalysis): List<RankedMixCandidate> {
         .takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
     val audibleStart = audibleStartOf(analysis)
+    // Finetune v1 §1.5/§3.3: a cold-open track is designed to start at full
+    // energy — penalising that pushes the entry into the middle of the track.
+    val coldOpen = isColdOpen(analysis, audibleStart)
     return candidates.map { candidate ->
         var rankScore = candidate.score.orZero() + (MIX_IN_TYPE_WEIGHT[candidate.type] ?: 0.0)
-        if (nearestValue(analysis.downbeats, candidate.time, beatSeconds / 2) != null) rankScore += 0.1
-        // A cold open: nothing before the point to play underneath the outgoing track, so entering
-        // here means starting the blend on the arrangement.
-        if (candidate.time - audibleStart < beatSeconds * 4) rankScore -= 0.2
+        // Finetune v1 §3.1 P1: beat-1 landings are non-negotiable — +0.25 with
+        // a tighter beat/3 tolerance so off-beat alternatives lose.
+        if (nearestValue(analysis.downbeats, candidate.time, beatSeconds / 3) != null) rankScore += 0.25
+        if (coldOpen) {
+            if (candidate.time - audibleStart < beatSeconds * 2) rankScore += 0.1
+        } else {
+            // A cold open: nothing before the point to play underneath the outgoing track, so entering
+            // here means starting the blend on the arrangement.
+            if (candidate.time - audibleStart < beatSeconds * 4) rankScore -= 0.2
+        }
         // Prefer entries whose run-up is instrumental; an intro that already sings will sing over
         // the outgoing track for the whole pre-roll.
         val vocal = vocalActivityBetween(
@@ -476,20 +515,39 @@ fun rankMixOutCandidates(
             val measured = audibleSecondsBetween(analysis, candidate.time, end)
             // With no energy curve there is no way to tell skipped music from skipped silence, so
             // the raw gap is charged in full and the budget errs toward playing the track.
-            // v2 §10: exits landing on a singing voice are buried the same way
-            // entries are — a vocal tail is the worst place to hand off.
+            // Finetune v1 §2.1 P1: piecewise multiplier — the old single-slope
+            // penalty (-0.10 at vocal 0.65) was functionally ignored by ranking.
+            // DJs never cut mid-lyric. The ±1.5 s window catches handoffs that
+            // start just after a phrase ends but are still inside the vocal.
             val exitVocal = vocalActivityBetween(analysis, candidate.time - 1.0, candidate.time + 1.0)
+            val windowVocal = vocalActivityBetween(
+                analysis,
+                candidate.time - VOCAL_EXIT_TIMING_WINDOW,
+                candidate.time + VOCAL_EXIT_TIMING_WINDOW,
+            )
+            val effectiveVocal = maxOf(exitVocal ?: 0.0, windowVocal ?: 0.0)
+            val hasMeasurement = exitVocal != null || windowVocal != null
             val vocalPenalty = when {
-                exitVocal == null -> 0.0
-                exitVocal > VOCAL_DISCARD_THRESHOLD -> -1.0
-                exitVocal > VOCAL_SOFT_PENALTY -> -(exitVocal - VOCAL_SOFT_PENALTY)
+                !hasMeasurement -> 0.0
+                effectiveVocal > VOCAL_DISCARD_THRESHOLD -> -1.0
+                effectiveVocal > VOCAL_STRONG_ZONE ->
+                    -(effectiveVocal - VOCAL_SOFT_PENALTY) * VOCAL_STRONG_MULTIPLIER
+                effectiveVocal > VOCAL_SOFT_PENALTY ->
+                    -(effectiveVocal - VOCAL_SOFT_PENALTY) * VOCAL_SOFT_MULTIPLIER
                 else -> 0.0
             }
+            // Finetune v1 §2.3: low-energy inside a BREAK scores near the top.
+            val breakBoost =
+                if (candidate.type == "low_energy" && isInsideBreak(analysis, candidate.time)) {
+                    LOW_ENERGY_BREAK_BOOST_SCORE - (MIX_OUT_TYPE_SCORE["low_energy"] ?: 0.0)
+                } else {
+                    0.0
+                }
             RankedMixCandidate(
                 time = candidate.time,
                 score = candidate.score,
                 type = candidate.type,
-                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0) + vocalPenalty,
+                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0) + vocalPenalty + breakBoost,
                 discardedMusicSeconds = measured ?: max(0.0, end - candidate.time),
                 measured = measured != null,
             )
@@ -959,7 +1017,7 @@ fun scoreCompatibility(
  */
 const val MIXSET_MIN_PLAY_SECONDS = 60.0
 const val MIXSET_TARGET_PLAY_SECONDS = 90.0
-const val MIXSET_MAX_PLAY_SECONDS = 120.0
+const val MIXSET_MAX_PLAY_SECONDS = 130.0
 /**
  * How much longer (in score-seconds) the anchor may play past the target for
  * a post-peak landing instead of taking a better-scoring point before it.
@@ -970,7 +1028,7 @@ const val MIXSET_WAIT_TOLERANCE_SECONDS = 8.0
  * (at most 30 s each way): when any calm grid point exists, the anchor never
  * lands on a vocal. Unknown stays cheap — absence of a mask is not evidence.
  */
-const val MIXSET_SINGING_PENALTY = 40.0
+const val MIXSET_SINGING_PENALTY = 20.0
 /**
  * Energy-arc constants. A cooldown is an 8 s stretch running below 70% of the
  * track mean with its max-min spread under half the mean — low AND settled,
@@ -1106,14 +1164,64 @@ private fun maxEnergyTimeAfterIntro(analysis: TrackAnalysis): Double? {
  * all (peak-anchored tracks); null when nothing supports the claim.
  */
 fun buildupStart(analysis: TrackAnalysis, peakTime: Double): Double? {
+    // Spec finetune §6.1 five-step chain: (1) stored map buildup, (2a)
+    // validated gradient inflection, (2b) unvalidated inflection with a
+    // monotonic lean, (3) structural BUILD ending near the drop, (4)
+    // drop minus one phrase (or drop−8 s when there is no buildup),
+    // (5) drop−8 s hard floor; the legacy foot walk stays as last resort
+    // for dropless tracks.
     analysis.structuredBuildupSec?.takeIf { it.isFinite() }?.let { stored ->
         return snapToPhrase16(analysis, stored) ?: stored
     }
     val drop = firstDropSec(analysis)
     if (drop != null && drop.isFinite()) {
-        val phrase16 = phrase16Seconds(analysis) ?: return null
-        val fallback = drop - phrase16
-        if (fallback > 0) return snapToPhrase16(analysis, fallback) ?: fallback
+        val peakEnergy = analysis.energyCurve
+            .filter { it.time.isFinite() && it.energy.isFinite() }
+            .minByOrNull { abs(it.time - drop) }?.energy
+            ?.takeIf { it > 0 }
+        if (peakEnergy != null) {
+            val gradient = StructureDetector.gradientBuildup(analysis.energyCurveFine, drop, peakEnergy)
+            if (gradient != null && gradient.isFinite() && gradient > 0) {
+                return snapToPhrase16(analysis, gradient) ?: gradient
+            }
+            val lean = StructureDetector.gradientInflection(analysis.energyCurveFine, drop)
+            if (lean != null && lean.isFinite() && lean > 0 &&
+                StructureDetector.climbMonotonic(analysis.energyCurveFine, lean, drop)
+            ) {
+                return snapToPhrase16(analysis, lean) ?: lean
+            }
+        }
+        val phrase16 = phrase16Seconds(analysis)
+        val buildNearDrop = analysis.structureMap
+            .filter {
+                it.type == StructureSectionType.BUILD && it.start.isFinite() && it.end.isFinite() &&
+                    it.end <= drop && phrase16 != null && drop - it.end <= phrase16 * 4
+            }
+            .maxByOrNull { it.end }?.start
+        if (buildNearDrop != null && buildNearDrop > 0) {
+            return snapToPhrase16(analysis, buildNearDrop) ?: buildNearDrop
+        }
+        if (phrase16 != null) {
+            val fallback = drop - phrase16
+            if (fallback > 0) {
+                // No buildup at all when the phrase-back point is already as
+                // loud as the drop: enter 8 s before it, just enough approach.
+                val footEnergy = energyAt(analysis, fallback)
+                val dropEnergy = energyAt(analysis, drop)
+                if (footEnergy != null && dropEnergy != null && dropEnergy > 0 &&
+                    footEnergy > 0.85 * dropEnergy
+                ) {
+                    val approach = drop - MIXSET_BUILDUP_MIN_SECONDS
+                    if (approach > 0) return snapToPhrase16(analysis, approach) ?: approach
+                } else {
+                    return snapToPhrase16(analysis, fallback) ?: fallback
+                }
+            }
+            // Hard floor: 8 s before the drop, always.
+            val floor = drop - MIXSET_BUILDUP_MIN_SECONDS
+            if (floor > 0) return snapToPhrase16(analysis, floor) ?: floor
+            return null
+        }
         return null
     }
     return legacyBuildupFoot(analysis, peakTime)
@@ -1176,9 +1284,9 @@ fun alignMixsetExitToIncomingDrop(
     if (!mixset || !anchor.isFinite()) return anchor
     val dropB = firstDropSec(incoming) ?: return anchor
     if (!dropB.isFinite() || dropB >= anchor) return anchor
-    // v2 §8c: nudge tolerance widens from a fixed 8 s to one phrase, capped
-    // at 16 s — a full phrase of Drift is still a nudge, more is a jump.
-    val tolerance = minOf(phrase16Seconds(outgoing) ?: MIXSET_WAIT_TOLERANCE_SECONDS, 16.0)
+    // Spec finetune §6.5: nudge tolerance widens from a fixed 8 s to one
+    // phrase, capped at 20 s — a full phrase of drift is still a nudge.
+    val tolerance = minOf(phrase16Seconds(outgoing) ?: MIXSET_WAIT_TOLERANCE_SECONDS, 20.0)
     val pulled = snapToPhrase16(outgoing, dropB)
     if (pulled >= anchor || anchor - pulled > tolerance) return anchor
     return max(0.0, pulled)
@@ -1238,15 +1346,39 @@ fun effectivePlayFloor(analysis: TrackAnalysis, length: Double): Double {
     val default = 0.8 * length
     val outro = analysis.structuredOutroSec?.takeIf { it.isFinite() && it > 0 } ?: return default
     if (outro >= default) return default
-    val tailEnd = minOf(outro + 30.0, length)
-    if (tailEnd - outro < 30.0) return default
+    // Finetune v1 §2.2: 22–28 s tails on 4-min pop/dance were missed by 30 s.
+    val tailEnd = minOf(outro + 20.0, length)
+    if (tailEnd - outro < 20.0) return default
     val mean = meanEnergy(analysis) ?: return default
     if (mean <= 0) return default
     val tail = analysis.energyCurve.filter {
         it.time.isFinite() && it.energy.isFinite() && it.time in outro..tailEnd
     }.map { it.energy }
     if (tail.size < 2) return default
-    return if (tail.average() < 0.7 * mean) maxOf(0.0, outro) else default
+    return if (tail.average() < 0.72 * mean) maxOf(0.0, outro) else default
+}
+
+/**
+ * Finetune v1 §2.3: BREAK is the DJ-canonical exit — a low-energy candidate
+ * inside a detected BREAK section earns the boost.
+ */
+fun isInsideBreak(analysis: TrackAnalysis, time: Double): Boolean =
+    analysis.structureMap.any { section ->
+        section.type == StructureSectionType.BREAK &&
+            time >= section.startSeconds && time <= section.endSeconds
+    }
+
+/** Finetune v1 §1.5/§3.3: derived, not stored — computable from stored fields. */
+fun isColdOpen(analysis: TrackAnalysis, audibleStart: Double = audibleStartOf(analysis)): Boolean {
+    if (!audibleStart.isFinite() || audibleStart >= COLD_OPEN_AUDIBLE_SECONDS) return false
+    val mean = meanEnergy(analysis) ?: return false
+    if (mean <= 0) return false
+    val barSeconds = if (analysis.beatInterval.orZero() > 0) analysis.beatInterval * 4 else 2.0
+    val head = analysis.energyCurve.filter {
+        it.time.isFinite() && it.energy.isFinite() && it.time in audibleStart..audibleStart + barSeconds
+    }.map { it.energy }
+    if (head.size < 2) return false
+    return head.average() > COLD_OPEN_RMS_FRACTION * mean
 }
 
 /**
@@ -1371,9 +1503,10 @@ fun cooldownLanding(analysis: TrackAnalysis, from: Double, to: Double): Double? 
         val energies = window.map { it.energy }
         if (energies.average() >= lowCeiling) continue
         if ((energies.max() - energies.min()) >= spreadCeiling) continue
-        // v2 §8b: the window must be falling, not flat or creeping up — a
-        // flat quiet stretch is a bed, not a comedown.
-        if (StructureDetector.linearSlope(window.map { it.time }, energies) >= MIXSET_COOLDOWN_SLOPE_THRESHOLD) continue
+        // Spec finetune §6: the window must be flat-stable, not still falling —
+        // a comedown that has settled (slope at/above the threshold) is a
+        // floor the next track can land on; a steep fall is still moving.
+        if (StructureDetector.linearSlope(window.map { it.time }, energies) < MIXSET_COOLDOWN_SLOPE_THRESHOLD) continue
         return point
     }
     return null

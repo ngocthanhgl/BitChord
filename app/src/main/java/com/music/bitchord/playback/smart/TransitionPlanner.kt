@@ -299,6 +299,18 @@ data class TransitionPlan(
      * Render carries no span of its own.
      */
     val overlapSeconds: Double = 0.0,
+    /**
+     * Spec finetune §7: the incoming deck's stretch in a HALF_TIME blend
+     * (rateB from [halfTimeRates], 1.0 = unison). Carried for tests and logs:
+     * the executor already voices it via incomingPlaybackRate.
+     */
+    val halfTimeStretch: Double = 1.0,
+    /**
+     * Spec finetune §4.1: true when this plan is a manual-fade fallback, not
+     * a matrix decision — the per-type ceilings never apply to it. Tests use
+     * it to exempt the standard path from the ceiling map.
+     */
+    val standardTransitionUsed: Boolean = false,
 ) {
     /** Convenience for the engine, which schedules in milliseconds. */
     val fadeMs: Long get() = (fadeSeconds * 1000).roundToLong()
@@ -318,9 +330,11 @@ private fun blocked(reason: String, transitionStart: Double = 0.0, transitionEnd
  * smooth the clean one, filter the clashing one, cut the rest.
  *
  * v2 §5c: HALF_TIME pairs arm first (they beat-sync by construction), and the
- * matrix only runs for BEATMATCHED + HALF_TIME — PLAIN is dissolved upstream
- * and DJ_ASSISTED keeps the phrase/adaptive tail below. [highEnergyB] is read
- * at the incoming buildup start, not at the proxy entry.
+ * matrix runs for BEATMATCHED + HALF_TIME — PLAIN is dissolved upstream.
+ * Spec finetune §7.1: DJ_ASSISTED runs a LIMITED matrix — no stretch may run,
+ * so never SMOOTH or HARMONIC: echo out the unsyncable, filter-mask the
+ * phase drift when the key agrees, cut the rest. [highEnergyB] is read at
+ * the incoming buildup start, not at the proxy entry.
  */
 fun selectTransitionType(
     score: CompatibilityScore,
@@ -328,14 +342,23 @@ fun selectTransitionType(
     highEnergyA: Boolean,
     highEnergyB: Boolean,
     hasDropInB: Boolean,
-): TransitionType = when {
-    tier == TransitionTier.HALF_TIME -> TransitionType.HALF_TIME_BLEND
-    highEnergyA && highEnergyB && hasDropInB -> TransitionType.LOOP_CUT_DROP
-    score.bpm < 0.50 -> TransitionType.ECHO_REVERB_OUT
-    score.key >= 0.85 && score.bpm >= 0.70 -> TransitionType.HARMONIC_BLEND
-    score.key >= 0.70 && score.bpm >= 0.70 && score.vocal >= 0.60 -> TransitionType.SMOOTH_CROSSFADE
-    score.bpm >= 0.70 && score.key < 0.70 -> TransitionType.FILTER_SWEEP
-    else -> TransitionType.HARD_CUT
+): TransitionType {
+    if (tier == TransitionTier.DJ_ASSISTED) {
+        return when {
+            score.bpm < 0.60 -> TransitionType.ECHO_REVERB_OUT
+            score.key >= 0.70 -> TransitionType.FILTER_SWEEP
+            else -> TransitionType.HARD_CUT
+        }
+    }
+    return when {
+        tier == TransitionTier.HALF_TIME -> TransitionType.HALF_TIME_BLEND
+        highEnergyA && highEnergyB && hasDropInB -> TransitionType.LOOP_CUT_DROP
+        score.bpm < 0.50 -> TransitionType.ECHO_REVERB_OUT
+        score.key >= 0.85 && score.bpm >= 0.70 -> TransitionType.HARMONIC_BLEND
+        score.key >= 0.70 && score.bpm >= 0.70 && score.vocal >= 0.60 -> TransitionType.SMOOTH_CROSSFADE
+        score.bpm >= 0.70 && score.key < 0.70 -> TransitionType.FILTER_SWEEP
+        else -> TransitionType.HARD_CUT
+    }
 }
 
 /**
@@ -383,6 +406,12 @@ fun findPlainCutPoint(analysis: TrackAnalysis, scanFrom: Double, contentEnd: Dou
             runStart = null
         }
     }
+    // (1b) Spec finetune §7.4: the track's own breath — longest onset gap in
+    // the tail, computed once in detectStructure. A gap without true silence
+    // still breathes; the 1-beat lookahead is baked into the stored value.
+    analysis.plainCutBreathSec
+        ?.takeIf { it.isFinite() && it in scanFrom..contentEnd }
+        ?.let { return it to 2.0 }
     // (2) Structure-map BREAK.
     analysis.structureMap
         .filter { it.type == StructureSectionType.BREAK && it.start.isFinite() }
@@ -506,7 +535,7 @@ private fun halfTimeBlendPlan(
     }
     val bars = if (short) 8 else 24
     val sharedBeat = 60.0 / shared
-    val fadeSec = minOf(bars * 4 * sharedBeat, AUTO_TRANSITION_MAX_SECONDS)
+    val fadeSec = minOf(bars * 4 * sharedBeat, ceilingFor(TransitionType.HALF_TIME_BLEND))
         .coerceAtLeast(MIN_TRANSITION_OVERLAP_SECONDS)
     val transitionStart = max(0.0, mixAnchor - fadeSec)
     val keyShift = if (analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
@@ -549,6 +578,7 @@ private fun halfTimeBlendPlan(
         outgoingBpm = shared,
         incomingBpm = shared,
         matchedRatio = policy.matchedRatio,
+        halfTimeStretch = (rateB * 10000).roundToInt() / 10000.0,
         halfTimeEmphasis = emphasis,
         policyReasons = policy.reasons,
         reason = if (started) "smart-half-time-blend" else "before-half-time-blend",
@@ -585,7 +615,7 @@ private fun heavyClashPlan(
         transitionStyle = TransitionStyle.ECHO_REVERB_OUT,
         incomingCueTime = entry,
         incomingHandoffTime = entry,
-        handoffStartSeconds = transitionStart + 4.0,
+        handoffStartSeconds = transitionStart + 4.5,
         handoffDuration = 4.0,
         type = TransitionType.ECHO_REVERB_OUT,
         score = score,
@@ -593,7 +623,7 @@ private fun heavyClashPlan(
         echoAmount = HEAVY_CLASH_ECHO_AMOUNT,
         reverbAmount = HEAVY_CLASH_REVERB_WET,
         reverbFreezeAtSec = HEAVY_CLASH_FREEZE_OFFSET_SEC,
-        incomingStartDelaySec = 4.0,
+        incomingStartDelaySec = 4.5,
         outgoingHoldSec = 3.0,
         volumeCurve = VolumeCurve.S_CURVE,
         policyReasons = reasons,
@@ -949,7 +979,9 @@ private fun capIncomingEntry(
     mixsetActive: Boolean,
 ): Double {
     if (!cue.isFinite() || nextLength <= 0) return cue
-    val fraction = if (mixsetActive) 0.5 else 0.3
+    // Finetune v1 §3.4: 30% at 5 min = 90 s, past the first chorus — 28%
+    // still clears a 64-bar intro at 120 BPM.
+    val fraction = if (mixsetActive) 0.5 else 0.28
     val audible = listOfNotNull(nextAnalysis.audibleStartTime, nextAnalysis.pickupTime)
         .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
     return min(cue, max(fraction * nextLength, audible + 2.0)).coerceAtLeast(0.0)
@@ -1003,13 +1035,13 @@ const val BED_POSITION = 0.5
 private const val DEFAULT_BASS_SWAP_FRACTION = 0.7
 
 /** Analysis may move the swap later than the prior, but never so late the outgoing low end survives almost to silence. */
-private const val MAX_BASS_SWAP_FRACTION = 0.85
+private const val MAX_BASS_SWAP_FRACTION = 0.80
 
 /** A normalized low-band step smaller than this is too weak to move the swap away from its prior. */
 private const val MIN_BASS_STRUCTURE_SCORE = 0.25
 
 /** Capped in absolute seconds too, so a long overlap does not scale the hold up with it. */
-private const val BASS_SWAP_MAX_SECONDS = 6.0
+private const val BASS_SWAP_MAX_SECONDS = 5.5
 
 /**
  * How far the outgoing track's low-pass sweep travels by the end of the
@@ -1463,11 +1495,28 @@ private data class Overlap(
 )
 
 /** How long a mix should run when the tracks are related but not phrase-switchable. */
+/**
+ * Finetune v1 §4.1 P1: per-type overlap ceilings. 12 s is a radio crossfade,
+ * not a DJ blend — smooth/harmonic pairs get real blend room while surgical
+ * types (filter/loop/dissolve) stay decisive.
+ */
+fun ceilingFor(type: TransitionType): Double = when (type) {
+    TransitionType.SMOOTH_CROSSFADE -> 22.0
+    TransitionType.HARMONIC_BLEND -> 28.0
+    TransitionType.FILTER_SWEEP -> 9.0
+    TransitionType.ECHO_REVERB_OUT -> 11.0
+    TransitionType.LOOP_CUT_DROP -> 8.0
+    TransitionType.HARD_CUT -> 0.3
+    TransitionType.HALF_TIME_BLEND -> 20.0
+    TransitionType.PLAIN_DISSOLVE -> 4.0
+}
+
 private fun adaptiveOverlap(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
     transitionPoint: Double,
     entryPoint: Double,
+    type: TransitionType = TransitionType.SMOOTH_CROSSFADE,
 ): Overlap {
     val currentBpm = analysis.bpm.orZero()
     val nextBpm = nextAnalysis.bpm.orZero()
@@ -1478,18 +1527,24 @@ private fun adaptiveOverlap(
     val ratio = normalizedTempoRatio(currentBpm, nextBpm)
     val distance = keyDistance(trustedKey(analysis), trustedKey(nextAnalysis))
     val vocalConflict = analysis.vocalProbability >= 0.62 && nextAnalysis.vocalProbability >= 0.62
-    val baseBeats =
-        if (!vocalConflict && (abs(1 - ratio) > 0.07 || (distance != null && distance > 4))) 16 else 8
+    // Finetune v1 §4.2: more room to mask mismatch (20), a viable minimum
+    // (12 beats = 5.6 s @128 BPM), and headroom to duck vocals (10).
+    val baseBeats = when {
+        vocalConflict -> 10
+        abs(1 - ratio) > 0.07 || (distance != null && distance > 4) -> 20
+        else -> 12
+    }
     // v2 §6: scale by arrangement energy direction — an outgoing track that
     // falls while the incoming one rises is the ideal long blend; two risers
     // fighting each other get tightened. Slopes over 16 bars each side.
     val energyFactor = overlapEnergyFactor(analysis, nextAnalysis, transitionPoint, entryPoint)
     val transitionBeats = (baseBeats * energyFactor).roundToInt().coerceIn(4, 32)
     val beatSeconds = 60 / currentBpm
-    val minimumOverlap = if (currentBpm >= 140) AUTO_FAST_TRACK_MIN_SECONDS else AUTO_MIN_SECONDS
+    // Finetune v1 §4.2: minimum up 1 s across the board.
+    val minimumOverlap = if (currentBpm >= 140) 7.0 else 5.0
 
     return Overlap(
-        overlap = clamp(transitionBeats * beatSeconds, minimumOverlap, AUTO_TRANSITION_MAX_SECONDS),
+        overlap = clamp(transitionBeats * beatSeconds, minimumOverlap, ceilingFor(type)),
         transitionBeats = transitionBeats,
         incomingPlaybackRate = if (ratio in 0.9..1.1) {
             (clamp(1 / ratio, 0.9, 1.1) * 10000).roundToInt() / 10000.0
@@ -1554,6 +1609,7 @@ private fun standardTransition(
         transitionEnd = length,
         fadeSeconds = fade,
         transitionStyle = TransitionStyle.EQUAL_POWER,
+        standardTransitionUsed = true,
         reason = if (started) reason else "before-$reason-window",
     )
 }
@@ -1602,6 +1658,14 @@ fun planTransition(
 
     if (length < MIN_SMART_DURATION_SECONDS) {
         return blocked("short-duration-guard", transitionStart = length, transitionEnd = length)
+    }
+
+    // Spec finetune §7.8: tracks under 90 s never carry a beat-blend — there
+    // is no room for a phrase to develop, so dissolve at the cut point. The
+    // policy reasons are not assessed yet; the plan carries its own reason.
+    val nextLenShort = max(0.0, trackDurationSeconds(nextTrack))
+    if (length < 90.0) {
+        return plainDissolvePlan(analysis, nextAnalysis, length, nextLenShort, playbackTime, mixset, emptyList())
     }
 
     val analyzedContentEnd = analysis.contentEndTime.orZero().takeIf { it != 0.0 } ?: length
@@ -1727,23 +1791,18 @@ fun planTransition(
     val buildupB = buildupStart(nextAnalysis, dropInB ?: proxyEntry) ?: proxyEntry
     val highEnergyB = isHighEnergyAt(nextAnalysis, buildupB)
     val beatOrHalf = policy.tier == TransitionTier.BEATMATCHED || policy.tier == TransitionTier.HALF_TIME
-    val selectedType = if (beatOrHalf) {
+    val selectedType = if (beatOrHalf || policy.tier == TransitionTier.DJ_ASSISTED) {
         selectTransitionType(proxyScore, policy.tier, highEnergyA, highEnergyB, dropInB != null)
     } else {
-        // v2 §5c: DJ_ASSISTED skips the matrix — no stretch may run, so the
-        // phrase/adaptive tail below (beat-quantized, unstretched) owns it.
+        // Unreachable today (PLAIN returns upstream), kept as the closed
+        // default so a future tier degrades to a blend, never to a crash.
         TransitionType.SMOOTH_CROSSFADE
     }
-    // Blueprint §9 anti-monotony: a long blend between two tracks that are
-    // the same tempo, the same key, AND sing the same median pitch is a
-    // six-minute song nobody asked for. A clean cut says "next track".
-    if ((selectedType == TransitionType.SMOOTH_CROSSFADE || selectedType == TransitionType.HARMONIC_BLEND) &&
-        proxyScore.bpm >= 0.95 && proxyScore.key >= 0.95 &&
-        analysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
-        nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
-        (PitchTracker.pitchSemitoneGap(analysis.vocalPitchMedianHz, nextAnalysis.vocalPitchMedianHz)
-            ?: Double.POSITIVE_INFINITY) < 0.5
-    ) {
+    // Spec finetune §7.3 anti-monotony: only a literally identical file earns
+    // the hard cut (a skip proxy — the planner cannot advance the queue, so
+    // the 0.1 s cut is the closest it gets). Merely similar-sounding tracks
+    // keep their matrix result: a key-matched smooth blend is a mashup.
+    if (currentTrack != null && nextTrack != null && currentTrack.id == nextTrack.id) {
         return hardCutPlan(
             analysis, nextAnalysis, length, nextLength,
             playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
@@ -1799,8 +1858,13 @@ fun planTransition(
             )
         }
 
-    val (overlap, transitionBeats, incomingPlaybackRate) =
-        adaptiveOverlap(analysis, nextAnalysis, mixAnchor, proxyEntry)
+    val (overlap, transitionBeats, adaptiveRate) =
+        adaptiveOverlap(analysis, nextAnalysis, mixAnchor, proxyEntry, selectedType)
+    // Spec finetune §7.1: DJ_ASSISTED never stretches — the filter masks the
+    // drift instead. The adaptive tail still sizes the overlap, but the deck
+    // rate stays unity.
+    val incomingPlaybackRate =
+        if (policy.tier == TransitionTier.DJ_ASSISTED) 1.0 else adaptiveRate
     val currentBpm = analysis.bpm.orZero()
     val nextBpm = nextAnalysis.bpm.orZero()
     val handoffBpm = if (currentBpm > 0) currentBpm else nextBpm
@@ -1820,10 +1884,10 @@ fun planTransition(
     val typeBeats = min(maxBeatsFor(selectedType), if (mixset) MIXSET_MAX_BEATS else Double.POSITIVE_INFINITY)
     val floorRail = mixEnd - playFloorSeconds
     val maximumOverlap = minOf(
-        if (handoffBpm > 0) (typeBeats * 60) / handoffBpm else AUTO_TRANSITION_MAX_SECONDS,
+        if (handoffBpm > 0) (typeBeats * 60) / handoffBpm else ceilingFor(selectedType),
         ABSOLUTE_MAX_TRANSITION_SECONDS,
         mixEnd * 0.6,
-        if (nextLength > 0) nextLength * 0.6 else AUTO_TRANSITION_MAX_SECONDS,
+        if (nextLength > 0) nextLength * 0.6 else ceilingFor(selectedType),
         if (!mixset && floorRail >= MIN_TRANSITION_OVERLAP_SECONDS) floorRail else Double.POSITIVE_INFINITY,
     )
     val handoffBeats = if (sameBeatBlend) 8 else 4

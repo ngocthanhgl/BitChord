@@ -140,7 +140,7 @@ class EchoSendProcessor : BaseAudioProcessor() {
         private const val TAG = "BitChordEchoSend"
 
         /** Repeats never exceed dry: this is a send, not an instrument. */
-        private const val MAX_WET = 0.6f
+        private const val MAX_WET = 0.72f
 
         /** Each repeat keeps this much of itself. ~4 audible tails per throw. */
         private const val FEEDBACK = 0.38f

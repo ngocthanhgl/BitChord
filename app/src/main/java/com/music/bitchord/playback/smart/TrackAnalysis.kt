@@ -118,6 +118,13 @@ data class TrackAnalysis(
     val structuredOutroSec: Double? = null,
     /** v2 §4: §4-gradient buildup foot, else null (see `buildupStart`). */
     val structuredBuildupSec: Double? = null,
+    /**
+     * Spec finetune §7: the track's own breathing room before the cut — the
+     * start of the longest onset gap (>0.25 s) in the last 35% of the track,
+     * plus one beat of lookahead. Null when the tail never breathes.
+     * Persisted; computed once in [TrackAnalyzer.detectStructure].
+     */
+    val plainCutBreathSec: Double? = null,
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing
