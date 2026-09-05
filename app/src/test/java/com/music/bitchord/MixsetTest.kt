@@ -242,7 +242,6 @@ class MixsetTest {
         // neighbors so the flat bed does not report a phantom drop.
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
-            bpm = 120.0,
             beatConfidence = 0.9,
             energyCurve = points,
             vocalActivityMask = calmMask(points.size),
@@ -267,7 +266,6 @@ class MixsetTest {
         }
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
-            bpm = 120.0,
             beatConfidence = 0.9,
             energyCurve = points,
             vocalActivityMask = mask,
@@ -435,10 +433,12 @@ class MixsetTest {
     @Test
     fun buildupStart_flatLineReturnsNull() {
         val length = 180.0
-        // A spike on a flat bed is not a buildup: nothing genuinely rises
-        // into it, so the entry falls back to the peak itself downstream.
+        // A single-point spike on a flat bed is not a buildup: nothing
+        // genuinely rises into it, so the entry falls back to the peak
+        // itself downstream. (Single point: a plateau would read as a
+        // sustained peak rather than an instantaneous spike.)
         val points = curve(length, energyAt = { t ->
-            if (t >= 119.0 && t <= 121.0) 3.0 else 1.0
+            if (t == 120.0) 3.0 else 1.0
         })
         val analysis = TrackAnalysis(
             introEndTime = 10.0,
