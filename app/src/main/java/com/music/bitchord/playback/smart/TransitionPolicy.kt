@@ -1365,7 +1365,7 @@ fun effectivePlayFloor(analysis: TrackAnalysis, length: Double): Double {
 fun isInsideBreak(analysis: TrackAnalysis, time: Double): Boolean =
     analysis.structureMap.any { section ->
         section.type == StructureSectionType.BREAK &&
-            time >= section.startSeconds && time <= section.endSeconds
+            time >= section.start && time <= section.end
     }
 
 /** Finetune v1 §1.5/§3.3: derived, not stored — computable from stored fields. */
