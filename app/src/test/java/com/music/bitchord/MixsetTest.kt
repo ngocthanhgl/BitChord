@@ -4,7 +4,9 @@ import com.music.bitchord.playback.smart.CrossfadeMode
 import com.music.bitchord.playback.smart.EnergySample
 import com.music.bitchord.playback.smart.MixCandidate
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.alignMixsetExitToIncomingDrop
+import com.music.bitchord.playback.smart.applyMixsetFireFloor
 import com.music.bitchord.playback.smart.bestPartCue
 import com.music.bitchord.playback.smart.buildupStart
 import com.music.bitchord.playback.smart.mixsetEntryPoint
@@ -567,5 +569,72 @@ class MixsetTest {
             "anchor at ${anchor.time}, expected inside [160, 185]",
             anchor.time in 160.0..185.0,
         )
+    }
+
+    // -- Bugfix: mixset fire floor (no blend may start before 30 s) ---------
+
+    @Test
+    fun mixsetFireFloor_dissolveShortTrack_shiftsWholeWindow() {
+        // A 50 s track in mixset dissolves: the silence hole at 25–26 s sits
+        // exactly on scanFrom (max(0 + 25, 50 − 45)), so the raw cut lands at
+        // 25 with a 2 s fade — start 23, an audible skip. The floor shifts
+        // the whole window to start at 30, fade intact.
+        val pts = mutableListOf<EnergySample>()
+        var t = 0.0
+        while (t <= 50.0) {
+            pts += EnergySample(t, if (t >= 25.0 && t < 26.0) 0.01 else 0.9)
+            t += 0.5
+        }
+        val out = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = 50.0,
+            contentEndTime = 50.0,
+            audibleStartTime = 0.0,
+            energyCurve = pts,
+            vocalActivityMask = calmMask(pts.size),
+        )
+        val nextCurve = curve(60.0)
+        val next = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = 60.0,
+            audibleStartTime = 0.0,
+            energyCurve = nextCurve,
+            vocalActivityMask = calmMask(nextCurve.size),
+        )
+        val plan = planTransition(
+            analysis = out,
+            nextAnalysis = next,
+            duration = 50.0,
+            mode = CrossfadeMode.SMART,
+            mixset = true,
+        )
+        assertEquals(
+            "dissolve start ${plan.transitionStart}, expected floored at 30",
+            30.0, plan.transitionStart, 1e-6,
+        )
+        assertEquals(
+            "fade was ${plan.fadeSeconds}, expected intact 2 s dissolve",
+            2.0, plan.fadeSeconds, 1e-6,
+        )
+    }
+
+    @Test
+    fun mixsetFireFloor_helperArithmetic() {
+        // Unit pin: a 36 s sameBeat-style overlap off a 60 s anchor fires at
+        // 24 — the floor shifts start and end together, fade untouched.
+        val shifted = applyMixsetFireFloor(
+            TransitionPlan(transitionStart = 24.0, transitionEnd = 60.0, fadeSeconds = 36.0),
+            200.0, true,
+        )
+        assertEquals(30.0, shifted.transitionStart, 1e-6)
+        assertEquals(66.0, shifted.transitionEnd, 1e-6)
+        assertEquals(36.0, shifted.fadeSeconds, 1e-6)
+        // Passthroughs: normal mode, safe plans, blocked plans.
+        val plain = TransitionPlan(transitionStart = 24.0, transitionEnd = 60.0, fadeSeconds = 36.0)
+        assertEquals(24.0, applyMixsetFireFloor(plain, 200.0, false).transitionStart, 1e-6)
+        val safe = TransitionPlan(transitionStart = 98.0, transitionEnd = 130.0, fadeSeconds = 32.0)
+        assertEquals(98.0, applyMixsetFireFloor(safe, 200.0, true).transitionStart, 1e-6)
+        val blockedPlan = TransitionPlan(blocked = true, transitionStart = 200.0, transitionEnd = 200.0)
+        assertEquals(200.0, applyMixsetFireFloor(blockedPlan, 200.0, true).transitionStart, 1e-6)
     }
 }

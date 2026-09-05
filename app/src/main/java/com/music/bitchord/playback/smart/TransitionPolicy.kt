@@ -1041,6 +1041,14 @@ const val MIXSET_MIN_PLAY_SECONDS = 60.0
  * true anchor (the marker latch tracks anchor moves over 2 s).
  */
 const val MIXSET_RESCUE_FLOOR_SECONDS = 60.0
+/**
+ * No mixset blend may *start* before this. The rescue floor above holds the
+ * anchor, but every branch subtracts its own overlap/fade — sameBeat
+ * 0.6·anchor, dissolve scanFrom cuts, the ≤20 s drop-align pull — so the
+ * fire point could still land at ~16–28 s. The planner shifts the whole
+ * window instead (see applyMixsetFireFloor).
+ */
+const val MIXSET_MIN_FIRE_SECONDS = 30.0
 const val MIXSET_TARGET_PLAY_SECONDS = 90.0
 const val MIXSET_MAX_PLAY_SECONDS = 130.0
 /**

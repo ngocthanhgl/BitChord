@@ -1622,6 +1622,36 @@ private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrac
 }
 
 /**
+ * Mixset fire floor: no mixset blend may start before
+ * [MIXSET_MIN_FIRE_SECONDS]. Anchors are floored at 60 s, but every branch
+ * subtracts its own overlap/fade from the anchor, so the fire point is
+ * clamped here instead of in each branch. The whole window shifts (start
+ * and end together, fade unchanged) so every branch keeps its blend
+ * character; the end is capped defensively at the track end, which only
+ * binds on tracks shorter than the floor itself (already blocked upstream).
+ *
+ * Internal (not private) so MixsetTest can pin the arithmetic directly;
+ * the planner paths are covered end to end separately.
+ */
+internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: Boolean): TransitionPlan {
+    if (!mixset || plan.blocked || plan.transitionStart >= MIXSET_MIN_FIRE_SECONDS) return plan
+    val delta = MIXSET_MIN_FIRE_SECONDS - plan.transitionStart
+    val end = min(plan.transitionEnd + delta, max(length - 1.0, MIXSET_MIN_FIRE_SECONDS + 1.0))
+    Log.d(
+        PLANNER_TAG,
+        "mixset fire-floor shift +${"%.1f".format(delta)}s " +
+            "start=${"%.1f".format(plan.transitionStart)}->${"%.1f".format(MIXSET_MIN_FIRE_SECONDS)} " +
+            "end=${"%.1f".format(plan.transitionEnd)}->${"%.1f".format(end)} type=${plan.type}",
+    )
+    return plan.copy(
+        transitionStart = MIXSET_MIN_FIRE_SECONDS,
+        transitionEnd = end,
+        fadeSeconds = max(0.0, end - MIXSET_MIN_FIRE_SECONDS),
+        overlapSeconds = max(0.0, end - MIXSET_MIN_FIRE_SECONDS),
+    )
+}
+
+/**
  * Plans the transition out of [currentTrack] and into [nextTrack].
  *
  * Called on every playback tick; the returned plan describes the transition
@@ -1665,7 +1695,10 @@ fun planTransition(
     // policy reasons are not assessed yet; the plan carries its own reason.
     val nextLenShort = max(0.0, trackDurationSeconds(nextTrack))
     if (length < 90.0) {
-        return plainDissolvePlan(analysis, nextAnalysis, length, nextLenShort, playbackTime, mixset, emptyList())
+        return applyMixsetFireFloor(
+            plainDissolvePlan(analysis, nextAnalysis, length, nextLenShort, playbackTime, mixset, emptyList()),
+            length, mixset,
+        )
     }
 
     val analyzedContentEnd = analysis.contentEndTime.orZero().takeIf { it != 0.0 } ?: length
@@ -1751,9 +1784,12 @@ fun planTransition(
         // of fading blindly over whatever happens to sit at the tail. The
         // dissolve finds its own cut, so the tail anchor is irrelevant — and
         // the score is the neutral default: nothing here was synchronised.
-        return plainDissolvePlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixset, policy.reasons,
+        return applyMixsetFireFloor(
+            plainDissolvePlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixset, policy.reasons,
+            ),
+            length, mixset,
         )
     }
 
@@ -1774,14 +1810,20 @@ fun planTransition(
                 "tier=${policy.tier} ratio=${policy.matchedRatio}",
         )
         if (policy.tier == TransitionTier.HALF_TIME) {
-            return halfTimeBlendPlan(
-                analysis, nextAnalysis, length, nextLength,
-                playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = true, mixset = mixset,
+            return applyMixsetFireFloor(
+                halfTimeBlendPlan(
+                    analysis, nextAnalysis, length, nextLength,
+                    playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = true, mixset = mixset,
+                ),
+                length, mixset,
             )
         }
-        return heavyClashPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyEntry, proxyScore, policy.reasons, mixset,
+        return applyMixsetFireFloor(
+            heavyClashPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyEntry, proxyScore, policy.reasons, mixset,
+            ),
+            length, mixset,
         )
     }
     val dropInB = firstDropSec(nextAnalysis)
@@ -1803,15 +1845,21 @@ fun planTransition(
     // the 0.1 s cut is the closest it gets). Merely similar-sounding tracks
     // keep their matrix result: a key-matched smooth blend is a mashup.
     if (currentTrack != null && nextTrack != null && currentTrack.id == nextTrack.id) {
-        return hardCutPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        return applyMixsetFireFloor(
+            hardCutPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+            ),
+            length, mixset,
         )
     }
     if (selectedType == TransitionType.ECHO_REVERB_OUT) {
-        return echoOutPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        return applyMixsetFireFloor(
+            echoOutPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+            ),
+            length, mixset,
         )
     }
     if (selectedType == TransitionType.LOOP_CUT_DROP && dropInB != null) {
@@ -1821,26 +1869,38 @@ fun planTransition(
         val beatOutA = analysis.beatInterval.orZero().takeIf { it > 0 }
             ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
         if (mixAnchor >= 32 * beatOutA) {
-            return loopCutPlan(
-                analysis, nextAnalysis, length, nextLength,
-                playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons, mixset,
+            return applyMixsetFireFloor(
+                loopCutPlan(
+                    analysis, nextAnalysis, length, nextLength,
+                    playbackTime, mixAnchor, dropInB, proxyScore, policy.reasons, mixset,
+                ),
+                length, mixset,
             )
         }
-        return hardCutPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        return applyMixsetFireFloor(
+            hardCutPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+            ),
+            length, mixset,
         )
     }
     if (selectedType == TransitionType.HARD_CUT) {
-        return hardCutPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+        return applyMixsetFireFloor(
+            hardCutPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
+            ),
+            length, mixset,
         )
     }
     if (selectedType == TransitionType.HALF_TIME_BLEND) {
-        return halfTimeBlendPlan(
-            analysis, nextAnalysis, length, nextLength,
-            playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = false, mixset = mixset,
+        return applyMixsetFireFloor(
+            halfTimeBlendPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = false, mixset = mixset,
+            ),
+            length, mixset,
         )
     }
 
@@ -1848,13 +1908,16 @@ fun planTransition(
         ?.takeIf { playbackTime < it.transitionEnd }
         ?.let { plan ->
             val started = playbackTime >= plan.transitionStart
-            return plan.copy(
-                shouldStart = started,
-                type = TransitionType.HARMONIC_BLEND,
-                score = scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime),
-                eqCurve = EQCurve.BASS_SWAP,
-                policyReasons = policy.reasons,
-                reason = if (started) "smart-phrase-switch" else "before-phrase-switch",
+            return applyMixsetFireFloor(
+                plan.copy(
+                    shouldStart = started,
+                    type = TransitionType.HARMONIC_BLEND,
+                    score = scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime),
+                    eqCurve = EQCurve.BASS_SWAP,
+                    policyReasons = policy.reasons,
+                    reason = if (started) "smart-phrase-switch" else "before-phrase-switch",
+                ),
+                length, mixset,
             )
         }
 
@@ -1994,11 +2057,12 @@ fun planTransition(
         0
     }
     val started = playbackTime >= transitionStart
-    return TransitionPlan(
-        shouldStart = started,
-        markerVisible = true,
-        transitionStart = transitionStart,
-        transitionEnd = mixEnd,
+    return applyMixsetFireFloor(
+        TransitionPlan(
+            shouldStart = started,
+            markerVisible = true,
+            transitionStart = transitionStart,
+            transitionEnd = mixEnd,
         fadeSeconds = alignedOverlap,
         handoffStartSeconds = 0.0,
         handoffDuration = alignedOverlap,
@@ -2030,5 +2094,7 @@ fun planTransition(
         ),
         policyReasons = policy.reasons,
         reason = if (started) "smart-duration" else "before-smart-duration",
+        ),
+        length, mixset,
     )
 }
