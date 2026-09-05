@@ -979,6 +979,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 mixOutCandidates = features.mixOutCandidates,
                 energyCurve = features.energyCurve,
                 lowEnergyCurve = features.lowEnergyCurve,
+                // Finetune §6.1: hand the transient fine curve to the in-memory
+                // analysis (dropped on persist — see AnalysisStore).
+                energyCurveFine = features.energyCurveFine,
                 // The model's mask where it ran, the DSP heuristic's where it didn't. Falling back to
                 // the heuristic rather than to nothing matters because the policy reads an
                 // absent mask and a neutral one identically — as "no evidence" — so a failed model

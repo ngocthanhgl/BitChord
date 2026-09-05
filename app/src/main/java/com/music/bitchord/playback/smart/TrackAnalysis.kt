@@ -84,6 +84,14 @@ data class TrackAnalysis(
     /** Low-band energy, present only when the analyzer ran a band split. Drives the bass swap. */
     val lowEnergyCurve: List<EnergySample> = emptyList(),
     /**
+     * Finetune §6.1: the transient fine energy curve, kept in memory only
+     * (never persisted — see [AnalysisStore], which drops it on write). Lets
+     * [buildupStart] re-derive the §4 gradient for analyses whose stored
+     * buildup is absent. Empty for cached, head-only, or failed analyses,
+     * where callers fall through to the next fallback.
+     */
+    val energyCurveFine: List<EnergySample> = emptyList(),
+    /**
      * Per-sample vocal activity, indexed against [energyCurve] sample times.
      * Empty, or any length other than the energy curve's, means "no
      * evidence", which never blocks a transition.
