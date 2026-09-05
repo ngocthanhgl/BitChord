@@ -886,9 +886,13 @@ class PlaybackService : MediaSessionService() {
             standby = { requireNotNull(spare) },
             onHandoff = ::adoptPlayer,
             analysisFor = { item -> trackAnalyzer.analysisFor(item.mediaId) },
-            requestAnalysis = { item, durationMs ->
+            requestAnalysis = { item, durationMs, isNext ->
                 item.localConfiguration?.uri?.let { uri ->
-                    trackAnalyzer.request(item.mediaId, uri, durationMs / 1000.0)
+                    trackAnalyzer.request(
+                        item.mediaId, uri, durationMs / 1000.0,
+                        if (isNext) com.music.bitchord.playback.smart.TrackAnalyzer.PRIORITY_NEXT
+                        else com.music.bitchord.playback.smart.TrackAnalyzer.PRIORITY_NORMAL,
+                    )
                 }
             },
             // "Incoming" and "outgoing" are roles, not players. The controller

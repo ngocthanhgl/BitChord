@@ -30,7 +30,10 @@ import android.util.Log
 import androidx.media3.common.util.UnstableApi
 import com.music.bitchord.playback.AudioCache
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
 import java.util.Locale
@@ -135,12 +138,43 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private fun discardsOf(key: String): Int = discarded[key] ?: 0
 
-    private val executor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "bitchord-smart-analysis").apply {
-            isDaemon = true
-            priority = Thread.NORM_PRIORITY
-        }
+    /**
+     * One lane, two priorities. Still a single worker thread — analysis jobs
+     * are never concurrent with each other, which the model sessions assume —
+     * but a job for the track that is about to play now overtakes jobs for
+     * tracks further out. Before this, a slow head-of-line job (a full CREPE
+     * pass, a spinning decode) held every track behind it, and the next track
+     * sat at WAITING until its fade arrived. Within a lane, FIFO.
+     *
+     * The queue holds [AnalysisJob]s only; anything else submitted here is a
+     * bug, and failing fast on it is better than a stuck comparator.
+     */
+    private val jobSeq = AtomicLong(0)
+
+    private inner class AnalysisJob(
+        val priority: Int,
+        val block: () -> Unit,
+    ) : Runnable, Comparable<AnalysisJob> {
+        val seq = jobSeq.getAndIncrement()
+        override fun run() = block()
+        override fun compareTo(other: AnalysisJob): Int =
+            compareValuesBy(this, other, { -it.priority }, { it.seq })
     }
+
+    private fun submit(priority: Int, block: () -> Unit) {
+        executor.execute(AnalysisJob(priority, block))
+    }
+
+    private val executor = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        PriorityBlockingQueue<Runnable>(),
+        { runnable ->
+            Thread(runnable, "bitchord-smart-analysis").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY
+            }
+        },
+    )
 
     /**
      * What is known about [trackId] right now: never a computation, never a
@@ -158,14 +192,14 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * against the seconds a real analysis takes — and against the alternative,
      * which is not having it at all.
      */
-    private fun restoreOnce(trackId: String) {
+    private fun restoreOnce(trackId: String, priority: Int = PRIORITY_NORMAL) {
         if (results.containsKey(trackId)) return
         // The set doubles as the once-guard: add() is true only for the first
         // caller, so a track with nothing stored is looked for once per session
         // rather than on every tick.
         if (!restoreAttempted.add(trackId)) return
-        executor.execute {
-            val stored = store.load(trackId) ?: return@execute
+        submit(priority) {
+            val stored = store.load(trackId) ?: return@submit
             Log.d(TAG, "Restored analysis for $trackId: bpm=${stored.bpm} conf=${stored.beatConfidence}")
             results.putIfAbsent(trackId, stored)
         }
@@ -206,7 +240,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * to wait for and nothing to escalate through. See [LocalAudioSource] for
      * why that needed saying at all.
      */
-    fun request(trackId: String, uri: Uri, durationSeconds: Double) {
+    fun request(trackId: String, uri: Uri, durationSeconds: Double, priority: Int = PRIORITY_NORMAL) {
         if (trackId.isBlank()) return
         if (trackId in running) return
 
@@ -216,7 +250,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // Queued before the cache is even consulted, so a track measured in an
         // earlier session short-circuits the whole path rather than being
         // re-earned from audio the cache may since have evicted.
-        restoreOnce(trackId)
+        restoreOnce(trackId, priority)
 
         // A track playing off the device is not a download in progress. Every
         // byte of it is already there, and none of those bytes are in the cache:
@@ -296,7 +330,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         if (!running.add(trackId)) return
 
-        executor.execute {
+        submit(priority) {
             try {
                 // [restoreOnce] queues onto this same single-threaded executor,
                 // so a stored result for this track has landed by now if there
@@ -306,7 +340,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 // seven seconds recomputing the identical numbers. A provisional
                 // result is exempt: superseding one is the whole point of it.
                 val landed = results[trackId]
-                if (landed != null && landed.isUsable && trackId !in provisional) return@execute
+                if (landed != null && landed.isUsable && trackId !in provisional) return@submit
                 if (usableComplete) {
                     val outcome = analyze(trackId, uri, durationSeconds)
                     val whole = outcome.analysis
@@ -845,12 +879,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      */
     private fun analyze(trackId: String, uri: Uri, durationSeconds: Double): WholeTrack {
         val copy = copyToRead(trackId, uri, durationSeconds) ?: return WholeTrack(null)
-        // Recorded before the outcome is known, because what this gates is
-        // whether a *written-off* track is worth reopening, and the answer is
-        // only ever "yes" for a copy that has not been read yet. Recording it on
-        // success alone would leave a failure looking permanently reopenable and
-        // re-decode the same file on every tick.
-        triedRenditions.add(copy.key)
+        // Recorded only once the outcome is decided (see the three return
+        // sites below), never on the way in: a throw between here and there —
+        // pitch resample NPE, model OOM — used to burn the copy before any
+        // result existed, freezing the track as session-sticky FAILED with no
+        // copy left to reopen it. A failure that decided nothing deserves
+        // another attempt, not a write-off.
         val openSource = copy.open
 
         var effectiveDuration = durationSeconds
@@ -876,8 +910,15 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // died on it. Returning is what releases them — a `val` cannot be nulled, and a narrower
         // scope alone does not make ART treat one as dead.
         val structural = structure(trackId, uri, copy, effectiveDuration)
-        if (structural.decodedShort) return WholeTrack(null, decodedShort = true)
-        val features = structural.features ?: return WholeTrack(empty(trackId, effectiveDuration))
+        if (structural.decodedShort) {
+            triedRenditions.add(copy.key)
+            return WholeTrack(null, decodedShort = true)
+        }
+        val features = structural.features
+        if (features == null) {
+            triedRenditions.add(copy.key)
+            return WholeTrack(empty(trackId, effectiveDuration))
+        }
 
         // Pass 2 (Phases 2 and 3, models): the Beat This! grid and the open-unmix vocal mask, over
         // the head and tail only. A transition only ever reads the tail of the outgoing track and
@@ -913,6 +954,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // outputs; the curves are released with `features` below.
         val structure = detectStructure(features, mergedDownbeats, effectiveDuration)
 
+        triedRenditions.add(copy.key)
         return WholeTrack(
                 TrackAnalysis(
                     status = TrackAnalysis.STATUS_READY,
@@ -1090,10 +1132,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // Pitch reads the head only, resampled off the beat model's own input
         // rather than a second downmix: the planner verifies the *incoming*
         // track's key against it, and nothing downstream of the head ever asks.
+        // Garnish-grade: wrapped so a resample NPE or a model OOM degrades to
+        // no pitch (the key gate closes itself below its confidence floor)
+        // instead of failing the whole analysis — the way beat and vocal
+        // already behave. A pitch pass must never decide a track's fate.
         val pitchCurve = if (trackPitch) {
-            inputs.forModel
-                ?.let { MelSpectrogram.resample(it, MelSpectrogram.sampleRate, PitchTracker.SAMPLE_RATE.toDouble()) }
-                ?.let { pitch.track(it, offsetSeconds = actualStart) }
+            runCatching {
+                inputs.forModel
+                    ?.let { MelSpectrogram.resample(it, MelSpectrogram.sampleRate, PitchTracker.SAMPLE_RATE.toDouble()) }
+                    ?.let { pitch.track(it, offsetSeconds = actualStart) }
+            }.getOrElse { error ->
+                Log.w(TAG, "Pitch pass degraded to none", error)
+                null
+            }
         } else {
             null
         }
@@ -1227,6 +1278,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private companion object {
         const val TAG = "BitChordTrackAnalyzer"
+
+        /** Lane for the track queued to play next. Everything else is 0. */
+        const val PRIORITY_NEXT = 1
+        const val PRIORITY_NORMAL = 0
 
         /**
          * What an unmeasured instant reads as. Below the policy's VOCAL_ACTIVE_THRESHOLD by

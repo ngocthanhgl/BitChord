@@ -136,7 +136,13 @@ class CrossfadeController(
      * recording from a differently-cut one before reusing an analysis across
      * them, and this class is the only place that already knows it.
      */
-    private val requestAnalysis: (MediaItem, Long) -> Unit = { _, _ -> },
+    /**
+     * Queues background analysis for a media item. The Boolean marks the
+     * track queued to play next, which the analyzer's priority lane serves
+     * ahead of everything else — the incoming side of the next transition is
+     * the one result whose lateness is audible.
+     */
+    private val requestAnalysis: (MediaItem, Long, Boolean) -> Unit = { _, _, _ -> },
     /**
      * The low-pass and high-pass riding each side of a transition. This is what
      * makes a plan's
@@ -783,8 +789,8 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
-        requestAnalysis(currentItem, duration)
-        requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem))
+        requestAnalysis(currentItem, duration, false)
+        requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem), true)
     }
 
     /**
