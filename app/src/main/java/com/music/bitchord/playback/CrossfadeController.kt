@@ -19,6 +19,7 @@ import com.music.bitchord.playback.smart.BASS_SWAP_WIDTH_V2
 import com.music.bitchord.playback.smart.MID_KILL_HP_HZ
 import com.music.bitchord.playback.smart.MID_KILL_LP_HZ
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
 import com.music.bitchord.playback.smart.TransitionTrackInfo
 import com.music.bitchord.playback.smart.TransitionType
@@ -353,6 +354,14 @@ class CrossfadeController(
      */
     private var lastMarkedPair: String? = null
     private var lastMarkedWindow: TransitionWindow? = null
+    /** G1: fingerprint of the plan that produced the latched window. */
+    private var lastMarkedFingerprint: String? = null
+    /** G3: frozen anchor for the final approach — the pair it belongs to. */
+    private var frozenAnchorPair: String? = null
+    private var frozenAnchorStartSec = 0.0
+    private var frozenAnchorEndSec = 0.0
+    /** P2: throttle for silent-guard diagnostics (see [logGuardOnce]). */
+    private var lastGuardLog: String? = null
 
     /**
      * A playhead jump bigger than this between two ticks is a seek, not
@@ -361,10 +370,22 @@ class CrossfadeController(
      */
     private val seekJumpThresholdMs = 2000L
     private var lastTickPositionMs = -1L
+    /**
+     * Anchor moves bigger than this update the latched marker; smaller ones
+     * stay frozen so tick jitter does not slide the bar (see G1 below).
+     */
+    private val markerUpdateDriftMs = 2000.0
+    /**
+     * How far ahead of a valid anchor the anchor freezes for its pair.
+     * Past this point only the entry cue may still move (see G3 below).
+     */
+    private val anchorFreezeAheadMs = 15_000L
 
     private fun clearMarkerLatch() {
         lastMarkedPair = null
         lastMarkedWindow = null
+        lastMarkedFingerprint = null
+        frozenAnchorPair = null
         lastTickPositionMs = -1L
     }
 
@@ -519,18 +540,25 @@ class CrossfadeController(
     /** Arms a crossfade as the playing track runs out. */
     private fun considerAutoTransition() {
         val player = active()
-        if (!player.isPlaying) return
+        if (!player.isPlaying) {
+            logGuardOnce("auto", "no transition: player not playing")
+            return
+        }
         // Nothing to transition *into*, so any analysis state left over from the
         // previous pair is stale — the last track of a queue should not still be
         // claiming both songs are measured.
         if (!player.hasNextMediaItem()) {
+            logGuardOnce("auto", "no transition: queue ends here")
             AppSettings.smartTransitionWindow.value = null
             clearMarkerLatch()
             return
         }
 
         val duration = player.duration
-        if (duration == C.TIME_UNSET || duration <= 0L) return
+        if (duration == C.TIME_UNSET || duration <= 0L) {
+            logGuardOnce("auto", "no transition: duration unset ($duration)")
+            return
+        }
 
         // Repeating one track would crossfade it into itself, so nothing is
         // armed and no window is marked — but the queue behind the loop has not
@@ -547,6 +575,7 @@ class CrossfadeController(
         // measurement is the same either way, so it may as well be made during
         // the loop rather than after it.
         if (player.repeatMode == Player.REPEAT_MODE_ONE) {
+            logGuardOnce("auto", "no transition: repeat-one loop")
             if (AppSettings.smartFadeEnabled.value) requestAnalysisAround(player, duration)
             // Stale otherwise: the marker would keep describing the transition
             // planned for this pair before the loop went on, at a point the
@@ -565,9 +594,15 @@ class CrossfadeController(
             return
         }
 
-        if (configuredFadeMs() <= 0L) return
+        if (configuredFadeMs() <= 0L) {
+            logGuardOnce("auto", "no transition: manual crossfade length is 0")
+            return
+        }
         val fade = fadeFor(duration)
-        if (fade <= 0L) return
+        if (fade <= 0L) {
+            logGuardOnce("auto", "no transition: fadeFor returned 0 for duration=$duration")
+            return
+        }
 
         val remaining = duration - player.currentPosition
         // Arm early: the standby has to open the incoming track and buffer to
@@ -619,7 +654,8 @@ class CrossfadeController(
         val nextAnalysis = analysisFor(nextItem)
         val analysisState = AppSettings.smartAnalysis.value
 
-        val plan = planTransition(
+        val mixset = AppSettings.mixsetModeEnabled.value && AppSettings.smartFadeEnabled.value
+        var plan = planTransition(
             analysis = currentAnalysis,
             nextAnalysis = nextAnalysis,
             currentTrack = currentItem.toTransitionInfo(duration),
@@ -628,7 +664,7 @@ class CrossfadeController(
             duration = duration / 1000.0,
             fadeSeconds = fallbackSeconds,
             mode = CrossfadeMode.SMART,
-            mixset = AppSettings.mixsetModeEnabled.value && AppSettings.smartFadeEnabled.value,
+            mixset = mixset,
         )
         // One line per distinct verdict rather than one per 250ms tick, so the
         // log says what the planner decided for this pair without burying it.
@@ -674,11 +710,60 @@ class CrossfadeController(
         // routinely analysed from its opening long before it plays, that was
         // most of the time the marker was missing.
         val pairKey = "${currentItem.mediaId}→${nextItem.mediaId}"
+        // G3 anchor freeze: inside the final approach the anchor stops moving.
+        // The planner re-plans every tick from fresh evidence, and late
+        // evidence (whole-track pass landing, next-track duration arriving)
+        // can push the anchor forward faster than the playhead advances — a
+        // perpetual `remaining > ARM_LEAD_MS` under a visible marker. Once the
+        // playhead is inside [anchorFreezeAheadMs] of a valid anchor it is
+        // frozen for this pair; only the entry cue may still move. The frozen
+        // values are what both the marker below and the fire gate after it
+        // read, so the bar and the blend can no longer disagree. (The verdict
+        // line above still logs the live plan; the `arm` line logs what fired.)
+        if (plan.blocked) {
+            if (frozenAnchorPair == pairKey) frozenAnchorPair = null
+        } else if (plan.fadeMs > 0L) {
+            val remainingMs = (plan.transitionStart * 1000).roundToLong() - player.currentPosition
+            if (frozenAnchorPair == pairKey) {
+                plan = plan.copy(
+                    transitionStart = frozenAnchorStartSec,
+                    transitionEnd = frozenAnchorEndSec,
+                )
+            } else if (remainingMs in 1..anchorFreezeAheadMs) {
+                frozenAnchorPair = pairKey
+                frozenAnchorStartSec = plan.transitionStart
+                frozenAnchorEndSec = plan.transitionEnd
+            }
+        } else if (frozenAnchorPair == pairKey) {
+            // Fresh verdict says no fade at all: holding a frozen anchor
+            // would mark a window that can never arm. Drop it and let the
+            // live plan (likely unmarkable) drive the marker below.
+            frozenAnchorPair = null
+        }
+        // G2 honest marker: the bar promises an audible mix, so it is gated
+        // on the plan actually being one. Fallback plain fades (unanalysed
+        // pair, cue at 0:00, equal-power, no stretch) still fade — they just
+        // no longer advertise a mix that is not coming.
+        val realMix = planIsRealMix(plan)
         val markable = !plan.blocked &&
             plan.markerVisible &&
+            realMix &&
             duration > 0L &&
             analysisState.current == TrackAnalysisState.ANALYSED &&
             analysisState.next in MEASURED_ENOUGH_TO_ENTER_ON
+        val fingerprint = listOf(
+            plan.transitionStart,
+            plan.transitionEnd,
+            plan.fadeMs,
+            plan.transitionStyle,
+            plan.incomingCueTime,
+            plan.incomingPlaybackRate,
+            mixset,
+            analysisState.current,
+            analysisState.next,
+            currentAnalysis.downbeats.size,
+            nextAnalysis.downbeats.size,
+        ).joinToString("|")
         val window = if (markable) {
             TransitionWindow(
                 start = (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
@@ -688,20 +773,29 @@ class CrossfadeController(
             null
         }
         if (window != null) {
-            if (pairKey != lastMarkedPair || lastMarkedWindow == null) {
+            // G1 versioned latch: the first markable plan still wins against
+            // tick jitter, but a re-plan that actually moved the anchor (over
+            // [markerUpdateDriftMs]) updates the bar instead of freezing a
+            // lie. Style/entry-only changes keep the shown position: the bar
+            // shows *where*, and where did not move.
+            val driftMs = lastMarkedWindow?.let { (abs(window.start - it.start) * duration).toDouble() }
+            if (pairKey != lastMarkedPair || lastMarkedWindow == null ||
+                (fingerprint != lastMarkedFingerprint && (driftMs == null || driftMs > markerUpdateDriftMs))
+            ) {
                 lastMarkedPair = pairKey
                 lastMarkedWindow = window
+                lastMarkedFingerprint = fingerprint
             }
-            // Same pair already latched: the marker is frozen. A re-planned
-            // window for the same pair (missed-anchor salvage after the
-            // playhead jumped, late evidence landing) must not slide the bar
-            // under the listener — the first markable plan is the truth the
-            // listener was shown. A real seek clears the latch above via the
-            // position jump, so the next markable tick re-latches fresh.
-        } else if (plan.blocked || pairKey != lastMarkedPair) {
-            // Structural (too short to mix, nothing measurable) or a new pair:
-            // nothing valid to show, so the latch goes with it. Backing into an
-            // old pair re-latches from scratch the first markable tick.
+        } else if (plan.blocked || pairKey != lastMarkedPair ||
+            (!realMix && analysisState.current == TrackAnalysisState.ANALYSED &&
+                analysisState.next in MEASURED_ENOUGH_TO_ENTER_ON)
+        ) {
+            // Structural, a new pair, or a settled fallback verdict on fully
+            // measured tracks: nothing audible to promise, so the latch goes
+            // with it. Unmeasured tracks keep a latched window through the
+            // dip — evidence is still landing, and the verdict is not final.
+            // Backing into an old pair re-latches from scratch the first
+            // markable tick.
             clearMarkerLatch()
         }
         // Otherwise a transient dip on the same pair — the latched window
@@ -722,7 +816,10 @@ class CrossfadeController(
         if (plan.blocked) return
 
         val fade = plan.fadeMs
-        if (fade <= 0L) return
+        if (fade <= 0L) {
+            logGuardOnce("smart", "no arm: plan fade is 0 (anchor=${plan.transitionStart})")
+            return
+        }
 
         val transitionStartMs = (plan.transitionStart * 1000).roundToLong()
         val remaining = transitionStartMs - player.currentPosition
@@ -732,7 +829,7 @@ class CrossfadeController(
         // file actually ends.
         if (remaining > ARM_LEAD_MS) return
 
-        begin(
+        if (!begin(
             fade,
             endMs = (plan.transitionEnd * 1000).roundToLong(),
             smart = true,
@@ -769,7 +866,9 @@ class CrossfadeController(
                 keyScore = plan.score.key,
                 overlapSeconds = plan.fadeSeconds,
             ),
-        )
+        )) {
+            logGuardOnce("smart", "no arm: begin() refused (anchor passed or no next item)")
+        }
     }
 
     /**
@@ -920,6 +1019,10 @@ class CrossfadeController(
         if (out === into) return false
         val nextIndex = out.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return false
+
+        // The frozen anchor did its job getting here; a later lap of the
+        // same pair (repeat-all) must freeze fresh, not inherit this lap's.
+        frozenAnchorPair = null
 
         fadeMs = fade
         fadeEndMs = endMs
@@ -1736,6 +1839,35 @@ class CrossfadeController(
             incomingCueTimeMs > 0L ||
             incomingPlaybackRate != 1.0
         )
+
+    /**
+     * Plan-level twin of [isRealMix] for use before anything is armed: the
+     * same rule (a filtering/bass style, a cued-in entry, or a stretch),
+     * read off the plan instead of the render state. G2 marker gating.
+     */
+    private fun planIsRealMix(plan: TransitionPlan): Boolean =
+        plan.transitionStyle == TransitionStyle.DJ_BLEND ||
+            plan.transitionStyle == TransitionStyle.DJ_FILTER ||
+            plan.transitionStyle == TransitionStyle.ECHO_REVERB_OUT ||
+            plan.transitionStyle == TransitionStyle.LOOP_CUT_DROP ||
+            plan.transitionStyle == TransitionStyle.HARD_CUT ||
+            plan.transitionStyle == TransitionStyle.PLAIN_DISSOLVE ||
+            plan.incomingCueTime > 0.0 ||
+            plan.incomingPlaybackRate != 1.0
+
+    /**
+     * P2: one log line per distinct silent-guard trip, never one per tick.
+     * The mark→arm→fade path drops transitions in a dozen places that used
+     * to return bare, so a "greybar but no mix" report was undiagnosable
+     * from logcat. Throttled by key: repeats are suppressed, changes surface.
+     */
+    private fun logGuardOnce(key: String, msg: String) {
+        val full = "$key|$msg"
+        if (full != lastGuardLog) {
+            lastGuardLog = full
+            Log.d(TAG, msg)
+        }
+    }
 
     /** Equal-power pair: [riseGain]² + [fallGain]² = 1, so the blend never dips. */
     private fun riseGain(progress: Float): Float =

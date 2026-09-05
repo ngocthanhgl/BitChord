@@ -97,6 +97,26 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      */
     private val shortDecodes = ConcurrentHashMap<String, Int>()
 
+    /**
+     * P0 terminal-analysis guarantee: bounded transient-failure counters so a
+     * track that trips on a still-filling stream, a revoked content URI, or a
+     * codec hiccup is retried a few times instead of written off on the first
+     * stumble — while a track that genuinely cannot be read still terminates
+     * instead of opening a data source on every tick forever.
+     */
+    private val throwStrikes = ConcurrentHashMap<String, Int>()
+    private val openFailStrikes = ConcurrentHashMap<String, Int>()
+    private val noDurationStrikes = ConcurrentHashMap<String, Int>()
+
+    /** Local URIs already granted their one fresh-open retry (see [analyze]). */
+    private val localReopenTried = ConcurrentHashMap.newKeySet<String>()
+
+    /** When the in-flight job for each track was queued; see the stuck watchdog in [request]. */
+    private val jobStartMs = ConcurrentHashMap<String, Long>()
+
+    /** Tracks already reported stuck, so the watchdog logs once not every tick. */
+    private val stuckLogged = ConcurrentHashMap.newKeySet<String>()
+
     /** Tracks already looked for on disk this session; see [restoreOnce]. */
     private val restoreAttempted = ConcurrentHashMap.newKeySet<String>()
 
@@ -285,8 +305,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // again for the same answer.
         //
         // A local file is its own single copy, keyed by URI — see [copyToRead] —
-        // so a failure there is read once and stays read, which is correct: no
-        // second copy of it is ever going to arrive.
+        // so a failure there used to be read once and stay read. That froze
+        // tracks on transient opens (a file still being written, a content
+        // provider hiccup), so a local copy now gets one fresh-open retry
+        // before the write-off below applies (see [analyze]).
         val untried = if (local) {
             uri.toString() !in triedRenditions
         } else {
@@ -328,7 +350,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             cache.requestAnalysisHead(uri)
             return
         }
+        // Stuck watchdog (P0/F5): a job that has occupied the single worker
+        // past STUCK_JOB_TIMEOUT_MS blocks every track behind it, including
+        // the next track whose fade is approaching. Reported once, never
+        // preempted — see the constant for why killing it is worse.
+        val started = jobStartMs[trackId]
+        if (started != null && trackId in running &&
+            System.currentTimeMillis() - started > STUCK_JOB_TIMEOUT_MS &&
+            stuckLogged.add(trackId)
+        ) {
+            Log.e(TAG, "Analysis job for $trackId stuck over ${STUCK_JOB_TIMEOUT_MS}ms on the single worker")
+        }
         if (!running.add(trackId)) return
+        jobStartMs[trackId] = System.currentTimeMillis()
 
         submit(priority) {
             try {
@@ -348,6 +382,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                         results[trackId] = whole
                         provisional.remove(trackId)
                         shortDecodes.remove(trackId)
+                        throwStrikes.remove(trackId)
+                        openFailStrikes.remove(trackId)
+                        noDurationStrikes.remove(trackId)
                         // Only the whole-track pass is persisted. A head result
                         // is missing everything past its window — the outro, the
                         // mix-out anchor, the energy curve — and storing one
@@ -392,18 +429,30 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 // [headWorthTrying] has already made sure the head is not tried
                 // twice, so this cannot spin.
                 if (usableComplete) {
-                    // Recorded as ready-but-empty so a track that cannot be
-                    // analysed is not retried on every tick for the rest of the
-                    // session.
-                    results[trackId] = TrackAnalysis(
-                        status = TrackAnalysis.STATUS_READY,
-                        trackId = trackId,
-                        duration = durationSeconds,
-                    )
-                    provisional.remove(trackId)
+                    // Recorded as ready-but-empty only after bounded strikes, so
+                    // a track that trips on a transient (codec hiccup, half-
+                    // flushed span, OOM under load) is retried instead of
+                    // written off on the first stumble. The finally below
+                    // releases the model sessions, so the next attempt starts
+                    // from a released state rather than a dying one.
+                    val strikes = throwStrikes.merge(trackId, 1, Int::plus)!!
+                    if (strikes >= MAX_THROW_ATTEMPTS) {
+                        Log.w(TAG, "Giving up on $trackId after $strikes thrown attempts", error)
+                        throwStrikes.remove(trackId)
+                        results[trackId] = TrackAnalysis(
+                            status = TrackAnalysis.STATUS_READY,
+                            trackId = trackId,
+                            duration = durationSeconds,
+                        )
+                        provisional.remove(trackId)
+                    } else {
+                        Log.d(TAG, "Deferring $trackId after throw (attempt $strikes)", error)
+                    }
                 }
             } finally {
                 running.remove(trackId)
+                jobStartMs.remove(trackId)
+                stuckLogged.remove(trackId)
                 // The session holds the model's arena and a parsed ONNX graph in native heap for
                 // as long as it is open, which a backgrounded music player cannot justify between
                 // transitions. Released the moment nothing is in flight; reloading costs under a
@@ -892,8 +941,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             effectiveDuration = openSource()?.use(AudioDecoder::containerDurationSeconds) ?: 0.0
         }
         if (effectiveDuration <= 0) {
-            Log.d(TAG, "Skipping $trackId: ${copy.key} has no readable duration")
-            return WholeTrack(empty(trackId, 0.0))
+            // No readable duration yet is "not now", not a verdict: stream
+            // metadata routinely arrives seconds after playback starts.
+            // Bounded so a track that genuinely has no duration doesn't open a
+            // data source on every tick for the rest of the session; each
+            // attempt costs one container-duration query, not a decode.
+            val strikes = noDurationStrikes.merge(trackId, 1, Int::plus)!!
+            if (strikes >= MAX_NO_DURATION_ATTEMPTS) {
+                Log.w(TAG, "Giving up on $trackId: no readable duration after $strikes attempts")
+                noDurationStrikes.remove(trackId)
+                return WholeTrack(empty(trackId, 0.0))
+            }
+            Log.d(TAG, "Deferring $trackId: ${copy.key} has no readable duration yet (attempt $strikes)")
+            return WholeTrack(null)
         }
 
         // Pass 1 (Phase 1, DSP-only): the analyzer needs the whole track — the energy curve,
@@ -916,6 +976,22 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         val features = structural.features
         if (features == null) {
+            // A null open or decode on a copy the cache called complete is
+            // usually transient — an eviction race, a half-flushed span, a
+            // content provider hiccup on a local file — so strike it instead
+            // of burning it. Local copies additionally get one fresh-open
+            // retry first: there is no second copy of a file, and a single
+            // reopen is what separates "still being written" from "unreadable".
+            if (copy.rendition == null && localReopenTried.add(copy.key)) {
+                Log.d(TAG, "Retrying local $trackId once with a fresh open")
+                return WholeTrack(null)
+            }
+            val strikes = openFailStrikes.merge(trackId, 1, Int::plus)!!
+            if (strikes < MAX_OPEN_FAIL_ATTEMPTS) {
+                Log.d(TAG, "Deferring $trackId: null open/decode on ${copy.key} (attempt $strikes)")
+                return WholeTrack(null)
+            }
+            openFailStrikes.remove(trackId)
             triedRenditions.add(copy.key)
             return WholeTrack(empty(trackId, effectiveDuration))
         }
@@ -1362,6 +1438,29 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
         /** Refusals before a track is written off as truncated rather than still filling in. */
         const val MAX_SHORT_DECODE_ATTEMPTS = 3
+
+        /** Uncaught throws before a track is written off rather than retried. */
+        const val MAX_THROW_ATTEMPTS = 3
+
+        /** Null open/decode passes before the copy is burnt rather than deferred. */
+        const val MAX_OPEN_FAIL_ATTEMPTS = 3
+
+        /**
+         * Ticks with no readable duration before a track is recorded empty.
+         * Generous: stream metadata routinely arrives seconds after playback
+         * starts, and each attempt costs one container-duration query, not a
+         * decode.
+         */
+        const val MAX_NO_DURATION_ATTEMPTS = 10
+
+        /**
+         * How long a job may occupy the single worker before it is reported
+         * stuck. Detection only, never preemption: MediaCodec calls are not
+         * reliably interruptible and the model sessions assume jobs never run
+         * concurrently, so killing the thread would trade a slow analysis for
+         * a leaked codec and a corrupted session.
+         */
+        const val STUCK_JOB_TIMEOUT_MS = 90_000L
 
         /**
          * Clean-slate retries per rendition. One: a discard is worth doing when
