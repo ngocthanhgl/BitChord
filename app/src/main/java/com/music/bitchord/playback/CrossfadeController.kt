@@ -1,7 +1,7 @@
 package com.music.bitchord.playback
 
 import android.os.SystemClock
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
@@ -674,7 +674,7 @@ class CrossfadeController(
             "|blocked=${plan.blocked}|policy=${plan.policyReasons.joinToString(",")}"
         if (verdict != lastPlanVerdict) {
             lastPlanVerdict = verdict
-            Log.d(
+            TrackLog.d(
                 TAG,
                 "plan ${currentItem.mediaId}->${nextItem.mediaId}: $verdict " +
                     "bpm=${currentAnalysis.bpm}/${nextAnalysis.bpm} " +
@@ -1041,7 +1041,7 @@ class CrossfadeController(
         val items = (0 until out.mediaItemCount).map { out.getMediaItemAt(it) }
         queuedItemCount = items.size
 
-        Log.d(
+        TrackLog.d(
             TAG,
             "arm ${if (smart) "smart" else "standard"} fade=${fade}ms end=${endMs}ms " +
                 "cue=${incomingCueTimeMs}ms rate=$incomingPlaybackRate at=${out.currentPosition}ms " +
@@ -1144,7 +1144,7 @@ class CrossfadeController(
         // v2 §7d: the nerd-stats line shows the grid that won, if any.
         AppSettings.sharedHalfTimeBpm.value = render.sharedBpm.takeIf { it > 0 }
 
-        Log.d(TAG, "handoff at cue=${into.currentPosition}ms out=${out.currentPosition}ms")
+        TrackLog.d(TAG, "handoff at cue=${into.currentPosition}ms out=${out.currentPosition}ms")
 
         // Before the swap, so the listener follows the session rather than
         // firing on a player this class is about to demote.
@@ -1193,7 +1193,7 @@ class CrossfadeController(
         if (appended.isEmpty()) return
         into.addMediaItems(appended)
         queuedItemCount = out.mediaItemCount
-        Log.d(TAG, "reconciled ${appended.size} appended item(s) onto the incoming player")
+        TrackLog.d(TAG, "reconciled ${appended.size} appended item(s) onto the incoming player")
     }
 
     /**
@@ -1335,7 +1335,7 @@ class CrossfadeController(
      */
     private fun bail() {
         if (phase == Phase.IDLE || phase == Phase.BAILING) return
-        Log.d(TAG, "bail from $phase")
+        TrackLog.d(TAG, "bail from $phase")
         AppSettings.smartMixInProgress.value = false
         AppSettings.sharedHalfTimeBpm.value = null
         if (!handedOff) {
@@ -1358,7 +1358,7 @@ class CrossfadeController(
 
     private fun finish() {
         if (phase != Phase.IDLE) {
-            Log.d(TAG, "finish from $phase")
+            TrackLog.d(TAG, "finish from $phase")
             // Stamped under this guard rather than beside the assignment at the
             // bottom, because this function is idempotent and gets called with
             // nothing in flight: marking every one of those as a transition
@@ -1868,7 +1868,7 @@ class CrossfadeController(
         val full = "$key|$msg"
         if (full != lastGuardLog) {
             lastGuardLog = full
-            Log.d(TAG, msg)
+            TrackLog.d(TAG, msg)
         }
     }
 

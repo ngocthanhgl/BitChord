@@ -1,7 +1,7 @@
 package com.music.bitchord.playback.smart
 
 import android.content.Context
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -84,7 +84,7 @@ class AnalysisStore(private val context: Context) {
                 // A half-written or outdated file is worth exactly nothing and
                 // costs a re-analysis to replace, so it goes rather than being
                 // returned as a partly-filled result.
-                Log.w(TAG, "Discarding unreadable analysis for $trackId", it)
+                TrackLog.w(TAG, "Discarding unreadable analysis for $trackId", it)
                 file.delete()
                 known[trackId] = false
             }
@@ -107,7 +107,7 @@ class AnalysisStore(private val context: Context) {
             temporary.writeText(json.encodeToString(Stored.serializer(), Stored.of(analysis)))
             if (!temporary.renameTo(file)) temporary.delete()
             known[trackId] = true
-        }.onFailure { Log.w(TAG, "Could not store analysis for $trackId", it) }
+        }.onFailure { TrackLog.w(TAG, "Could not store analysis for $trackId", it) }
         prune()
     }
 

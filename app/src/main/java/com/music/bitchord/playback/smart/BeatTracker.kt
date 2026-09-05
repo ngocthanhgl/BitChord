@@ -25,7 +25,7 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import java.io.File
 import java.nio.FloatBuffer
 import kotlin.math.abs
@@ -88,7 +88,7 @@ class BeatTracker(private val context: Context) {
                 }
                 OrtEnvironment.getEnvironment().createSession(file.absolutePath, options)
                     .also { session = it }
-            }.onFailure { Log.w(TAG, "Beat model unavailable; falling back to no grid", it) }
+            }.onFailure { TrackLog.w(TAG, "Beat model unavailable; falling back to no grid", it) }
                 .getOrNull()
         }
     }
@@ -109,7 +109,7 @@ class BeatTracker(private val context: Context) {
         val downbeatLogits = FloatArray(spectrogram.frames)
         val inferStarted = System.currentTimeMillis()
         if (!infer(active, spectrogram, beatLogits, downbeatLogits)) return null
-        Log.d(
+        TrackLog.d(
             TAG,
             "mel ${melMs}ms (${spectrogram.frames} frames) " +
                 "infer ${System.currentTimeMillis() - inferStarted}ms",
@@ -194,7 +194,7 @@ class BeatTracker(private val context: Context) {
             start += stride
         }
         true
-    }.onFailure { Log.w(TAG, "Beat inference failed", it) }.getOrDefault(false)
+    }.onFailure { TrackLog.w(TAG, "Beat inference failed", it) }.getOrDefault(false)
 
     fun release() {
         synchronized(lock) {

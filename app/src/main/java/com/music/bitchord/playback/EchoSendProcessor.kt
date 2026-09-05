@@ -1,6 +1,6 @@
 package com.music.bitchord.playback
 
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import androidx.media3.common.C
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.BaseAudioProcessor
@@ -66,7 +66,7 @@ class EchoSendProcessor : BaseAudioProcessor() {
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT || inputAudioFormat.channelCount < 1) {
-            Log.w(
+            TrackLog.w(
                 TAG,
                 "Echo send inactive: encoding=${inputAudioFormat.encoding} " +
                     "channels=${inputAudioFormat.channelCount} is not 16-bit PCM",

@@ -26,7 +26,7 @@ package com.music.bitchord.playback.smart
 import android.content.Context
 import android.media.MediaDataSource
 import android.net.Uri
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import androidx.media3.common.util.UnstableApi
 import com.music.bitchord.playback.AudioCache
 import java.util.concurrent.ConcurrentHashMap
@@ -204,16 +204,21 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     private inner class AnalysisJob(
         val lane: Lane,
         val priority: Int,
+        val track: String?,
         val block: () -> Unit,
     ) : Runnable, Comparable<AnalysisJob> {
         val seq = jobSeq.getAndIncrement()
         override fun run() {
             currentLane.set(lane)
+            // File every line of this job against its track, so a track's
+            // story reads whole in the session log (see TrackLog).
+            TrackLog.setWorking(track)
             lane.inFlight.incrementAndGet()
             try {
                 block()
             } finally {
                 currentLane.remove()
+                TrackLog.setWorking(null)
                 // Lane-local idle release: the old global `running.isEmpty()`
                 // close could land while the other lane was mid-inference.
                 // Zero here means nothing submitted or running on this lane,
@@ -249,13 +254,14 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         laneThreadFactory("bitchord-smart-low"),
     )
 
-    private fun submit(priority: Int, block: () -> Unit) {
+    private fun submit(priority: Int, trackId: String? = null, block: () -> Unit) {
         // Priority is the lane selector now, not just queue order: the next
         // track's analysis must never queue behind a backlog of normals.
         // RejectedExecutionException can only come from shutdown (see
         // [release]), and at that point the process is going away anyway.
+        // The track id files the job's log lines against their track.
         val lane = if (priority >= PRIORITY_NEXT) highLane else lowLane
-        (if (priority >= PRIORITY_NEXT) highExecutor else lowExecutor).execute(AnalysisJob(lane, priority, block))
+        (if (priority >= PRIORITY_NEXT) highExecutor else lowExecutor).execute(AnalysisJob(lane, priority, trackId, block))
     }
 
     /**
@@ -280,9 +286,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // caller, so a track with nothing stored is looked for once per session
         // rather than on every tick.
         if (!restoreAttempted.add(trackId)) return
-        submit(priority) {
+        submit(priority, trackId) {
             val stored = store.load(trackId) ?: return@submit
-            Log.d(TAG, "Restored analysis for $trackId: bpm=${stored.bpm} conf=${stored.beatConfidence}")
+            TrackLog.d(TAG, "Restored analysis for $trackId: bpm=${stored.bpm} conf=${stored.beatConfidence}")
             results.putIfAbsent(trackId, stored)
         }
     }
@@ -422,12 +428,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             System.currentTimeMillis() - started > STUCK_JOB_TIMEOUT_MS &&
             stuckLogged.add(trackId)
         ) {
-            Log.e(TAG, "Analysis job for $trackId stuck over ${STUCK_JOB_TIMEOUT_MS}ms on its lane")
+            TrackLog.e(TAG, "Analysis job for $trackId stuck over ${STUCK_JOB_TIMEOUT_MS}ms on its lane")
         }
         if (!running.add(trackId)) return
         jobStartMs[trackId] = System.currentTimeMillis()
 
-        submit(priority) {
+        submit(priority, trackId) {
             try {
                 // [restoreOnce] queues onto the lane executors, so a stored result for this track has landed by now if there
                 // was one — but the decision to get here was taken a tick
@@ -461,7 +467,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                         // isn't re-decoded on every tick for the rest of the
                         // session. Any provisional head result already published
                         // stays: a partial analysis beats an empty one.
-                        Log.w(TAG, "Giving up on $trackId after $MAX_SHORT_DECODE_ATTEMPTS short decodes")
+                        TrackLog.w(TAG, "Giving up on $trackId after $MAX_SHORT_DECODE_ATTEMPTS short decodes")
                         if (trackId !in provisional) {
                             results[trackId] = TrackAnalysis(
                                 status = TrackAnalysis.STATUS_READY,
@@ -485,7 +491,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 // nobody's parent takes the whole app down for work whose
                 // entire failure mode is meant to be "this track goes
                 // unanalysed".
-                Log.w(TAG, "Analysis of $trackId failed", error)
+                TrackLog.w(TAG, "Analysis of $trackId failed", error)
                 // A failed head pass records nothing: the whole-track pass reads
                 // a different, complete file and deserves its own attempt.
                 // [headWorthTrying] has already made sure the head is not tried
@@ -499,7 +505,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     // from a released state rather than a dying one.
                     val strikes = throwStrikes.merge(trackId, 1, Int::plus)!!
                     if (strikes >= MAX_THROW_ATTEMPTS) {
-                        Log.w(TAG, "Giving up on $trackId after $strikes thrown attempts", error)
+                        TrackLog.w(TAG, "Giving up on $trackId after $strikes thrown attempts", error)
                         throwStrikes.remove(trackId)
                         results[trackId] = TrackAnalysis(
                             status = TrackAnalysis.STATUS_READY,
@@ -508,7 +514,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                         )
                         provisional.remove(trackId)
                     } else {
-                        Log.d(TAG, "Deferring $trackId after throw (attempt $strikes)", error)
+                        TrackLog.d(TAG, "Deferring $trackId after throw (attempt $strikes)", error)
                     }
                 }
             } finally {
@@ -598,7 +604,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // invisible otherwise, which is exactly how the first version of
             // this shipped doing nothing at all.
             if (headSkipLogged.add("$trackId@${candidate.key}")) {
-                Log.d(
+                TrackLog.d(
                     TAG,
                     "Head pass for $trackId waiting: ${prefix / 1024}kB cached of " +
                         "${needed / 1024}kB needed (rendition ${candidate.key})",
@@ -679,11 +685,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 // for a head pass to do nothing — a partial container the
                 // extractor will not read a duration out of — and while it was
                 // silent the whole path looked like it had never run.
-                Log.d(TAG, "Head rendition ${rendition.key} for $trackId has no readable duration yet")
+                TrackLog.d(TAG, "Head rendition ${rendition.key} for $trackId has no readable duration yet")
                 return null
             }
             if (abs(length - expected) > RENDITION_DURATION_TOLERANCE) {
-                Log.d(
+                TrackLog.d(
                     TAG,
                     "Head rendition ${rendition.key} rejected for $trackId: " +
                         "${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected",
@@ -696,7 +702,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val window = BeatTracker.WINDOW_SECONDS
         val head = region(::openSource, 0.0, window, features = null, deriveFeatures = true)
             ?: run {
-                Log.d(TAG, "Head pass for $trackId could not decode rendition ${rendition.key}")
+                TrackLog.d(TAG, "Head pass for $trackId could not decode rendition ${rendition.key}")
                 return null
             }
         // What was decoded, not what was asked for: the source stops where the
@@ -705,17 +711,17 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // one, and the planner cannot see the difference — so it is refused here
         // and the next attempt gets more of the file.
         if (head.seconds < MIN_HEAD_SECONDS) {
-            Log.d(TAG, "Head pass for $trackId decoded only ${"%.1f".format(Locale.ROOT, head.seconds)}s; too short")
+            TrackLog.d(TAG, "Head pass for $trackId decoded only ${"%.1f".format(Locale.ROOT, head.seconds)}s; too short")
             return null
         }
         val grid = head.grid
         val entry = head.features
         if (grid == null && entry == null) {
-            Log.d(TAG, "Head pass for $trackId produced nothing usable")
+            TrackLog.d(TAG, "Head pass for $trackId produced nothing usable")
             return null
         }
 
-        Log.d(
+        TrackLog.d(
             TAG,
             "Analysed head of $trackId: bpm=${grid?.bpm ?: entry?.bpm} " +
                 "conf=${grid?.beatConfidence ?: entry?.beatConfidence} " +
@@ -791,7 +797,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // made, and the worst case degrades from "never analysed" to "a grid
             // measured off the only audio we have".
             return complete.singleOrNull()?.also {
-                Log.d(
+                TrackLog.d(
                     TAG,
                     "Analysing $trackId from its only cached rendition ${it.key}; " +
                         "no duration to check it against",
@@ -804,7 +810,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 .use(AudioDecoder::containerDurationSeconds) ?: continue
             if (length <= 0) continue
             if (abs(length - expected) > RENDITION_DURATION_TOLERANCE) {
-                Log.d(
+                TrackLog.d(
                     TAG,
                     "Rendition ${candidate.key} rejected for $trackId: " +
                         "${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected",
@@ -812,7 +818,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 continue
             }
             if (candidate.key != cache.cacheKeyOf(uri)) {
-                Log.d(
+                TrackLog.d(
                     TAG,
                     "Analysing $trackId from lighter rendition ${candidate.key} " +
                         "(${candidate.contentLength / 1024}kB)",
@@ -916,7 +922,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // while a confidently wrong one does not degrade at all.
         val decodedSeconds = if (pcm.sampleRate > 0) pcm.samples.size / pcm.sampleRate else 0.0
         if (decodedSeconds < effectiveDuration * MIN_DECODED_FRACTION) {
-            Log.w(
+            TrackLog.w(
                 TAG,
                 "Analysis of $trackId refused: ${copy.key} decoded " +
                     "${"%.1f".format(Locale.ROOT, decodedSeconds)}s of a " +
@@ -1005,11 +1011,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // attempt costs one container-duration query, not a decode.
             val strikes = noDurationStrikes.merge(trackId, 1, Int::plus)!!
             if (strikes >= MAX_NO_DURATION_ATTEMPTS) {
-                Log.w(TAG, "Giving up on $trackId: no readable duration after $strikes attempts")
+                TrackLog.w(TAG, "Giving up on $trackId: no readable duration after $strikes attempts")
                 noDurationStrikes.remove(trackId)
                 return WholeTrack(empty(trackId, 0.0))
             }
-            Log.d(TAG, "Deferring $trackId: ${copy.key} has no readable duration yet (attempt $strikes)")
+            TrackLog.d(TAG, "Deferring $trackId: ${copy.key} has no readable duration yet (attempt $strikes)")
             return WholeTrack(null)
         }
 
@@ -1040,12 +1046,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // retry first: there is no second copy of a file, and a single
             // reopen is what separates "still being written" from "unreadable".
             if (copy.rendition == null && localReopenTried.add(copy.key)) {
-                Log.d(TAG, "Retrying local $trackId once with a fresh open")
+                TrackLog.d(TAG, "Retrying local $trackId once with a fresh open")
                 return WholeTrack(null)
             }
             val strikes = openFailStrikes.merge(trackId, 1, Int::plus)!!
             if (strikes < MAX_OPEN_FAIL_ATTEMPTS) {
-                Log.d(TAG, "Deferring $trackId: null open/decode on ${copy.key} (attempt $strikes)")
+                TrackLog.d(TAG, "Deferring $trackId: null open/decode on ${copy.key} (attempt $strikes)")
                 return WholeTrack(null)
             }
             openFailStrikes.remove(trackId)
@@ -1070,7 +1076,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // head is what a track uses when it is the *incoming* side of a different transition.
         val leading = tailGrid ?: headGrid
 
-        Log.d(
+        TrackLog.d(
             TAG,
             "Analysed $trackId: bpm=${leading?.bpm ?: features.bpm} " +
                 "conf=${leading?.beatConfidence ?: features.beatConfidence} " +
@@ -1291,7 +1297,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 // were reported identically, which cost a round of guessing:
                 // this one is the extractor refusing the container outright, so
                 // the bytes are wrong or not enough of them are there to parse.
-                Log.d(TAG, "Region [$startSeconds, $endSeconds) would not open")
+                TrackLog.d(TAG, "Region [$startSeconds, $endSeconds) would not open")
                 return null
             }
         val (stereo, actualStart) = decoded
@@ -1299,7 +1305,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // And this one is a container that parsed fine and yielded under a
             // second of audio — a decode that started and ran out, not one that
             // never started.
-            Log.d(TAG, "Region [$startSeconds, $endSeconds) decoded ${stereo.left.size} frames; too few")
+            TrackLog.d(TAG, "Region [$startSeconds, $endSeconds) decoded ${stereo.left.size} frames; too few")
             return null
         }
 
@@ -1325,7 +1331,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     ?.let { MelSpectrogram.resample(it, MelSpectrogram.sampleRate, PitchTracker.SAMPLE_RATE.toDouble()) }
                     ?.let { lane.pitch.track(it, offsetSeconds = actualStart) }
             }.getOrElse { error ->
-                Log.w(TAG, "Pitch pass degraded to none", error)
+                TrackLog.w(TAG, "Pitch pass degraded to none", error)
                 null
             }
         } else {

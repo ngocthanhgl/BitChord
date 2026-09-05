@@ -125,6 +125,11 @@ fun SongActionsSheet(
      */
     onCopyLog: (() -> Unit)? = null,
     /**
+     * Writes the whole session log to Downloads. Same player-only rule as
+     * [onCopyLog]: the full story is only meaningful beside the player.
+     */
+    onSaveLog: (() -> Unit)? = null,
+    /**
      * True while a lookup for this track's album/artist ids is still in
      * flight, so it isn't yet known whether "Open album" and "Open artist"
      * belong on this sheet at all. Only the player ever opens a sheet before
@@ -229,6 +234,9 @@ fun SongActionsSheet(
         // the one row here nobody reaches for by accident.
         onCopyLog?.let {
             ActionRow(Icons.Rounded.BugReport, "Copy Log", accent = palette.accent, onClick = it)
+        }
+        onSaveLog?.let {
+            ActionRow(Icons.Rounded.Save, "Save Log to Downloads", accent = palette.accent, onClick = it)
         }
         Spacer(Modifier.height(24.dp))
     }

@@ -22,7 +22,7 @@
 
 package com.music.bitchord.playback.smart
 
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -1637,7 +1637,7 @@ internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: 
     if (!mixset || plan.blocked || plan.transitionStart >= MIXSET_MIN_FIRE_SECONDS) return plan
     val delta = MIXSET_MIN_FIRE_SECONDS - plan.transitionStart
     val end = min(plan.transitionEnd + delta, max(length - 1.0, MIXSET_MIN_FIRE_SECONDS + 1.0))
-    Log.d(
+    TrackLog.d(
         PLANNER_TAG,
         "mixset fire-floor shift +${"%.1f".format(delta)}s " +
             "start=${"%.1f".format(plan.transitionStart)}->${"%.1f".format(MIXSET_MIN_FIRE_SECONDS)} " +
@@ -1803,7 +1803,7 @@ fun planTransition(
         // v2 §9: a weak pair never blends — the heavy clash gets a forced
         // echo-out, a weak HALF_TIME lock a short 8-bar blend (§9 over §5c:
         // keep beat-sync, only shorten the overlap).
-        Log.d(
+        TrackLog.d(
             PLANNER_TAG,
             "Low score ${"%.2f".format(proxyScore.overall)} " +
                 "genres=${genreClass(analysis)}/${genreClass(nextAnalysis)} " +

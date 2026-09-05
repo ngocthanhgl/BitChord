@@ -3356,6 +3356,16 @@ class PlaybackService : MediaSessionService() {
         // is not a reason to leave either behind.
         spare?.release()
         spare = null
+        // Session log out to Downloads while the process is still alive to do
+        // it: flush+close are synchronous (buffered, milliseconds), the
+        // MediaStore copy rides a background thread best-effort. If the
+        // process dies first, the internal file survives for a manual export.
+        TrackLog.closeSessionFile()
+        CoroutineScope(Dispatchers.IO).launch {
+            TrackLog.exportSessionFile(this@PlaybackService)?.let { where ->
+                TrackLog.d("BitChord", "session log exported to $where")
+            }
+        }
         super.onDestroy()
     }
 

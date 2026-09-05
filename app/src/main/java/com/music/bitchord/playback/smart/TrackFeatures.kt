@@ -21,7 +21,7 @@
 
 package com.music.bitchord.playback.smart
 
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -58,10 +58,10 @@ object TrackFeatures {
     fun analyze(samples: FloatArray, durationSeconds: Double): Features? {
         if (!available || samples.isEmpty()) return null
         val json = runCatching { nativeAnalyze(samples, sampleRate, durationSeconds) }
-            .onFailure { Log.w(TAG, "Native analysis failed", it) }
+            .onFailure { TrackLog.w(TAG, "Native analysis failed", it) }
             .getOrNull() ?: return null
         return runCatching { parse(JSONObject(json)) }
-            .onFailure { Log.w(TAG, "Could not parse analysis output", it) }
+            .onFailure { TrackLog.w(TAG, "Could not parse analysis output", it) }
             .getOrNull()
     }
 

@@ -175,7 +175,9 @@ import com.music.bitchord.ui.theme.rememberArtworkPalette
 import com.music.bitchord.ui.theme.SystemBarIcons
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
@@ -2109,6 +2111,23 @@ private fun BitChordApp(
                                     context,
                                     "Log copied · ${text.lineSequence().count()} lines",
                                     Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                    onSaveLog = if (fromPlayer) {
+                        {
+                            songActions = null
+                            scope.launch {
+                                val where = withContext(Dispatchers.IO) {
+                                    TrackLog.exportSessionFile(context)
+                                }
+                                Toast.makeText(
+                                    context,
+                                    where ?: "Log export failed",
+                                    Toast.LENGTH_LONG,
                                 ).show()
                             }
                         }

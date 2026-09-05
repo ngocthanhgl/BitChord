@@ -4,7 +4,7 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 import java.io.File
 import java.nio.FloatBuffer
 import kotlin.math.exp
@@ -83,7 +83,7 @@ class PitchTracker(private val context: Context) {
                 }
                 OrtEnvironment.getEnvironment().createSession(file.absolutePath, options)
                     .also { session = it }
-            }.onFailure { Log.w(TAG, "CREPE model unavailable; YIN fallback answers", it) }
+            }.onFailure { TrackLog.w(TAG, "CREPE model unavailable; YIN fallback answers", it) }
                 .getOrNull()
         }
     }
@@ -131,7 +131,7 @@ class PitchTracker(private val context: Context) {
             }
             start += batch
         }
-        Log.d(TAG, "pitch via crepe: $frameCount frames")
+        TrackLog.d(TAG, "pitch via crepe: $frameCount frames")
         return PitchCurve(times, f0, conf)
     }
 
@@ -258,7 +258,7 @@ class PitchTracker(private val context: Context) {
                 pos += YIN_HOP
             }
             if (times.isEmpty()) return null
-            Log.d(TAG, "pitch via yin: ${times.size} frames")
+            TrackLog.d(TAG, "pitch via yin: ${times.size} frames")
             return PitchCurve(times, f0, conf)
         }
 

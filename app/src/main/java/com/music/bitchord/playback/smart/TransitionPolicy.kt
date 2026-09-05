@@ -27,7 +27,7 @@ import kotlin.math.log2
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
-import android.util.Log
+import com.music.bitchord.data.TrackLog
 
 /**
  * The confidence-aware transition policy.
@@ -54,7 +54,7 @@ private fun logMixsetAnchorOnce(trackId: String, msg: String) {
     val full = "$trackId|$msg"
     if (full != lastMixsetAnchorLog) {
         lastMixsetAnchorLog = full
-        Log.d(POLICY_TAG, msg)
+        TrackLog.d(POLICY_TAG, msg)
     }
 }
 

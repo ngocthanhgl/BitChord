@@ -1,6 +1,10 @@
 package com.music.bitchord.data
 
+import android.content.ContentValues
+import android.content.Context
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import com.music.bitchord.BuildConfig
 import com.music.bitchord.data.model.Song
@@ -8,6 +12,8 @@ import com.music.bitchord.data.sources.SourceResolver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.withContext
+import java.io.BufferedWriter
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -69,32 +75,32 @@ object TrackLog {
 
     fun d(tag: String, message: String, about: String? = working.get()) {
         if (BuildConfig.DEBUG) Log.d(tag, message)
-        record('D', message, about)
+        record('D', "[$tag] $message", about)
     }
 
     fun i(tag: String, message: String, about: String? = working.get()) {
         if (BuildConfig.DEBUG) Log.i(tag, message)
-        record('I', message, about)
+        record('I', "[$tag] $message", about)
     }
 
     fun w(tag: String, message: String, about: String? = working.get()) {
         if (BuildConfig.DEBUG) Log.w(tag, message)
-        record('W', message, about)
+        record('W', "[$tag] $message", about)
     }
 
     fun w(tag: String, message: String, error: Throwable, about: String? = working.get()) {
         if (BuildConfig.DEBUG) Log.w(tag, message, error)
-        record('W', "$message\n${error.stackTraceToString()}", about)
+        record('W', "[$tag] $message\n${error.stackTraceToString()}", about)
     }
 
     fun e(tag: String, message: String, about: String? = working.get()) {
         if (BuildConfig.DEBUG) Log.e(tag, message)
-        record('E', message, about)
+        record('E', "[$tag] $message", about)
     }
 
     fun e(tag: String, message: String, error: Throwable, about: String? = working.get()) {
         if (BuildConfig.DEBUG) Log.e(tag, message, error)
-        record('E', "$message\n${error.stackTraceToString()}", about)
+        record('E', "[$tag] $message\n${error.stackTraceToString()}", about)
     }
 
     // ── Whose line is it ────────────────────────────────────────────────────
@@ -121,6 +127,16 @@ object TrackLog {
      */
     fun about(id: String?): CoroutineContext = working.asContextElement(id)
 
+    /**
+     * Plain-thread twin of [about]: pins the calling thread's subsequent
+     * lines to [id] until cleared with `setWorking(null)`. For worker
+     * threads that never enter a coroutine — the analysis lanes set this to
+     * the track under analysis so a track's story files itself.
+     */
+    fun setWorking(id: String?) {
+        working.set(id)
+    }
+
     private class Line(val at: Long, val level: Char, val text: String, val track: String?)
 
     private val lines = ArrayDeque<Line>()
@@ -140,12 +156,137 @@ object TrackLog {
         } else {
             message
         }
+        val at = System.currentTimeMillis()
         synchronized(lines) {
-            lines.addLast(Line(System.currentTimeMillis(), level, text, about))
+            lines.addLast(Line(at, level, text, about))
             held += text.length
             while (held > MAX_HELD_CHARS && lines.isNotEmpty()) {
                 held -= lines.removeFirst().text.length
             }
+            appendFile("${CLOCK.format(Date(at))} $level $text")
+        }
+    }
+
+    // ── Session file: start-to-close on disk ───────────────────────────────
+
+    /**
+     * Continuous on-disk twin of the ring above: every recorded line is
+     * appended to an internal session file from [init] (process start) until
+     * [closeSessionFile], so a full start-to-close log survives to be
+     * exported to Downloads — no adb, no repro-with-debugger dance.
+     *
+     * Bounded by rotation, not by hope: past [MAX_FILE_BYTES] the file rolls
+     * to one spare and a fresh one opens with a continuation marker.
+     */
+    private var sessionFile: File? = null
+    private var fileOut: BufferedWriter? = null
+    private var fileBytes = 0L
+    private var fileLinesSinceFlush = 0
+
+    /** Must be called once from `Application.onCreate`, before anything logs. */
+    fun init(context: Context) {
+        synchronized(lines) {
+            if (fileOut != null) return
+            val dir = File(context.filesDir, SESSION_DIR).apply { mkdirs() }
+            val name = "bitchord-session-${FILE_STAMP.format(Date())}.log"
+            sessionFile = File(dir, name)
+            fileOut = runCatching { sessionFile!!.bufferedWriter(Charsets.UTF_8, 8192) }.getOrNull()
+            fileBytes = 0L
+            fileLinesSinceFlush = 0
+            fileOut?.let {
+                val header = "BitChord session log — $name\n" +
+                    "build: ${BuildConfig.VERSION_NAME} (${BuildConfig.BUILD_TYPE})\n" +
+                    "device: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n" +
+                    "started: ${CLOCK.format(Date())}\n"
+                runCatching {
+                    it.write(header)
+                    fileBytes += header.toByteArray(Charsets.UTF_8).size
+                }
+            }
+        }
+    }
+
+    private fun appendFile(formatted: String) {
+        val out = fileOut ?: return
+        runCatching {
+            val bytes = (formatted + "\n").toByteArray(Charsets.UTF_8)
+            if (fileBytes + bytes.size > MAX_FILE_BYTES) rotateSessionFile()
+            fileOut?.let {
+                it.write(formatted)
+                it.newLine()
+                fileBytes += bytes.size
+                if (++fileLinesSinceFlush >= FLUSH_EVERY_LINES) {
+                    it.flush()
+                    fileLinesSinceFlush = 0
+                }
+            }
+        }
+    }
+
+    private fun rotateSessionFile() {
+        runCatching {
+            fileOut?.flush()
+            fileOut?.close()
+            val current = sessionFile ?: return
+            File(current.parent, current.name + ".1").delete()
+            current.renameTo(File(current.parent, current.name + ".1"))
+            fileOut = current.bufferedWriter(Charsets.UTF_8, 8192)
+            fileBytes = 0L
+            fileLinesSinceFlush = 0
+            fileOut?.write("…continued after rotation at ${CLOCK.format(Date())}\n")
+        }
+    }
+
+    fun closeSessionFile() {
+        synchronized(lines) {
+            runCatching {
+                fileOut?.flush()
+                fileOut?.close()
+            }
+            fileOut = null
+        }
+    }
+
+    /**
+     * Copies the current session file (plus its rotated spare, if any) to
+     * Downloads and returns the display path, or null when the export fails.
+     * Safe to call mid-session: the writer is flushed first and left open.
+     */
+    fun exportSessionFile(context: Context): String? {
+        synchronized(lines) {
+            runCatching { fileOut?.flush() }
+            val current = sessionFile?.takeIf { it.exists() } ?: return null
+            val spare = File(current.parent, current.name + ".1").takeIf { it.exists() }
+            val name = current.name
+            return runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/")
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val uri = context.contentResolver.insert(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values,
+                    ) ?: return null
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        spare?.inputStream()?.copyTo(out)
+                        current.inputStream().copyTo(out)
+                    }
+                    values.clear()
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    context.contentResolver.update(uri, values, null, null)
+                    "Downloads/$name"
+                } else {
+                    val target = File(
+                        context.getExternalFilesDir(null),
+                        "session-logs/$name",
+                    ).apply { parentFile?.mkdirs() }
+                    spare?.copyTo(target, overwrite = true)
+                    current.copyTo(target, overwrite = true)
+                    target.absolutePath
+                }
+            }.getOrNull()
         }
     }
 
@@ -269,6 +410,16 @@ object TrackLog {
 
     /** Roughly the last few tracks' worth, and small enough to hold without thinking about it. */
     private const val MAX_HELD_CHARS = 512_000
+
+    private const val SESSION_DIR = "session-logs"
+
+    /** One spare rotation: a session that logs past this keeps the last ~16 MB on disk, no more. */
+    private const val MAX_FILE_BYTES = 8L * 1024 * 1024
+
+    /** Flush cadence for the session file: crash-safe enough without fsyncing every line. */
+    private const val FLUSH_EVERY_LINES = 100
+
+    private val FILE_STAMP = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
     /** Enough for a stack trace or a search response's opening; not a whole catalogue page. */
     private const val MAX_LINE_CHARS = 2_000
