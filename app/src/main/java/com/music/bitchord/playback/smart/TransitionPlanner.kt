@@ -448,7 +448,7 @@ fun findPlainCutPoint(analysis: TrackAnalysis, scanFrom: Double, contentEnd: Dou
  * voice in T5/C6). For pairs the evidence cannot sync: cut at the gap,
  * not on the grid.
  */
-private fun plainDissolvePlan(
+internal fun plainDissolvePlan(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
     length: Double,
@@ -1664,7 +1664,65 @@ internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: 
  * @param mixset Mixset Mode: the outgoing window becomes ~90 s past the
  *   track's best part and the 80%-play floor below does not apply.
  */
+/**
+ * Minimum audible blend every non-blocked plan must carry. Plans shorter
+ * than this (HARD_CUT 0.1 s, misflagged GAPLESS, LOOP INSTANT-hold, span
+ * collapses) are substituted with a silence-seeking dissolve so no track
+ * ever hard-cuts like a manual Next press.
+ */
+const val MIN_GUARANTEED_BLEND_SECONDS = 4.0
+
 fun planTransition(
+    analysis: TrackAnalysis = TrackAnalysis(),
+    nextAnalysis: TrackAnalysis = TrackAnalysis(),
+    currentTrack: TransitionTrackInfo? = null,
+    nextTrack: TransitionTrackInfo? = null,
+    currentTime: Double = 0.0,
+    duration: Double = 0.0,
+    fadeSeconds: Double = 6.0,
+    minFadeSeconds: Double = 1.0,
+    mode: CrossfadeMode = CrossfadeMode.STANDARD,
+    albumSequential: Boolean = false,
+    mixset: Boolean = false,
+): TransitionPlan {
+    val plan = planTransitionInner(
+        analysis, nextAnalysis, currentTrack, nextTrack, currentTime,
+        duration, fadeSeconds, minFadeSeconds, mode, albumSequential, mixset,
+    )
+    if (plan.blocked) return plan
+    if (plan.fadeSeconds >= MIN_GUARANTEED_BLEND_SECONDS) return plan
+    // A deliberate silence-seeking dissolve is already a mix, even at 2 s.
+    if (plan.type == TransitionType.PLAIN_DISSOLVE) return plan
+    // The queue literally repeats one file: dissolving a track into itself
+    // is a glitch, not a mix.
+    if (currentTrack != null && nextTrack != null && currentTrack.id == nextTrack.id) return plan
+    // A genuine gapless album handoff keeps its 0.12 s cut.
+    if (plan.transitionStyle == TransitionStyle.GAPLESS) return plan
+    val len = max(duration.orZero(), trackDurationSeconds(currentTrack))
+    val nextLen = max(0.0, trackDurationSeconds(nextTrack))
+    val playbackTime = max(0.0, currentTime.orZero())
+    val sub = plainDissolvePlan(
+        analysis, nextAnalysis, len, nextLen, playbackTime, mixset,
+        plan.policyReasons.ifEmpty { listOf("instant-to-dissolve-floor") },
+    )
+    if (sub.fadeSeconds >= MIN_GUARANTEED_BLEND_SECONDS) return sub
+    // The dissolve itself sits on a 2 s gap: stretch the window back so the
+    // substituted blend still honours the floor instead of reintroducing a
+    // short cut through the back door.
+    val extendedStart = max(0.0, sub.transitionEnd - MIN_GUARANTEED_BLEND_SECONDS)
+    val extendedFade = sub.transitionEnd - extendedStart
+    return sub.copy(
+        shouldStart = playbackTime >= extendedStart,
+        transitionStart = extendedStart,
+        fadeSeconds = extendedFade,
+        handoffStartSeconds = extendedStart,
+        handoffDuration = extendedFade,
+        overlapSeconds = extendedFade,
+        reason = "instant-to-dissolve-floor",
+    )
+}
+
+private fun planTransitionInner(
     analysis: TrackAnalysis = TrackAnalysis(),
     nextAnalysis: TrackAnalysis = TrackAnalysis(),
     currentTrack: TransitionTrackInfo? = null,

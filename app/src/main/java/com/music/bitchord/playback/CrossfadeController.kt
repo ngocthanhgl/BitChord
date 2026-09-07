@@ -25,6 +25,7 @@ import com.music.bitchord.playback.smart.TransitionTrackInfo
 import com.music.bitchord.playback.smart.TransitionType
 import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
+import com.music.bitchord.playback.smart.plainDissolvePlan
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -833,8 +834,19 @@ class CrossfadeController(
 
         val fade = plan.fadeMs
         if (fade <= 0L) {
-            logGuardOnce("smart", "no arm: plan fade is 0 (anchor=${plan.transitionStart})")
-            return
+            // The planner floor above guarantees a non-blocked plan carries a
+            // real blend; if one still arrives with no fade, rebuild it as a
+            // dissolve here instead of letting the track hard-cut at its end.
+            logGuardOnce("smart", "no fade in plan (anchor=${plan.transitionStart}), rebuilding dissolve")
+            plan = plainDissolvePlan(
+                currentAnalysis,
+                nextAnalysis,
+                duration / 1000.0,
+                nextDuration.takeIf { it > 0L }?.div(1000.0) ?: 0.0,
+                player.currentPosition / 1000.0,
+                mixset,
+                plan.policyReasons.ifEmpty { listOf("controller-dissolve-rebuild") },
+            )
         }
 
         val transitionStartMs = (plan.transitionStart * 1000).roundToLong()
@@ -1240,7 +1252,11 @@ class CrossfadeController(
             ?.minus(incomingCueTimeMs)
             ?.coerceAtLeast(0L)
         val incomingCap = remainingIncoming?.div(3) ?: Long.MAX_VALUE
-        val span = minOf(fadeMs, incomingCap).coerceAtLeast(1L)
+        // A short incoming track (or late cue) shortens the blend but never
+        // vaporises it: below 2 s the ear hears a cut, not a mix. Completion
+        // is still safe — `done` below also fires on the outgoing track
+        // ending, so an over-long span cannot hang the handoff.
+        val span = minOf(fadeMs, incomingCap).coerceAtLeast(2000L)
         val elapsed = (player.currentPosition - incomingCueTimeMs).coerceAtLeast(0L)
         val progress = (elapsed.toFloat() / span).coerceIn(0f, 1f)
 
@@ -1495,10 +1511,11 @@ class CrossfadeController(
             // the incoming one opens dry. The dedicated echo send (P1) rides
             // on top of this; the wash alone already decays, never clashes.
             TransitionStyle.ECHO_REVERB_OUT -> {
-                // Spec finetune §5 heavy clash: the plan carries a reverb freeze
+                // Spec finetune §5 heavy clash: the plan carries a reverb
                 // offset, and the envelope below replaces the P0 wash — the
                 // outgoing track holds full for 3 s, then sinks behind echo
-                // (1.0→0.70 wet) and reverb (→0.75, frozen at +3.5 s) while the
+                // (1.0→0.70 wet) and reverb (→0.75, decaying — freeze removed:
+                // unity-feedback sustain clipped terrifyingly loud) while the
                 // incoming track waits out its delay before ramping in.
                 val freezeAt = render.reverbFreezeAtSec
                 if (freezeAt != null && freezeAt.isFinite()) {
@@ -1506,17 +1523,16 @@ class CrossfadeController(
                     // sized into overlapSeconds, and the rides read it back.
                     val spanSec = render.overlapSeconds.toFloat().coerceAtLeast(1f)
                     val wetRamp = (progress * spanSec / HEAVY_CLASH_WET_RAMP_SEC).coerceIn(0f, 1f)
-                    val frozen = progress * spanSec >= freezeAt.toFloat()
                     filters.outgoing(20000f, 20f)
                     // Spec finetune §5: B enters under a 500 Hz high-pass that
                     // relaxes over 3.5 s from its start (4.5 s into the window),
-                    // so its low end never punches through the frozen tail.
+                    // so its low end never punches through the reverb tail.
                     val bElapsed = progress * spanSec - 4.5f
                     val bOpen = (bElapsed / 3.5f).coerceIn(0f, 1f)
                     filters.incoming(20000f, 500f * (1f - bOpen) + 20f * bOpen)
                     echoFilters.outgoing(HEAVY_CLASH_ECHO_WET * wetRamp, render.echoBeatSeconds.toFloat())
                     echoFilters.incoming(0f, 0f)
-                    reverbFilters.outgoing((render.reverbAmount * wetRamp).toFloat(), frozen)
+                    reverbFilters.outgoing((render.reverbAmount * wetRamp).toFloat(), false)
                     reverbFilters.incoming(0f, false)
                 } else {
                     val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
