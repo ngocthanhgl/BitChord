@@ -1810,7 +1810,7 @@ fun NowPlayingScreen(
                                         ) + (sharedHalfTimeBpm
                                             ?.takeIf { it > 0 }
                                             ?.let { " · shared ${"%.0f".format(it)} BPM" } ?: "")
-                                    )),
+                                    ),
                                     style = nerdStyle,
                                     // Dimmer than the measured line above it: that
                                     // one describes the audio, this one describes
