@@ -81,19 +81,22 @@ class HalfTimeMatrixTest {
     // --- shared-tempo math ---
 
     @Test
-    fun `shared grid is the slower tempo`() {
-        val (shared, rateA, rateB) = halfTimeRates(90.0, 135.0)
-        assertEquals(90.0, shared, 1e-9)
-        assertEquals(1.0, rateA, 1e-9)
-        assertEquals(90.0 / 135.0, rateB, 1e-9)
+    fun `shared grid is the geometric mean`() {
+        // Review v2.1 B7: 90 vs 135 (3:2) split the log distance —
+        // shared = 90·√1.5, A stretches up √1.5, B down to 1/√1.5.
+        val (shared, rateA, rateB) = halfTimeRates(90.0, 135.0, 1.5)
+        assertEquals(90.0 * kotlin.math.sqrt(1.5), shared, 1e-9)
+        assertEquals(kotlin.math.sqrt(1.5), rateA, 1e-9)
+        assertEquals(1.0 / kotlin.math.sqrt(1.5), rateB, 1e-9)
     }
 
     @Test
-    fun `faster outgoing slows down instead`() {
-        val (shared, rateA, rateB) = halfTimeRates(128.0, 85.0)
-        assertEquals(85.0, shared, 1e-9)
-        assertEquals(85.0 / 128.0, rateA, 1e-9)
-        assertEquals(1.0, rateB, 1e-9)
+    fun `both decks share the stretch`() {
+        // 128 vs 85 (~2:3): shared = 128·√(2/3), A down, B up.
+        val (shared, rateA, rateB) = halfTimeRates(128.0, 85.0, 2.0 / 3.0)
+        assertEquals(128.0 * kotlin.math.sqrt(2.0 / 3.0), shared, 1e-9)
+        assertEquals(kotlin.math.sqrt(2.0 / 3.0), rateA, 1e-9)
+        assertEquals(128.0 * kotlin.math.sqrt(2.0 / 3.0) / 85.0, rateB, 1e-9)
     }
 
     @Test

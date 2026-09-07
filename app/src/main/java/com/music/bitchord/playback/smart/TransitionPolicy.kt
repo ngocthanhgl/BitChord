@@ -174,6 +174,12 @@ const val BASS_SWAP_WIDTH_V2 = 0.20
 const val MID_KILL_LP_HZ = 700.0
 /** v2 §7a: virtual mid-kill lower HP entry. */
 const val MID_KILL_HP_HZ = 350.0
+/** Review v2.1 B1: outgoing LP ramp start for the staggered mid-kill. */
+const val MID_KILL_START_HZ = 1200.0
+/** Review v2.1 B1: incoming HP during the staggered overlap window. */
+const val MID_KILL_STAGGERED_HP_HZ = 500.0
+/** Review v2.1 B1: outgoing LP bed after the handoff completes. */
+const val MID_KILL_BED_HZ = 300.0
 
 /** Finetune v1 §1: structural detector thresholds. */
 const val DROP_RMS_MULTIPLIER = 1.25

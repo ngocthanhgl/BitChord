@@ -1206,6 +1206,13 @@ class PlaybackService : MediaLibraryService() {
 
                 override fun outgoing(lowPassHz: Float, highPassHz: Float) =
                     spareFilter.setCutoffs(lowPassHz, highPassHz)
+
+                // Resonance rides the sweep gesture, which spans the handoff:
+                // both decks get it so a role swap mid-sweep never drops the Q.
+                override fun setResonance(q: Float) {
+                    activeFilter.setResonance(q)
+                    spareFilter.setResonance(q)
+                }
             },
             // Same role wiring as the filters: the controller only ever rides
             // sends after the handoff, when the incoming track sits on the

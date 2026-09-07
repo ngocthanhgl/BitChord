@@ -83,17 +83,17 @@ class DissolvePlanTest {
     }
 
     @Test
-    fun halfTimeRates_slowerDeckWins() {
-        // 90 vs 135 (3:2): B slows to A.
-        val (shared, rateA, rateB) = halfTimeRates(90.0, 135.0)
-        assertEquals(90.0, shared, 0.001)
-        assertEquals(1.0, rateA, 0.001)
-        assertEquals(90.0 / 135.0, rateB, 0.001)
-        // 128 vs 85 (~2:3): A slows to B.
-        val (shared2, rateA2, rateB2) = halfTimeRates(128.0, 85.0)
-        assertEquals(85.0, shared2, 0.001)
-        assertEquals(1.0, rateB2, 0.001)
+    fun halfTimeRates_geometricSplit() {
+        // Review v2.1 B7: 90 vs 135 (3:2) — shared = 90·√1.5, symmetric split.
+        val (shared, rateA, rateB) = halfTimeRates(90.0, 135.0, 1.5)
+        assertEquals(90.0 * kotlin.math.sqrt(1.5), shared, 0.001)
+        assertEquals(kotlin.math.sqrt(1.5), rateA, 0.001)
+        assertEquals(1.0 / kotlin.math.sqrt(1.5), rateB, 0.001)
+        // 128 vs 85 (~2:3): shared = 128·√(2/3), A down and B up.
+        val (shared2, rateA2, rateB2) = halfTimeRates(128.0, 85.0, 2.0 / 3.0)
+        assertEquals(128.0 * kotlin.math.sqrt(2.0 / 3.0), shared2, 0.001)
         assertTrue(rateA2 < 1.0)
+        assertTrue(rateB2 > 1.0)
     }
 
     // -- Guaranteed-blend floor: no instant cut survives planTransition ------

@@ -16,8 +16,10 @@ import com.music.bitchord.data.settings.TrackAnalysisState
 import com.music.bitchord.data.settings.TransitionWindow
 import com.music.bitchord.playback.smart.CrossfadeMode
 import com.music.bitchord.playback.smart.BASS_SWAP_WIDTH_V2
-import com.music.bitchord.playback.smart.MID_KILL_HP_HZ
 import com.music.bitchord.playback.smart.MID_KILL_LP_HZ
+import com.music.bitchord.playback.smart.MID_KILL_BED_HZ
+import com.music.bitchord.playback.smart.MID_KILL_STAGGERED_HP_HZ
+import com.music.bitchord.playback.smart.MID_KILL_START_HZ
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
@@ -855,7 +857,14 @@ class CrossfadeController(
         // the plan's own start rather than a fixed offset from track end —
         // an analyzed mix-out anchor can place that start well before the
         // file actually ends.
-        if (remaining > ARM_LEAD_MS) return
+        //
+        // Review v2.1 B5 adaptive lead: no per-track resolve-time metric
+        // exists in the analysis pipeline, so usability is the proxy — an
+        // incoming track not yet measured means its resolution is still in
+        // flight (the slow case from the session log) and gets the full
+        // lead; a measured one arms on the resolved margin.
+        val armLeadMs = if (nextAnalysis?.isUsable == true) ARM_LEAD_RESOLVED_MS else ARM_LEAD_MS
+        if (remaining > armLeadMs) return
 
         if (!begin(
             fade,
@@ -1309,12 +1318,14 @@ class CrossfadeController(
         // and the track leaving, which only exists once both are audible.
         rideFilters(progress)
         // v2 §7d/§11.2: no shelf on the processor, so the "low-shelf +3dB"
-        // accent is a one-tick full-open of the incoming high-pass at each
-        // planned phrase start — a low-end thump exactly on the stretched
-        // downbeat. Applied after rideFilters so it wins for one tick only.
+        // accent is a one-tick dip of the incoming high-pass to 80 Hz at
+        // each planned phrase start — the spec's 16 ms pulse lands on the
+        // next fade tick (~30 ms), which is the finest granularity the
+        // ticker has. Applied after rideFilters so it wins for one tick
+        // only, then the ride re-aims.
         if (emphasisPulseArmed) {
             emphasisPulseArmed = false
-            filters.incoming(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+            filters.incoming(TransitionFilterProcessor.OPEN_HZ, 80f)
         }
 
         // Whichever comes first: the fade running its course, the old track
@@ -1482,13 +1493,28 @@ class CrossfadeController(
      * locked: a pause parks the filter exactly where it parks the fade.
      */
     private fun rideFilters(progress: Float) {
+        // Resonance belongs to the sweep gesture only; every other style
+        // re-parks it so a previous DJ_FILTER transition never leaks Q.
+        if (render.style != TransitionStyle.DJ_FILTER) filters.setResonance(1.0f)
         when (render.style) {
             TransitionStyle.DJ_FILTER -> {
+                // Review v2.1 C1: resonant sweep on the outgoing low-pass.
+                filters.setResonance(TransitionFilterProcessor.FILTER_SWEEP_Q_FACTOR)
                 rideFilterSweep(progress)
                 rideMidKill(progress)
             }
             TransitionStyle.DJ_BLEND ->
-                if (render.bassSwap) rideBassSwap(progress) else rideVocalSeparation(progress)
+                if (render.bassSwap) {
+                    filters.setResonance(1.0f)
+                    rideBassSwap(progress)
+                } else if (render.overlapSeconds > PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS) {
+                    // Review v2.1 C2 (see rideProactiveMidCut).
+                    filters.setResonance(1.0f)
+                    rideProactiveMidCut(progress)
+                } else {
+                    filters.setResonance(1.0f)
+                    rideVocalSeparation(progress)
+                }
             // GAPLESS is an album being played through, where any filtering would
             // be an edit the record didn't ask for — so it stays open whatever
             // the material does.
@@ -1633,27 +1659,74 @@ class CrossfadeController(
      * gets a real sweep) and at least 8 s of overlap (a kill needs room to
      * breathe; short sweeps stay untouched).
      */
+    /**
+     * Review v2.1 B1 staggered handoff: the old schedule cut the outgoing
+     * mids at 0.30 while the incoming mids arrived at 0.50, leaving a ~20 %
+     * null zone with neither track's midrange. Now the outgoing LP ramps
+     * 1200→700 Hz across 0.25–0.45 while the incoming HP is already at
+     * 500 Hz from 0.40, so the mids overlap instead of gaping; the bed
+     * settles at 300 Hz from 0.80, when the outgoing track is nearly gone.
+     */
     private fun rideMidKill(progress: Float) {
         if (render.style != TransitionStyle.DJ_FILTER) return
         if (render.keyScore >= 0.50 || render.overlapSeconds < 8.0) return
         val p = progress.toDouble()
         when {
-            p < 0.30 || p >= 0.70 -> Unit // sweep stands, relax after
-            p < 0.50 -> filters.outgoing(
-                MID_KILL_LP_HZ.toFloat(),
+            p < 0.25 -> Unit // sweep stands
+            p < 0.40 -> filters.outgoing(
+                glide(MID_KILL_START_HZ, MID_KILL_LP_HZ, (p - 0.25) / 0.15).toFloat(),
                 TransitionFilterProcessor.OFF_HZ,
             )
-            else -> {
+            p < 0.65 -> {
                 filters.outgoing(
                     MID_KILL_LP_HZ.toFloat(),
                     TransitionFilterProcessor.OFF_HZ,
                 )
                 filters.incoming(
                     TransitionFilterProcessor.OPEN_HZ,
-                    MID_KILL_HP_HZ.toFloat(),
+                    MID_KILL_STAGGERED_HP_HZ.toFloat(),
                 )
             }
+            p < 0.80 -> {
+                // Incoming already open; outgoing holds the cut bed.
+                filters.outgoing(
+                    MID_KILL_LP_HZ.toFloat(),
+                    TransitionFilterProcessor.OFF_HZ,
+                )
+            }
+            else -> filters.outgoing(
+                MID_KILL_BED_HZ.toFloat(),
+                TransitionFilterProcessor.OFF_HZ,
+            )
         }
+    }
+
+    /**
+     * Review v2.1 C2 proactive mid-cut: long smooth blends (overlap > 16 s)
+     * put two full-range mixes on top of each other with no clash evidence to
+     * trigger the reactive kills. While the handoff crosses (0.30–0.70) the
+     * outgoing LP sits at 600 Hz and the incoming HP at 300 Hz — gentler
+     * than the reactive kill because nothing has proven a collision. Outside
+     * the window the filters open (glided by the processor, never snapped).
+     *
+     * Deviation noted: the review gates this on similar spectral centroids,
+     * but Render carries no centroid fields; overlap length alone is the
+     * gate rather than adding planner fields for it.
+     */
+    private fun rideProactiveMidCut(progress: Float) {
+        val p = progress.toDouble()
+        if (p < 0.30 || p > 0.70) {
+            filters.open()
+            return
+        }
+        filters.outgoing(
+            PROACTIVE_MID_CUT_LP_HZ.toFloat(),
+            TransitionFilterProcessor.OFF_HZ,
+        )
+        filters.incoming(
+            TransitionFilterProcessor.OPEN_HZ,
+            PROACTIVE_MID_CUT_HP_HZ.toFloat(),
+        )
     }
 
     /**
@@ -1737,11 +1810,23 @@ class CrossfadeController(
         val open = TransitionFilterProcessor.OPEN_HZ.toDouble()
         val entry = glide(open, FILTER_ENTRY_HZ, sweep)
         val floor = glide(open, FILTER_FLOOR_HZ, sweep)
+        // Review v2.1 C3: the 0.75 exponent spends the travel where a voice
+        // actually is (2.6 kHz at a fifth in, 1.0 kHz at the midpoint) instead
+        // of burning it in sub-bass — see FILTER_SWEEP_SHAPE's KDoc.
         val cutoff = glide(entry, floor, progress.toDouble().pow(FILTER_SWEEP_SHAPE))
         filters.outgoing(cutoff.toFloat(), TransitionFilterProcessor.OFF_HZ)
+        // Review v2.1 A4 exception: on a key clash the entry starts at the
+        // masking corner and relaxes to the normal entry over the first 25 %
+        // of the overlap; otherwise the bass-only entry applies throughout.
+        val clashMask = render.keyScore < 0.50
+        val entryTop = if (clashMask && progress < 0.25f) {
+            glide(ENTRY_CLASH_HIGH_PASS_HZ, ENTRY_HIGH_PASS_HZ, (progress / 0.25f).toDouble())
+        } else {
+            ENTRY_HIGH_PASS_HZ
+        }
         filters.incoming(
             TransitionFilterProcessor.OPEN_HZ,
-            entryHighPass(progress, sweep, ENTRY_HIGH_PASS_HZ, ENTRY_OPEN_BY),
+            entryHighPass(progress, sweep, entryTop, ENTRY_OPEN_BY),
         )
     }
 
@@ -1955,8 +2040,18 @@ class CrossfadeController(
          * matters, but a cold one has to be resolved and fetched, and a
          * transition that arrives before its incoming track is ready is one that
          * gets dropped.
+         *
+         * Review v2.1 B5: 6000 — a 9097 ms session-log resolution ran ~50 %
+         * past the old 4000. The smart path below uses the full lead only
+         * while the next analysis is still resolving (see the adaptive lead);
+         * an already-measured incoming track arms on the old margin.
          */
-        const val ARM_LEAD_MS = 4_000L
+        const val ARM_LEAD_MS = 6_000L
+        /**
+         * Review v2.1 B5 margin once the incoming track is measured: the
+         * previous lead, kept for the case that needs no resolution at all.
+         */
+        const val ARM_LEAD_RESOLVED_MS = 4_000L
 
         /**
          * States in which a track is measured well enough to be *entered* on.
@@ -2048,22 +2143,30 @@ class CrossfadeController(
         /**
          * Where the incoming track's high-pass starts on a filter ride.
          *
-         * Above the fundamental range of most voices and the body of a snare, so
-         * what arrives first is presence and percussion — enough to hear a track
-         * coming and lock onto its groove, not enough for a second lead vocal.
-         *
-         * 700Hz was that corner while the outgoing sweep was gentler. It no longer
-         * is: the sweep engages at [FILTER_ENTRY_HZ] and is down to 4kHz a tenth
-         * of the way in, so a 700Hz entry left the two tracks sharing very nearly
-         * three octaves — and sharing them from 529Hz up, which is exactly where a
-         * lead vocal's fundamentals sit. 1.2kHz takes about an octave off the
-         * bottom of that shared band, and it is the octave the collision actually
-         * happens in. What is left of the outgoing track then sits *under* the
-         * arriving one rather than inside it, which is what makes the incoming
-         * track read as a layer landing on top of a darkening one instead of a
-         * second voice in the same space.
+         * Review v2.1 A4: 220 Hz — removes only the bass floor, keeps the mids,
+         * so the arriving track never reads as a hollow treble whisper. (Was
+         * 1.2 kHz; the octave-band argument for it is preserved below for the
+         * key-clash case, where ENTRY_CLASH_HIGH_PASS_HZ temporarily restores
+         * the masking.)
          */
-        const val ENTRY_HIGH_PASS_HZ = 1_200.0
+        const val ENTRY_HIGH_PASS_HZ = 220.0
+
+        /**
+         * Review v2.1 A4 exception: when the pair clashes in key
+         * (keyScore < 0.50), the entry high-pass starts here and relaxes to
+         * [ENTRY_HIGH_PASS_HZ] over the first 25 % of the overlap, keeping the
+         * clash masking while restoring mids sooner.
+         */
+        const val ENTRY_CLASH_HIGH_PASS_HZ = 500.0
+
+        /**
+         * Review v2.1 C2: proactive mid-cut on long smooth blends
+         * (overlap > 16 s) — outgoing LP / incoming HP while the handoff
+         * crosses, so two full-range mixes never sit on each other.
+         */
+        const val PROACTIVE_MID_CUT_LP_HZ = 600.0
+        const val PROACTIVE_MID_CUT_HP_HZ = 300.0
+        const val PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS = 16.0
 
         /**
          * How far into the fade the incoming track is fully open again.
@@ -2104,8 +2207,13 @@ class CrossfadeController(
          * voices competing, not to send one of them into another room. 1.6kHz is
          * below the presence and sibilance a lead vocal is picked out by, and
          * above enough of its body that the track still reads as itself.
+         *
+         * Review v2.1 A3: 300 Hz — 1.6 kHz sits inside the vocal fundamental
+         * range and gutted the outgoing track into a telephone call. Removing
+         * only the bass still avoids the double-bass the separation exists
+         * for, and leaves mids, snare body and warmth alone.
          */
-        const val VOCAL_SEPARATION_FLOOR_HZ = 1_600.0
+        const val VOCAL_SEPARATION_FLOOR_HZ = 300.0
 
         /**
          * Where the incoming track's high-pass starts in [rideVocalSeparation].

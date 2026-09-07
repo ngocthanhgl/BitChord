@@ -30,6 +30,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+import kotlin.math.sqrt
 
 private const val PLANNER_TAG = "BitChordTransitionPlanner"
 
@@ -76,7 +77,6 @@ data class TransitionTrackInfo(
 private const val AUTO_TRANSITION_MAX_BEATS = 16.0
 private const val AUTO_MIN_SECONDS = 4.0
 private const val AUTO_FAST_TRACK_MIN_SECONDS = 6.0
-private const val AUTO_TRANSITION_MAX_SECONDS = 12.0
 private const val AUTO_FALLBACK_SECONDS = 8.0
 
 /** Below this a track would spend too much of itself transitioning to be worth planning. */
@@ -363,15 +363,18 @@ fun selectTransitionType(
 
 /**
  * v2 §7d: shared tempo and per-deck speeds for a HALF_TIME pair. The shared
- * grid is the SLOWER tempo — the faster deck slows to it (Sonic stretches
- * down cleaner than up) and the other stays at 1.0, which also minimises the
- * total stretch magnitude (both directions cost the same log distance, so the
- * tie breaks toward slowing down). Returns (sharedBpm, rateA, rateB).
- * Pure — tested directly.
+ * grid is the GEOMETRIC mean (Review v2.1 B7) — both decks split the log
+ * distance, each stretching by √ratio, instead of pegging at the slower
+ * tempo and making one deck do all the work. [matchedRatio] is oriented
+ * outgoing→incoming (see [matchHarmonicRatio]), so
+ * `bpmA·√ratio == √(bpmA·bpmB)` up to stretch deviation; it defaults to 1.0
+ * (no half-time relation) which reduces to the slower-side choice.
+ * Returns (sharedBpm, rateA, rateB). Pure — tested directly.
  */
-fun halfTimeRates(bpmA: Double, bpmB: Double): Triple<Double, Double, Double> {
+fun halfTimeRates(bpmA: Double, bpmB: Double, matchedRatio: Double = 1.0): Triple<Double, Double, Double> {
     if (bpmA <= 0 || bpmB <= 0) return Triple(0.0, 1.0, 1.0)
-    val shared = min(bpmA, bpmB)
+    val shared = bpmA * sqrt(matchedRatio.coerceAtLeast(1e-9))
+    if (!(shared > 0)) return Triple(0.0, 1.0, 1.0)
     return Triple(shared, shared / bpmA, shared / bpmB)
 }
 
@@ -526,7 +529,7 @@ private fun halfTimeBlendPlan(
 ): TransitionPlan {
     val bpmA = analysis.bpm.orZero()
     val bpmB = nextAnalysis.bpm.orZero()
-    val (shared, rateA, rateB) = halfTimeRates(bpmA, bpmB)
+    val (shared, rateA, rateB) = halfTimeRates(bpmA, bpmB, policy.matchedRatio)
     if (shared <= 0) {
         return hardCutPlan(
             analysis, nextAnalysis, length, nextLength,
@@ -901,8 +904,11 @@ private fun timedValueNearOrBefore(
     .maxOrNull()
 
 /**
- * Snaps a transition start onto the outgoing track's grid: a phrase boundary
- * if one is near, a downbeat otherwise, and the raw target when neither is.
+ * Snaps a transition start onto the outgoing track's grid: a 16-bar grid
+ * point first (Review v2.1 B4 — the spec phrase; the native 8-bar phrases
+ * do not always resolve to stable 16-bar forms, so [phrase16Grid] is tried
+ * before them), then an 8-bar phrase boundary, a downbeat otherwise, and
+ * the raw target when neither is.
  */
 private fun alignedTransitionStart(
     analysis: TrackAnalysis,
@@ -913,8 +919,15 @@ private fun alignedTransitionStart(
 ): Double {
     val interval = analysis.beatInterval.orZero().takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.0
+    val phrase16Tolerance = max(1.5, interval * 8)
     val phraseTolerance = max(1.0, interval * 4)
     val downbeatTolerance = max(0.75, interval * 2)
+    val grid16 = phrase16Grid(analysis)
+    val phrase16 = if (preferEarlier) {
+        timedValueNearOrBefore(grid16, target, phrase16Tolerance, minimum)
+    } else {
+        nearestTimedValue(grid16, target, phrase16Tolerance, minimum)
+    }
     val phrase = if (preferEarlier) {
         timedValueNearOrBefore(analysis.phraseBoundaries, target, phraseTolerance, minimum)
     } else {
@@ -925,7 +938,7 @@ private fun alignedTransitionStart(
     } else {
         nearestTimedValue(analysis.downbeats, target, downbeatTolerance, minimum)
     }
-    return clamp(phrase ?: downbeat ?: target, minimum, end)
+    return clamp(phrase16 ?: phrase ?: downbeat ?: target, minimum, end)
 }
 
 /**
@@ -2004,11 +2017,16 @@ private fun planTransitionInner(
     // blends, so its ceiling is 16 beats on top of the usual rails.
     val typeBeats = min(maxBeatsFor(selectedType), if (mixset) MIXSET_MAX_BEATS else Double.POSITIVE_INFINITY)
     val floorRail = mixEnd - playFloorSeconds
+    // Review v2.1 B6: the overlap must also leave the incoming track room
+    // for its own entry — gate on its clearance (length minus entry), not
+    // just its length. incomingStartPoint is overlap-independent, so it can
+    // be read before the rails that consume it.
+    val earlyIncomingCue = incomingStartPoint(nextAnalysis).coerceAtLeast(0.0)
     val maximumOverlap = minOf(
         if (handoffBpm > 0) (typeBeats * 60) / handoffBpm else ceilingFor(selectedType),
         ABSOLUTE_MAX_TRANSITION_SECONDS,
         mixEnd * 0.6,
-        if (nextLength > 0) nextLength * 0.6 else ceilingFor(selectedType),
+        if (nextLength > 0) max(0.0, nextLength - earlyIncomingCue) * 0.60 else ceilingFor(selectedType),
         if (!mixset && floorRail >= MIN_TRANSITION_OVERLAP_SECONDS) floorRail else Double.POSITIVE_INFINITY,
     )
     val handoffBeats = if (sameBeatBlend) 8 else 4
