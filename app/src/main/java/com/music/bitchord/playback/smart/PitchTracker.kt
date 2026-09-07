@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import com.music.bitchord.data.TrackLog
+import com.music.bitchord.data.settings.AppSettings
 import java.io.File
 import java.nio.FloatBuffer
 import kotlin.math.exp
@@ -60,12 +61,16 @@ class PitchTracker(private val context: Context) {
     }
 
     @Volatile private var session: OrtSession? = null
+    @Volatile private var sessionThreads = 0
     private val lock = Any()
 
     private fun session(): OrtSession? {
-        session?.let { return it }
+        val threads = AppSettings.automixPerformanceMode.value.inferenceThreads
+        session?.takeIf { sessionThreads == threads }?.let { return it }
         synchronized(lock) {
-            session?.let { return it }
+            session?.takeIf { sessionThreads == threads }?.let { return it }
+            runCatching { session?.close() }
+            session = null
             return runCatching {
                 val file = File(context.filesDir, MODEL_ASSET)
                 if (!file.exists() || file.length() == 0L) {
@@ -74,7 +79,7 @@ class PitchTracker(private val context: Context) {
                     }
                 }
                 val options = OrtSession.SessionOptions().apply {
-                    setIntraOpNumThreads(INFERENCE_THREADS)
+                    setIntraOpNumThreads(threads)
                     setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                     // Same reasoning as BeatTracker: analysis runs a handful of
                     // times per track, so per-run allocation beats a retained arena.
@@ -82,7 +87,10 @@ class PitchTracker(private val context: Context) {
                     setMemoryPatternOptimization(false)
                 }
                 OrtEnvironment.getEnvironment().createSession(file.absolutePath, options)
-                    .also { session = it }
+                    .also {
+                        session = it
+                        sessionThreads = threads
+                    }
             }.onFailure { TrackLog.w(TAG, "CREPE model unavailable; YIN fallback answers", it) }
                 .getOrNull()
         }
@@ -139,13 +147,13 @@ class PitchTracker(private val context: Context) {
         synchronized(lock) {
             runCatching { session?.close() }
             session = null
+            sessionThreads = 0
         }
     }
 
     companion object {
         private const val TAG = "BitChordPitchTracker"
         private const val MODEL_ASSET = "crepe_tiny.onnx"
-        private const val INFERENCE_THREADS = 2
         private const val INFERENCE_BATCH = 32
 
         /** CREPE reads 16 kHz mono, 1024-sample frames every 10 ms. */

@@ -26,6 +26,7 @@ import com.music.bitchord.playback.smart.TransitionType
 import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -223,6 +224,7 @@ class CrossfadeController(
 
     /** Which player this class's own listener is currently attached to. */
     private var listeningTo: ExoPlayer? = null
+    private var tickerJob: Job? = null
 
     /** Length of the transition in flight, in ms. Fixed when it begins. */
     private var fadeMs = 0L
@@ -464,7 +466,8 @@ class CrossfadeController(
 
     fun start() {
         listenTo(active())
-        scope.launch {
+        tickerJob?.cancel()
+        tickerJob = scope.launch {
             while (isActive) {
                 tick()
                 delay(
@@ -480,6 +483,8 @@ class CrossfadeController(
     }
 
     fun release() {
+        tickerJob?.cancel()
+        tickerJob = null
         listeningTo?.removeListener(listener)
         listeningTo = null
         active().volume = 1f
@@ -634,6 +639,14 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
+        // Even a manual catalogue match is still video-origin. AutoMix's
+        // analysis and cueing are deliberately never applied to either side
+        // of a transition involving a video row.
+        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) {
+            AppSettings.smartTransitionWindow.value = null
+            AppSettings.smartMixInProgress.value = false
+            return
+        }
         val nextDuration = nextItemDurationMs(nextIndex, nextItem)
 
         requestAnalysisAround(player, duration)
@@ -891,6 +904,7 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
+        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return
         requestAnalysis(currentItem, duration, false)
         requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem), true)
     }
