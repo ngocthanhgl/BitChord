@@ -3827,8 +3827,20 @@ class PlaybackService : MediaLibraryService() {
         configuredFloatOutput = enableFloat
         activeFilter = transitionFilterA
         spareFilter = transitionFilterB
-        val newActive = buildPlayer(spatialAudioProcessorA, transitionFilterA, ownsSession = true)
-        val newSpare = buildPlayer(spatialAudioProcessorB, transitionFilterB, ownsSession = false)
+        // Same role reset as the filters: the new active player owns the A
+        // instances, so the echo/reverb roles must point back at them too —
+        // otherwise rides after a handoff would drive the wrong processor.
+        // open() each one: a frozen reverb tail must not leak into the rebuild.
+        activeEcho = echoSendA
+        spareEcho = echoSendB
+        activeReverb = reverbSendA
+        spareReverb = reverbSendB
+        echoSendA.open()
+        echoSendB.open()
+        reverbSendA.open()
+        reverbSendB.open()
+        val newActive = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, ownsSession = true)
+        val newSpare = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, ownsSession = false)
         player = newActive
         spare = newSpare
         newSpare.audioSessionId = newActive.audioSessionId

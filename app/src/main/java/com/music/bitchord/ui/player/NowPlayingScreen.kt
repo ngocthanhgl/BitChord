@@ -1806,10 +1806,9 @@ fun NowPlayingScreen(
                                             R.string.automix_analysis_status,
                                             smartAnalysis.current.localizedLabel(),
                                             smartAnalysis.next.localizedLabel(),
-                                        )
-                                        // v2 §7d: half-time blends play neither
-                                        // track's own tempo — say which grid won.
-                                        + (sharedHalfTimeBpm
+                                            // v2 §7d: half-time blends play neither
+                                            // track's own tempo — say which grid won.
+                                        ) + (sharedHalfTimeBpm
                                             ?.takeIf { it > 0 }
                                             ?.let { " · shared ${"%.0f".format(it)} BPM" } ?: "")
                                     }),
