@@ -278,8 +278,17 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // RejectedExecutionException can only come from shutdown (see
         // [release]), and at that point the process is going away anyway.
         // The track id files the job's log lines against their track.
-        val lane = if (priority >= PRIORITY_NEXT) highLane else lowLane
-        (if (priority >= PRIORITY_NEXT) highExecutor else lowExecutor).execute(AnalysisJob(lane, priority, trackId, block))
+        // Dual lanes run only under PERFORMANCE mode: EFFICIENT and BALANCED
+        // collapse onto the high lane so analysis stays single-threaded and
+        // the priority queue alone keeps the next track ahead of the backlog.
+        // The mode is read per submit, so toggling it mid-flight needs no
+        // drain: the in-flight job finishes on its lane (per-lane tracker
+        // instances plus the global [running] guard keep the brief overlap
+        // safe) while every new job takes the newly selected lane.
+        val dualLane = AppSettings.automixPerformanceMode.value == AutomixPerformanceMode.PERFORMANCE
+        val low = dualLane && priority < PRIORITY_NEXT
+        val lane = if (low) lowLane else highLane
+        (if (low) lowExecutor else highExecutor).execute(AnalysisJob(lane, priority, trackId, block))
     }
 
     /**
