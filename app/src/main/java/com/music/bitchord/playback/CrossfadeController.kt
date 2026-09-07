@@ -42,6 +42,23 @@ import kotlin.math.sin
 import java.util.Locale
 
 /**
+ * Tempo glide-back factor for a beatmatched handoff: 1 at the fade start,
+ * easing to 0 (own tempo) by its end. The glide window scales with the
+ * stretch magnitude — an 8% nudge rides home over the last 40% of the fade
+ * while a half-time 50% stretch starts coming back at 25% — so small
+ * corrections stay locked to the shared grid as long as possible and big
+ * ones still land home without a snap. Smoothstepped, so both ends of the
+ * ride have zero slope and no kink is audible.
+ */
+fun tempoGlideFactor(progress: Float, stretch: Double): Double {
+    val portion = (abs(stretch - 1.0) * 5.0).coerceIn(0.25, 0.75).toFloat()
+    val start = 1f - portion
+    val t = ((progress - start) / portion).coerceIn(0f, 1f)
+    val s = t * t * (3f - 2f * t)
+    return 1.0 - s
+}
+
+/**
  * A real crossfade: two tracks audible at once, the outgoing one falling as the
  * incoming one rises, the way Spotify and Apple Music do it.
  *
@@ -642,14 +659,10 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
-        // Even a manual catalogue match is still video-origin. AutoMix's
-        // analysis and cueing are deliberately never applied to either side
-        // of a transition involving a video row.
-        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) {
-            AppSettings.smartTransitionWindow.value = null
-            AppSettings.smartMixInProgress.value = false
-            return
-        }
+        // Video-origin rows play through the same audio-only players — no video
+        // surface exists anywhere in the app, so a \"video\" row is just audio
+        // with provenance. Analysis resolves its bytes via the canonical Opus
+        // entry, and the mix below treats it like any other track.
         val nextDuration = nextItemDurationMs(nextIndex, nextItem)
 
         requestAnalysisAround(player, duration)
@@ -925,7 +938,8 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
-        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return
+        // Video rows are measured like any other: both players are audio-only,
+        // and analysis resolves a video row to its canonical Opus bytes.
         requestAnalysis(currentItem, duration, false)
         requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem), true)
     }
@@ -1327,6 +1341,25 @@ class CrossfadeController(
             emphasisPulseArmed = false
             filters.incoming(TransitionFilterProcessor.OPEN_HZ, 80f)
         }
+        // Tempo glide-back: the incoming deck rode a stretched rate to sit on
+        // the shared grid; riding it home to its own tempo before the handoff
+        // avoids the snap finish() would otherwise deliver at full volume.
+        // The key shift rides the same curve in the same call — pitch and tempo
+        // returning together is what a DJ's pitch fader does. Unity means no
+        // call: ExoPlayer re-prepares its audio pipeline on parameter changes.
+        // Progress (not inProgress): the glide follows the whole fade, so a
+        // delayed entry still lands home by the handoff.
+        val stretch = render.incomingPlaybackRate
+        val shift = render.keyShiftSemitones
+        if (stretch != 1.0 || shift != 0) {
+            val glide = tempoGlideFactor(progress, stretch)
+            player.setPlaybackParameters(
+                PlaybackParameters(
+                    (AppSettings.playbackSpeed.value * (1.0 + (stretch - 1.0) * glide)).toFloat(),
+                    2.0.pow(shift / 12.0 * glide).toFloat(),
+                ),
+            )
+        }
 
         // Whichever comes first: the fade running its course, the old track
         // genuinely ending, the tail failing outright, or whichever setting
@@ -1431,8 +1464,12 @@ class CrossfadeController(
             outgoing?.let(::retire)
         } else {
             // The transition never became audible, so the session player never
-            // moved and the standby is the one to throw away.
+            // moved and the standby is the one to throw away. The session
+            // player may still carry the outgoing stretch startFade applied
+            // for a half-time blend — reset it, or the track keeps playing at
+            // the shared tempo indefinitely after the bail.
             outgoing?.volume = 1f
+            outgoing?.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
             incoming?.let(::retire)
         }
 
