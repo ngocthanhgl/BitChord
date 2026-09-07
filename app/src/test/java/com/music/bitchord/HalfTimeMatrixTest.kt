@@ -149,9 +149,10 @@ class HalfTimeMatrixTest {
         )
         assertEquals(TransitionType.HALF_TIME_BLEND, plan.type)
         assertEquals(1.5, plan.matchedRatio, 1e-9)
-        assertEquals(1.0, plan.outgoingPlaybackRate, 1e-9)
-        assertEquals(90.0 / 135.0, plan.incomingPlaybackRate, 1e-4)
-        assertEquals(90.0, plan.outgoingBpm, 1e-9)
+        // Review v2.1 B7 geometric split: shared = 90·√1.5, both decks move.
+        assertEquals(kotlin.math.sqrt(1.5), plan.outgoingPlaybackRate, 1e-9)
+        assertEquals(90.0 * kotlin.math.sqrt(1.5) / 135.0, plan.incomingPlaybackRate, 1e-4)
+        assertEquals(90.0 * kotlin.math.sqrt(1.5), plan.outgoingBpm, 1e-9)
         assertTrue("fade ${plan.fadeSeconds} should ride the 32 s rail", plan.fadeSeconds <= 32.0 + 1e-9)
     }
 }
