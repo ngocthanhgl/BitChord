@@ -1349,7 +1349,9 @@ class CrossfadeController(
         // call: ExoPlayer re-prepares its audio pipeline on parameter changes.
         // Progress (not inProgress): the glide follows the whole fade, so a
         // delayed entry still lands home by the handoff.
-        val stretch = render.incomingPlaybackRate
+        // The plan rate lives on this controller (set at arm time in begin),
+        // not on Render: Render describes the mix, the rate describes the deck.
+        val stretch = incomingPlaybackRate
         val shift = render.keyShiftSemitones
         if (stretch != 1.0 || shift != 0) {
             val glide = tempoGlideFactor(progress, stretch)
