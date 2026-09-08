@@ -13,15 +13,23 @@ import org.junit.Test
  * Splice-guard micro-fades: beat-snapped cues and INSTANT cuts land
  * mid-waveform, so the guard softens every splice with short equal-power
  * ramps. Pure JVM — the processor only touches short arrays.
+ *
+ * All indices below are SAMPLES (stereo: two samples per frame); the
+ * processor advances one ramp counter per sample.
  */
 class SpliceGuardTest {
 
     private val sr = 48_000
-    private val format = AudioProcessor.AudioFormat(sr, 2, C.ENCODING_PCM_16BIT)
+    private val channels = 2
+    private val format = AudioProcessor.AudioFormat(sr, channels, C.ENCODING_PCM_16BIT)
+
+    private val fadeSamples = (sr * SpliceGuardProcessor.FADE_IN_MS / 1000).toInt() * channels
+    private val cutOutSamples = (sr * SpliceGuardProcessor.CUT_OUT_MS / 1000).toInt() * channels
+    private val cutInSamples = (sr * SpliceGuardProcessor.CUT_IN_MS / 1000).toInt() * channels
 
     private fun fullScale(frames: Int): ByteBuffer {
-        val buf = ByteBuffer.allocateDirect(frames * 4).order(ByteOrder.nativeOrder())
-        repeat(frames * 2) { buf.putShort(Short.MAX_VALUE) }
+        val buf = ByteBuffer.allocateDirect(frames * channels * 2).order(ByteOrder.nativeOrder())
+        repeat(frames * channels) { buf.putShort(Short.MAX_VALUE) }
         buf.flip()
         return buf
     }
@@ -37,18 +45,19 @@ class SpliceGuardTest {
 
     private fun fresh(): SpliceGuardProcessor = SpliceGuardProcessor().also {
         val out = it.configure(format)
-        assertEquals(format, out)
+        assertEquals(C.ENCODING_PCM_16BIT, out.encoding)
+        assertEquals(sr, out.sampleRate)
     }
 
     @Test
     fun `flush arms a fade-in from silence`() {
         val g = fresh()
         g.onFlush()
-        val samples = drain(g, 600)
-        // First sample is (near) silence, ramp reaches full scale at 10 ms.
+        val samples = drain(g, fadeSamples / channels + 120)
+        // First sample is (near) silence, ramp reaches full scale exactly at
+        // the end of the 10 ms window, steady full scale after.
         assertTrue(samples[0] < 500)
-        val fadeFrames = (sr * SpliceGuardProcessor.FADE_IN_MS / 1000).toInt()
-        assertTrue(samples[fadeFrames - 1] > Short.MAX_VALUE - 500)
+        assertEquals(Short.MAX_VALUE, samples[fadeSamples - 1])
         assertEquals(Short.MAX_VALUE, samples.last())
     }
 
@@ -56,7 +65,7 @@ class SpliceGuardTest {
     fun `steady state passes through bit-exact`() {
         val g = fresh()
         g.onFlush()
-        drain(g, 600) // drain the fade-in
+        drain(g, fadeSamples / channels + 120) // drain the fade-in
         val samples = drain(g, 600)
         assertTrue(samples.all { it == Short.MAX_VALUE })
     }
@@ -65,11 +74,9 @@ class SpliceGuardTest {
     fun `cut dips to zero and returns without a gap`() {
         val g = fresh()
         g.onFlush()
-        drain(g, 600)
+        drain(g, fadeSamples / channels + 120)
         g.triggerCut()
-        val outFrames = (sr * SpliceGuardProcessor.CUT_OUT_MS / 1000).toInt()
-        val inFrames = (sr * SpliceGuardProcessor.CUT_IN_MS / 1000).toInt()
-        val samples = drain(g, outFrames + inFrames + 100)
+        val samples = drain(g, (cutOutSamples + cutInSamples) / channels + 100)
         val min = samples.min()
         assertTrue("cut reaches silence, min=$min", min < 500)
         // No silent gap: the cut-in starts the sample the cut-out ends.
@@ -82,10 +89,10 @@ class SpliceGuardTest {
     fun `cut then flush still fades in cleanly`() {
         val g = fresh()
         g.onFlush()
-        drain(g, 600)
+        drain(g, fadeSamples / channels + 120)
         g.triggerCut()
         g.onFlush()
-        val samples = drain(g, 600)
+        val samples = drain(g, fadeSamples / channels + 120)
         assertTrue(samples[0] < 500)
         assertEquals(Short.MAX_VALUE, samples.last())
     }

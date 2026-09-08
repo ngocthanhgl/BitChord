@@ -31,10 +31,16 @@ class SpliceGuardProcessor : BaseAudioProcessor() {
     private var fadeInFrames = 0
     private var cutOutFrames = 0
     private var cutInFrames = 0
+    // Sample-denominated totals: queueInput advances one counter per sample,
+    // and a stereo frame is two samples. Counted separately so the ramp
+    // lengths stay exactly 10/8/8 ms regardless of channel count.
+    private var fadeInSamples = 0
+    private var cutOutSamples = 0
+    private var cutInSamples = 0
 
     /** Fires the out+in micro-cut. Safe to call when idle: it just runs. */
     fun triggerCut() {
-        cutOutRemaining = cutOutFrames
+        cutOutRemaining = cutOutSamples
         cutInRemaining = 0
         fadeInRemaining = 0
     }
@@ -47,13 +53,16 @@ class SpliceGuardProcessor : BaseAudioProcessor() {
         fadeInFrames = ((sr * FADE_IN_MS) / 1000).toInt().coerceAtLeast(1)
         cutOutFrames = ((sr * CUT_OUT_MS) / 1000).toInt().coerceAtLeast(1)
         cutInFrames = ((sr * CUT_IN_MS) / 1000).toInt().coerceAtLeast(1)
+        fadeInSamples = fadeInFrames * inputAudioFormat.channelCount
+        cutOutSamples = cutOutFrames * inputAudioFormat.channelCount
+        cutInSamples = cutInFrames * inputAudioFormat.channelCount
         return inputAudioFormat
     }
 
     override fun onFlush() {
         // A flush means a seek or a fresh source: the next buffer opens
         // mid-waveform, so arm the fade-in before it arrives.
-        fadeInRemaining = fadeInFrames
+        fadeInRemaining = fadeInSamples
         cutOutRemaining = 0
         cutInRemaining = 0
     }
@@ -92,22 +101,22 @@ class SpliceGuardProcessor : BaseAudioProcessor() {
     private fun gainForNextSample(): Float {
         if (cutOutRemaining > 0) {
             cutOutRemaining--
-            val progress = 1f - cutOutRemaining.toFloat() / cutOutFrames.toFloat()
+            val progress = 1f - cutOutRemaining.toFloat() / cutOutSamples.toFloat()
             if (cutOutRemaining == 0) {
-                cutInRemaining = cutInFrames
+                cutInRemaining = cutInSamples
             }
             val c = cos(progress * PI / 2.0).toFloat()
             return c * c
         }
         if (cutInRemaining > 0) {
             cutInRemaining--
-            val progress = 1f - cutInRemaining.toFloat() / cutInFrames.toFloat()
+            val progress = 1f - cutInRemaining.toFloat() / cutInSamples.toFloat()
             val s = kotlin.math.sin(progress * PI / 2.0).toFloat()
             return s * s
         }
         if (fadeInRemaining > 0) {
             fadeInRemaining--
-            val progress = 1f - fadeInRemaining.toFloat() / fadeInFrames.toFloat()
+            val progress = 1f - fadeInRemaining.toFloat() / fadeInSamples.toFloat()
             val s = kotlin.math.sin(progress * PI / 2.0).toFloat()
             return s * s
         }
