@@ -52,10 +52,17 @@ class SpliceGuardTest {
         assertEquals(sr, out.sampleRate)
     }
 
+    /**
+     * Arms the fade-in the way the pipeline does: [onFlush] is protected, so
+     * tests go through the public [flush], which is exactly what a seek or a
+     * fresh source triggers in production.
+     */
+    private fun armFadeIn(g: SpliceGuardProcessor) = g.flush()
+
     @Test
     fun `flush arms a fade-in from silence`() {
         val g = fresh()
-        g.onFlush()
+        armFadeIn(g)
         val samples = drain(g, fadeSamples / channels + 120)
         // First sample is (near) silence, ramp reaches full scale exactly at
         // the end of the 10 ms window, steady full scale after.
@@ -67,7 +74,7 @@ class SpliceGuardTest {
     @Test
     fun `steady state passes through bit-exact`() {
         val g = fresh()
-        g.onFlush()
+        armFadeIn(g)
         drain(g, fadeSamples / channels + 120) // drain the fade-in
         val samples = drain(g, 600)
         assertTrue(samples.all { it == Short.MAX_VALUE })
@@ -76,7 +83,7 @@ class SpliceGuardTest {
     @Test
     fun `cut dips to zero and returns without a gap`() {
         val g = fresh()
-        g.onFlush()
+        armFadeIn(g)
         drain(g, fadeSamples / channels + 120)
         g.triggerCut()
         val samples = drain(g, (cutOutSamples + cutInSamples) / channels + 100)
@@ -91,10 +98,10 @@ class SpliceGuardTest {
     @Test
     fun `cut then flush still fades in cleanly`() {
         val g = fresh()
-        g.onFlush()
+        armFadeIn(g)
         drain(g, fadeSamples / channels + 120)
         g.triggerCut()
-        g.onFlush()
+        armFadeIn(g)
         val samples = drain(g, fadeSamples / channels + 120)
         assertTrue(samples[0] < 500)
         assertEquals(Short.MAX_VALUE, samples.last())
