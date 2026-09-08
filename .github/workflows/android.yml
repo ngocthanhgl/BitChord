@@ -65,7 +65,15 @@ jobs:
       run: chmod +x gradlew
 
     - name: Run Unit Tests (full suite — every test file must execute)
-      run: ./gradlew testProdDebugUnitTest
+      run: ./gradlew testProdDebugUnitTest 2>&1 | tee /tmp/test-output.txt; test ${PIPESTATUS[0]} -eq 0
+
+    # TEMPORARY CI-debug: posts the first error as a commit status (public API
+    # readable). Remove once the click-fix CI is green.
+    - name: Exfiltrate failure excerpt to commit status
+      if: failure()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: bash scripts/ci_excerpt.sh /tmp/test-output.txt
 
     - name: Build Signed Prod Release APK
       run: ./gradlew assembleProdRelease

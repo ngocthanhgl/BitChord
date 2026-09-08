@@ -3,6 +3,7 @@ package com.music.bitchord.playback
 import androidx.media3.common.C
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.BaseAudioProcessor
+import androidx.media3.common.util.UnstableApi
 import java.nio.ByteBuffer
 import kotlin.math.PI
 import kotlin.math.cos
@@ -22,6 +23,7 @@ import kotlin.math.cos
  * per-sample path is a single int comparison. 16-bit only, like the echo and
  * reverb sends — other encodings bow out with [AudioProcessor.AudioFormat.NOT_SET].
  */
+@UnstableApi
 class SpliceGuardProcessor : BaseAudioProcessor() {
 
     @Volatile private var fadeInRemaining = 0
