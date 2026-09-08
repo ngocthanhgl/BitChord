@@ -177,13 +177,14 @@ class ExitEntrySpecTest {
 
     @Test
     fun `vocal-heavy entry advances to the next clean beat`() {
-        // V3 shape: buildup at 60, voice over 60-70, clean after.
+        // V3 shape: buildup at 60, voice over 60-62 (inside the 8-bar
+        // advance cap), clean after.
         val mask = List(800) { i ->
             val t = i * 0.25
-            if (t in 60.0..70.0) 1.0 else 0.0
+            if (t >= 60.0 && t < 62.0) 1.0 else 0.0
         }
         val analysis = TrackAnalysis(beatInterval = 0.5, vocalActivityMask = mask)
-        assertEquals(70.0, adjustedMixsetEntry(60.0, analysis, 200.0), 1e-9)
+        assertEquals(62.0, adjustedMixsetEntry(60.0, analysis, 200.0), 1e-9)
     }
 
     @Test
