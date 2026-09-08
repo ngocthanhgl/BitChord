@@ -39,7 +39,10 @@ class SpliceGuardTest {
         val out = g.output
         val samples = ShortArray(out.remaining() / 2)
         repeat(samples.size) { samples[it] = out.short }
-        g.reset()
+        // No reset() here: BaseAudioProcessor.reset() funnels through flush(),
+        // which calls onFlush() and would re-arm the fade-in between drains.
+        // The counters are the state under test — each test arms them
+        // explicitly via onFlush()/triggerCut().
         return samples
     }
 
