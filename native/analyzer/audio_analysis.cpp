@@ -571,7 +571,7 @@ void BuildStructure(const EnvelopeResult& envelope, AnalysisResult& result) {
     mix_ins.push_back({result.mix_in_time, 0.9, "intro_drop"});
   }
   const double drop_cue = result.beat_interval > 0 ? phrase_start + result.beat_interval * 32.0 : result.intro_end_time;
-  if (drop_cue > result.mix_in_time + 0.5 && drop_cue < envelope.content_end * 0.4) {
+  if (drop_cue > result.mix_in_time + 0.5 && drop_cue < envelope.content_end * 0.55) {
     const double aligned_drop = DownbeatAtOrBefore(result.downbeats, drop_cue, drop_cue);
     mix_ins.push_back({aligned_drop, 0.95, "main_drop"});
   }

@@ -207,6 +207,35 @@ const val COLD_OPEN_RMS_FRACTION = 0.85
 const val AMBIENT_BEAT_CONF = 0.28
 const val AMBIENT_ONSET_DENSITY = 1.8
 const val AMBIENT_RMS_VARIANCE = 0.04
+/** Exit-entry spec Fix 1: scored drop selection — acceptance and winner gates. */
+const val DROP_SCORE_ACCEPT = 0.45
+const val DROP_SCORE_BEST = 0.55
+/** Exit-entry spec Fix 1: drop-zone position bonus/penalty. */
+const val DROP_SCORE_POSITION_BONUS = 0.15
+const val DROP_SCORE_POSITION_OK = 0.05
+const val DROP_SCORE_POSITION_PENALTY = -0.20
+/** Exit-entry spec Fix 6: techno branch (ELECTRONIC + bpm>=130). */
+const val DROP_TECHNO_BPM = 130.0
+const val DROP_TECHNO_CENTROID_HZ = 2000.0
+const val DROP_TECHNO_RMS_BOOST = 1.10
+const val DROP_TECHNO_SUSTAIN_STEPS = 8
+const val DROP_HOUSE_CENTROID_HZ = 2500.0
+const val DROP_OTHER_CENTROID_HZ = 2300.0
+const val DROP_SUSTAIN_STEPS = 2
+const val DROP_CENTROID_BUILD_FRACTION = 0.60
+/** Exit-entry spec Fix 2: drop play-through before a post-drop exit. */
+const val MIN_DROP_PLAY_THROUGH_PHRASES = 2.0
+/** Exit-entry spec Fix 3: buildup↔drop distance validation. */
+const val MIN_BUILDUP_TO_DROP_SECONDS = 8.0
+const val MAX_BUILDUP_TO_DROP_SECONDS = 90.0
+/** Exit-entry spec Fix 4: vocal check on the mixset entry. */
+const val MIXSET_ENTRY_VOCAL_CHECK_BARS = 4
+const val MIXSET_ENTRY_VOCAL_ADVANCE_BARS = 8
+const val MIXSET_ENTRY_VOCAL_THRESHOLD = 0.45
+const val MIXSET_ENTRY_VOCAL_ACCEPT = 0.40
+/** Exit-entry spec Fix 7: late-drop window push band. */
+const val LATE_DROP_WINDOW_LOW = 0.72
+const val LATE_DROP_WINDOW_HIGH = 0.82
 
 /** v2 §8: replaces the unbounded buildup walk; 96 s = ~4 phrases. */
 const val MIXSET_BUILDUP_MAX_SECONDS = 96.0
@@ -565,8 +594,33 @@ fun rankMixOutCandidates(
                 else -> 0.0
             }
             // Finetune v1 §2.3: low-energy inside a BREAK scores near the top.
+            // Exit-entry spec Fix 2: the boost applies ONLY to post-drop
+            // breaks. A pre-drop breakdown (BREAK → BUILD → DROP, common in
+            // House) gets base score only — otherwise the system exits at
+            // the pre-drop calm and the listener never hears the drop.
+            // Hard veto: never exit inside a DROP section or within 2 bars
+            // after one starts (rankScore -1 sinks it below every real
+            // candidate; it can only win when no other exit exists at all).
+            val dropSec = firstDropSec(analysis)
+            val phrase16 = phrase16Seconds(analysis)
+            val playThrough =
+                if (phrase16 != null && phrase16.isFinite() && phrase16 > 0) {
+                    phrase16 * MIN_DROP_PLAY_THROUGH_PHRASES
+                } else {
+                    0.0
+                }
+            val inDrop = analysis.structureMap.any { label ->
+                label.type == StructureSectionType.DROP &&
+                    label.start.isFinite() &&
+                    candidate.time >= label.start &&
+                    candidate.time < label.start + analysis.beatInterval * 8
+            }
             val breakBoost =
-                if (candidate.type == "low_energy" && isInsideBreak(analysis, candidate.time)) {
+                if (inDrop) {
+                    0.0
+                } else if (candidate.type == "low_energy" && isInsideBreak(analysis, candidate.time) &&
+                    (dropSec == null || !dropSec.isFinite() || candidate.time > dropSec + playThrough)
+                ) {
                     LOW_ENERGY_BREAK_BOOST_SCORE - (MIX_OUT_TYPE_SCORE["low_energy"] ?: 0.0)
                 } else {
                     0.0
@@ -575,7 +629,11 @@ fun rankMixOutCandidates(
                 time = candidate.time,
                 score = candidate.score,
                 type = candidate.type,
-                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0) + vocalPenalty + breakBoost,
+                rankScore = if (inDrop) {
+                    -1.0
+                } else {
+                    candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0) + vocalPenalty + breakBoost
+                },
                 discardedMusicSeconds = measured ?: max(0.0, end - candidate.time),
                 measured = measured != null,
             )
@@ -1207,7 +1265,32 @@ private fun maxEnergyTimeAfterIntro(analysis: TrackAnalysis): Double? {
  * failed (spec §4 fallback); the legacy foot walk when there is no drop at
  * all (peak-anchored tracks); null when nothing supports the claim.
  */
+/**
+ * Exit-entry spec Fix 3: distance validation for every buildup result. A
+ * buildup closer than 8 s to the drop gives no approach; farther than 90 s
+ * plays too much non-peak content. Either way back off to drop − 1 phrase.
+ * Null when even that is non-positive, so callers fall back to the peak.
+ */
+fun validateBuildupStart(rawBuildup: Double?, drop: Double, phrase16: Double?): Double? {
+    if (rawBuildup == null || !rawBuildup.isFinite() || !drop.isFinite()) return rawBuildup
+    val gap = drop - rawBuildup
+    if (gap < MIN_BUILDUP_TO_DROP_SECONDS || gap > MAX_BUILDUP_TO_DROP_SECONDS) {
+        if (phrase16 == null || !phrase16.isFinite() || phrase16 <= 0) return rawBuildup
+        val backed = drop - phrase16
+        return if (backed > 0) backed else null
+    }
+    return rawBuildup
+}
+
 fun buildupStart(analysis: TrackAnalysis, peakTime: Double): Double? {
+    val raw = buildupStartRaw(analysis, peakTime) ?: return null
+    // Dropless (legacy foot) has no drop to validate against — keep as is.
+    val drop = firstDropSec(analysis) ?: return raw
+    if (!drop.isFinite()) return raw
+    return validateBuildupStart(raw, drop, phrase16Seconds(analysis))
+}
+
+private fun buildupStartRaw(analysis: TrackAnalysis, peakTime: Double): Double? {
     // Spec finetune §6.1 five-step chain: (1) stored map buildup, (2a)
     // validated gradient inflection, (2b) unvalidated inflection with a
     // monotonic lean, (3) structural BUILD ending near the drop, (4)
@@ -1300,6 +1383,40 @@ private fun legacyBuildupFoot(analysis: TrackAnalysis, peakTime: Double): Double
 }
 
 /**
+ * Exit-entry spec Fix 4: the mixset entry bypasses mix-in ranking, so a
+ * buildup under vocals would enter mid-voice. Check the first 4 bars at
+ * 250 ms resolution; when vocal-heavy, advance beat by beat (after an
+ * initial 1-bar jump) up to 8 bars forward, never past 2 bars before the
+ * drop. No clean bar → keep the original (never overshoot into the drop).
+ */
+fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: Double): Double {
+    val beat = analysis.beatInterval.takeIf { it.isFinite() && it > 0 } ?: return buildupStartSec
+    val mask = analysis.vocalActivityMask
+    fun vocalAt(t: Double): Double {
+        val idx = (t / 0.25).toInt()
+        return mask.getOrNull(idx)?.takeIf { it.isFinite() } ?: 0.0
+    }
+    val startIdx = (buildupStartSec / 0.25).toInt()
+    val checkSamples = (beat * 4 * MIXSET_ENTRY_VOCAL_CHECK_BARS / 0.25).toInt().coerceAtLeast(1)
+    var sum = 0.0
+    var n = 0
+    for (i in 0 until checkSamples) {
+        val v = mask.getOrNull(startIdx + i)?.takeIf { it.isFinite() } ?: continue
+        sum += v
+        n++
+    }
+    if (n == 0 || sum / n <= MIXSET_ENTRY_VOCAL_THRESHOLD) return buildupStartSec
+    val maxAdvance = buildupStartSec + beat * MIXSET_ENTRY_VOCAL_ADVANCE_BARS
+    val hardCap = drop - beat * 8
+    var cursor = buildupStartSec + beat * 4
+    while (cursor < minOf(maxAdvance, hardCap)) {
+        if (vocalAt(cursor) < MIXSET_ENTRY_VOCAL_ACCEPT) return cursor
+        cursor += beat
+    }
+    return buildupStartSec
+}
+
+/**
  * Mixset entry: the buildup foot when the curve shows one, else the peak.
  * One function so the hard/echo/plain cues, the WSOLA drop and the adaptive
  * handoff all agree on where the incoming track begins.
@@ -1308,7 +1425,10 @@ fun mixsetEntryPoint(analysis: TrackAnalysis): Double? {
     val peak = bestPartCue(analysis) ?: return null
     val entry = buildupStart(analysis, peak) ?: peak
     // Spec: every entry decision happens at a phrase boundary.
-    return snapToPhrase16(analysis, entry)
+    val snapped = snapToPhrase16(analysis, entry) ?: entry
+    val drop = firstDropSec(analysis)
+    if (drop == null || !drop.isFinite()) return snapped
+    return adjustedMixsetEntry(snapped, analysis, drop)
 }
 
 /**
@@ -1388,6 +1508,20 @@ fun mixsetTargetFor(genre: GenreClass): Double = when (genre) {
  */
 fun effectivePlayFloor(analysis: TrackAnalysis, length: Double): Double {
     val default = 0.8 * length
+    // Exit-entry spec Fix 7: late drop (main drop at 72–82% of the track).
+    // The normal window opens right at the drop and an energy cliff at the
+    // drop onset would win the exit — push the floor past the drop so the
+    // listener hears it before any exit candidate competes.
+    val drop = firstDropSec(analysis)
+    if (drop != null && drop.isFinite() && length > 0 &&
+        drop / length in LATE_DROP_WINDOW_LOW..LATE_DROP_WINDOW_HIGH
+    ) {
+        val phrase16 = phrase16Seconds(analysis)
+        if (phrase16 != null && phrase16.isFinite() && phrase16 > 0) {
+            return maxOf(default, drop + MIN_DROP_PLAY_THROUGH_PHRASES * phrase16)
+        }
+        return maxOf(default, drop)
+    }
     val outro = analysis.structuredOutroSec?.takeIf { it.isFinite() && it > 0 } ?: return default
     if (outro >= default) return default
     // Finetune v1 §2.2: 22–28 s tails on 4-min pop/dance were missed by 30 s.
@@ -1493,6 +1627,18 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
     }
     time = capActivePlaytime(analysis, entry, time, length)
     time = pushPastDrop(analysis, time, drop, length)
+    // Exit-entry spec Fix 5: drop play-through floor (safety net). The exit
+    // cannot fire until the listener has heard the drop: at least 2 phrases
+    // after it starts. Clamped to the track end — past-length deferral is
+    // impossible, and the 130 s cap / window-collapse rescue above already
+    // handled the too-short-track case by returning rescue early.
+    if (drop != null && drop.isFinite()) {
+        val phrase16 = phrase16Seconds(analysis)
+        if (phrase16 != null && phrase16.isFinite() && phrase16 > 0) {
+            time = maxOf(time, drop + MIN_DROP_PLAY_THROUGH_PHRASES * phrase16)
+                .coerceAtMost(max(0.0, length - 2.0))
+        }
+    }
     logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_peak t=${"%.1f".format(time)} len=${"%.1f".format(length)} entry=${"%.1f".format(entry)} floor=${"%.1f".format(floor)} cap=${"%.1f".format(cap)}")
     return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
 }

@@ -77,33 +77,7 @@ object StructureDetector {
         // 4-bar windows, stepping one bar for boundary resolution.
         // Bound is strict: bar+4 == size would read bars[size] past the end
         // (crashed every track with >=8 downbeats on-device, 2026-09-05 log).
-        val windows = mutableListOf<WindowStats>()
-        var bar = 0
-        while (bar + 4 < bars.size) {
-            val start = bars[bar]
-            val end = bars[bar + 4]
-            if (end <= start || start < 0) {
-                bar++
-                continue
-            }
-            val energies = fine.filter { it.time.isFinite() && it.energy.isFinite() && it.time in start..end }
-                .map { it.energy }
-            if (energies.isEmpty()) {
-                bar++
-                continue
-            }
-            val cents = centroid.filter { it.time.isFinite() && it.energy.isFinite() && it.time in start..end }
-                .map { it.energy }
-            val onsetCount = onsets.count { it.isFinite() && it in start..end }
-            windows += WindowStats(
-                start = start,
-                end = end,
-                rmsMean = energies.average(),
-                onsetPerSec = onsetCount / (end - start),
-                centroidMean = if (cents.isEmpty()) 0.0 else cents.average(),
-            )
-            bar++
-        }
+        val windows = buildWindowStats(fine, centroid, onsets, bars)
         if (windows.isEmpty()) return emptyList()
         val trackMean = windows.map { it.rmsMean }.average()
         val trackPeak = windows.maxOf { it.rmsMean }
@@ -156,6 +130,147 @@ object StructureDetector {
             StructureLabel(window.start, window.end, type)
         }.mergeAdjacent()
     }
+
+    private fun buildWindowStats(
+        fine: List<EnergySample>,
+        centroid: List<EnergySample>,
+        onsets: List<Double>,
+        bars: List<Double>,
+    ): List<WindowStats> {
+        val windows = mutableListOf<WindowStats>()
+        var bar = 0
+        while (bar + 4 < bars.size) {
+            val start = bars[bar]
+            val end = bars[bar + 4]
+            if (end <= start || start < 0) {
+                bar++
+                continue
+            }
+            val energies = fine.filter { it.time.isFinite() && it.energy.isFinite() && it.time in start..end }
+                .map { it.energy }
+            if (energies.isEmpty()) {
+                bar++
+                continue
+            }
+            val cents = centroid.filter { it.time.isFinite() && it.energy.isFinite() && it.time in start..end }
+                .map { it.energy }
+            val onsetCount = onsets.count { it.isFinite() && it in start..end }
+            windows += WindowStats(
+                start = start,
+                end = end,
+                rmsMean = energies.average(),
+                onsetPerSec = onsetCount / (end - start),
+                centroidMean = if (cents.isEmpty()) 0.0 else cents.average(),
+            )
+            bar++
+        }
+        return windows
+    }
+
+    /**
+     * Exit-entry spec Fix 1 (+ Fix 6 genre branch): scored best-candidate drop
+     * selection. Replaces first-match: every 4-bar window is scored on
+     * rms/onset/centroid (each 0..1), BUILD-precedence (highest single weight:
+     * an energetic intro with no BUILD before it can barely pass), sustain,
+     * plus a position bonus for the expected drop zone [0.20L, 0.65L].
+     * Winners need >= DROP_SCORE_BEST; fallback is max-RMS in-zone but only
+     * when it genuinely peaks (guards the flat-bed phantom-drop test).
+     * AMBIENT (untrusted grid) returns null — max-energy fallback downstream.
+     */
+    fun selectFirstDrop(
+        fine: List<EnergySample>,
+        centroid: List<EnergySample>,
+        onsets: List<Double>,
+        downbeats: List<Double>,
+        duration: Double,
+        meanRms: Double,
+        meanOnset: Double,
+        beatInterval: Double,
+        structureMap: List<StructureLabel>,
+        bpm: Double,
+        beatConfidence: Double,
+    ): Double? {
+        if (fine.size < 8 || meanRms <= 0 || duration <= 0) return null
+        if (beatConfidence < AMBIENT_BEAT_CONF) return null
+        val bars = downbeats.filter { it.isFinite() }.sorted()
+        if (bars.size < 8) return null
+        val windows = buildWindowStats(fine, centroid, onsets, bars)
+        if (windows.isEmpty()) return null
+        val presence = bars.size / duration
+        val isTechno = bpm >= DROP_TECHNO_BPM && bpm <= 150.0 && presence > 0.2
+        val centroidNorm = when {
+            isTechno -> DROP_TECHNO_CENTROID_HZ
+            bpm in 70.0..105.0 && presence > 0.2 -> DROP_OTHER_CENTROID_HZ
+            bpm in 90.0..135.0 -> DROP_OTHER_CENTROID_HZ
+            else -> DROP_HOUSE_CENTROID_HZ
+        }
+        val rmsBoost = if (isTechno) DROP_TECHNO_RMS_BOOST else 1.0
+        val sustainSteps = if (isTechno) DROP_TECHNO_SUSTAIN_STEPS else DROP_SUSTAIN_STEPS
+        val phraseSec = if (beatInterval.isFinite() && beatInterval > 0) beatInterval * 64 else 30.0
+        val barSec = if (beatInterval.isFinite() && beatInterval > 0) beatInterval * 4 else 2.0
+        var best: DropCandidate? = null
+        for (i in windows.indices) {
+            val w = windows[i]
+            if (!w.start.isFinite()) continue
+            val rmsRatio = ((w.rmsMean / meanRms) * rmsBoost).coerceIn(0.0, 2.5) / 2.5
+            val onsetRatio = if (meanOnset > 0) {
+                (w.onsetPerSec / meanOnset).coerceIn(0.0, 2.5) / 2.5
+            } else {
+                0.0
+            }
+            val centroidScore = (w.centroidMean / centroidNorm).coerceIn(0.0, 1.0)
+            val hasBuildBefore = structureMap.any { label ->
+                label.type == StructureSectionType.BUILD &&
+                    label.end.isFinite() && w.start.isFinite() &&
+                    label.end > w.start - phraseSec * 2 &&
+                    label.end <= w.start + barSec
+            }
+            // Compressed-EDM fallback: centroid rising over the 2 phrases
+            // before the candidate counts as partial build (rms ceiling hides
+            // the slope). Fraction of rising adjacent pairs in range.
+            var risingPairs = 0
+            var totalPairs = 0
+            for (j in 1..windows.lastIndex) {
+                val a = windows[j - 1]
+                val b = windows[j]
+                if (b.start < w.start - phraseSec * 2 || b.start > w.start) continue
+                totalPairs++
+                if (b.centroidMean > a.centroidMean) risingPairs++
+            }
+            val buildScore = when {
+                hasBuildBefore -> 1.0
+                totalPairs > 0 && risingPairs.toDouble() / totalPairs > DROP_CENTROID_BUILD_FRACTION -> 0.6
+                else -> 0.0
+            }
+            var sustained = 0
+            for (offset in 1..sustainSteps) {
+                val next = windows.getOrNull(i + offset)
+                if (next != null && next.rmsMean > meanRms) sustained++
+            }
+            val sustainScore = sustained.toDouble() / sustainSteps
+            val positionRatio = w.start / duration
+            val positionBonus = when {
+                positionRatio in 0.20..0.65 -> DROP_SCORE_POSITION_BONUS
+                positionRatio in 0.10..0.75 -> DROP_SCORE_POSITION_OK
+                else -> DROP_SCORE_POSITION_PENALTY
+            }
+            val score = rmsRatio * 0.30 + onsetRatio * 0.15 + centroidScore * 0.15 +
+                buildScore * 0.25 + sustainScore * 0.15 + positionBonus
+            if (score > DROP_SCORE_ACCEPT) {
+                if (best == null || score > best.score) best = DropCandidate(w.start, score)
+            }
+        }
+        val winner = best?.takeIf { it.score >= DROP_SCORE_BEST }
+        if (winner != null) return winner.startSec
+        // Fallback: max-RMS in-zone, guarded — a flat bed must not report a
+        // phantom drop (MixsetTest strict-neighbor contract).
+        return windows
+            .filter { it.start / duration in 0.20..0.65 && it.rmsMean > 1.05 * meanRms }
+            .maxByOrNull { it.rmsMean }
+            ?.start
+    }
+
+    private data class DropCandidate(val startSec: Double, val score: Double)
 
     /**
      * Spec slopes are per bar but windows step one bar while spanning four —

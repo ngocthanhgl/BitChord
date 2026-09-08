@@ -1294,7 +1294,27 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }.onFailure {
             TrackLog.w(TAG, "StructureDetector failed; degrading to v1 heuristics", it)
         }.getOrDefault(emptyList())
-        val dropSec = map.firstOrNull { it.type == StructureSectionType.DROP }?.start
+        // Exit-entry spec Fix 1: scored best-candidate drop selection replaces
+        // first-match. Wrapped: any scorer throw degrades to the old first
+        // DROP label (which firstDropSec's stored-wins contract still honors).
+        val dropSec = runCatching {
+            StructureDetector.selectFirstDrop(
+                fine = fine,
+                centroid = features.spectralCentroidCurve,
+                onsets = onsets,
+                downbeats = downbeats,
+                duration = duration,
+                meanRms = meanRms,
+                meanOnset = meanOnset,
+                beatInterval = interval,
+                structureMap = map,
+                bpm = features.bpm,
+                beatConfidence = features.beatConfidence,
+            )
+        }.onFailure {
+            TrackLog.w(TAG, "selectFirstDrop failed; falling back to first DROP label", it)
+        }.getOrNull()
+            ?: map.firstOrNull { it.type == StructureSectionType.DROP }?.start
         // §4 gradient anchors on the detector's DROP; without one there is no
         // peak to walk back from, and buildupStart falls back downstream.
         val buildupSec = if (dropSec != null && dropSec.isFinite()) {
