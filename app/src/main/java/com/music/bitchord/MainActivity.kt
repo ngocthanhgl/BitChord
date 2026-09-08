@@ -2680,23 +2680,6 @@ private fun BitChordApp(
                     } else {
                         null
                     },
-                    onSaveLog = if (fromPlayer) {
-                        {
-                            songActions = null
-                            scope.launch {
-                                val where = withContext(Dispatchers.IO) {
-                                    TrackLog.exportSessionFile(context)
-                                }
-                                Toast.makeText(
-                                    context,
-                                    where ?: "Log export failed",
-                                    Toast.LENGTH_LONG,
-                                ).show()
-                            }
-                        }
-                    } else {
-                        null
-                    },
                 )
             }
         }

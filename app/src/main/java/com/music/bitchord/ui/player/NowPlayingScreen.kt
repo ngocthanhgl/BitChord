@@ -89,7 +89,6 @@ import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.FastRewind
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Headphones
-import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -194,7 +193,6 @@ import com.music.bitchord.data.canvas.CanvasRepository
 import com.music.bitchord.data.lyrics.Genius
 import com.music.bitchord.data.lyrics.LyricLine
 import com.music.bitchord.data.lyrics.LyricsSource
-import com.music.bitchord.ui.components.LyricsLogConsole
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.settings.AudioQuality
 import com.music.bitchord.data.model.LikeStatus
@@ -682,11 +680,8 @@ fun NowPlayingScreen(
     // The queue lives inside the player, Apple-style, rather than in a sheet.
     var queueOpen by remember { mutableStateOf(false) }
     var lyricsOpen by remember { mutableStateOf(false) }
-    var lyricsLogsOpen by remember { mutableStateOf(false) }
-    val showLyricsLogsEnabled by AppSettings.showLyricsLogs.collectAsStateWithLifecycle()
     LaunchedEffect(song.videoId) {
         lyricsOpen = false
-        lyricsLogsOpen = false
     }
     // A brief, non-modal confirmation that the three-dot menu now contains a
     // way back to the original YouTube rendition. The control keeps its usual
@@ -730,22 +725,14 @@ fun NowPlayingScreen(
     // dispatcher to outrank and the BackHandler is already the newest
     // callback on the dialog's, so it wins there unaided.
     BackHandler(enabled = lyricsOpen) {
-        if (lyricsLogsOpen) {
-            lyricsLogsOpen = false
-        } else {
-            lyricsOpen = false
-        }
+        lyricsOpen = false
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         val view = LocalView.current
-        DisposableEffect(view, lyricsOpen, lyricsLogsOpen) {
+        DisposableEffect(view, lyricsOpen) {
             val callback = if (lyricsOpen) {
                 OverlayBack.register(view) {
-                    if (lyricsLogsOpen) {
-                        lyricsLogsOpen = false
-                    } else {
-                        lyricsOpen = false
-                    }
+                    lyricsOpen = false
                 }
             } else {
                 null
@@ -1958,20 +1945,6 @@ fun NowPlayingScreen(
                 }
 
                 if (lyricsOpen) {
-                    if (lyricsLogsOpen) {
-                        // Full-screen log console — replaces the lyrics list while
-                        // the debug panel is open. Same fade-in timing as the lyrics
-                        // panel so the transition is identical from the user's side.
-                        LyricsLogConsole(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(top = HEADER_HEIGHT)
-                                .graphicsLayer {
-                                    alpha = ((p - 0.45f) / 0.55f).coerceIn(0f, 1f)
-                                    translationY = (1f - p) * 26.dp.toPx()
-                                },
-                        )
-                    } else {
                         LyricsPanel(
                             lines = lyrics.orEmpty(),
                             positionMs = positionMs,
@@ -1990,7 +1963,6 @@ fun NowPlayingScreen(
                                     translationY = (1f - p) * 26.dp.toPx()
                                 },
                         )
-                    }
                 }
 
                 // Toggles and the queue arrive after the sleeve has finished
@@ -2184,33 +2156,6 @@ fun NowPlayingScreen(
                         .height(IntrinsicSize.Min),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Logs icon — only shown when the debug-log setting is on
-                    // (Advanced Options in Settings). Icon-only, no label.
-                    if (showLyricsLogsEnabled) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxHeight()
-                                .aspectRatio(1f, matchHeightConstraintsFirst = true)
-                                .clip(CircleShape)
-                                .background(if (lyricsLogsOpen) Color.White.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.10f))
-                                .clickable(
-                                    interactionSource = remember { MutableInteractionSource() },
-                                    indication = null,
-                                ) {
-                                    haptics.play(Haptic.Tap)
-                                    lyricsLogsOpen = !lyricsLogsOpen
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.History,
-                                contentDescription = "Lyrics Logs",
-                                tint = if (lyricsLogsOpen) Color(0xFFFFD54F) else Color.White.copy(alpha = 0.8f),
-                                modifier = Modifier.size(16.dp),
-                            )
-                        }
-                        Spacer(Modifier.width(8.dp))
-                    }
                     // Source credit pill — same style as original, but sits between
                     // the two icon buttons and fills leftover horizontal space.
                     Box(
@@ -2247,7 +2192,6 @@ fun NowPlayingScreen(
                                 indication = null,
                             ) {
                                 haptics.play(Haptic.Tap)
-                                lyricsLogsOpen = false
                                 lyricsOpen = false
                             },
                         contentAlignment = Alignment.Center,

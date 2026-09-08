@@ -13,7 +13,6 @@ import coil3.request.crossfade
 import com.music.bitchord.auth.AuthStore
 import com.music.bitchord.data.canvas.CanvasCache
 import com.music.bitchord.data.canvas.SpotifyToken
-import com.music.bitchord.data.TrackLog
 import com.music.bitchord.playback.AudioCache
 import com.music.bitchord.playback.LastPlayed
 import com.music.bitchord.playback.OriginalVersion
@@ -34,9 +33,6 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory {
     @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
-        // First, so every line logged from process start lands in the
-        // session file the user can export from Downloads.
-        TrackLog.init(this)
         // PlaybackService shares this process, so seeding the cookie here means
         // stream resolution is authenticated from the first play onwards.
         authStore = AuthStore(this)

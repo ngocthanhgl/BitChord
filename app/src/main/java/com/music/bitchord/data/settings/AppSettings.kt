@@ -420,9 +420,6 @@ object AppSettings {
      */
     val prioritizeSyllableSync = MutableStateFlow(false)
 
-    /** When enabled, shows lyrics fetching and Genius scraping logs in the lyrics menu/panel. */
-    val showLyricsLogs = MutableStateFlow(false)
-
     /** Disk budget for cached audio. [AudioCache][com.music.bitchord.playback.AudioCache] evicts past it. */
     val audioCacheLimitBytes = MutableStateFlow(DEFAULT_CACHE_LIMIT_BYTES)
 
@@ -674,7 +671,6 @@ object AppSettings {
         lyricsSources.value = readLyricsSources()
         lyricsSourceOrder.value = readLyricsSourceOrder()
         prioritizeSyllableSync.value = prefs.getBoolean(KEY_PRIORITIZE_SYLLABLE_SYNC, false)
-        showLyricsLogs.value = prefs.getBoolean(KEY_SHOW_LYRICS_LOGS, false)
         audioCacheLimitBytes.value = prefs.getLong(KEY_CACHE_LIMIT, DEFAULT_CACHE_LIMIT_BYTES)
             .coerceIn(DEFAULT_CACHE_LIMIT_BYTES, MAX_CACHE_LIMIT_BYTES)
         lastfmEnabled.value = prefs.getBoolean(KEY_LASTFM_ENABLED, false)
@@ -1017,21 +1013,10 @@ object AppSettings {
         prefs.edit().putBoolean(KEY_PRIORITIZE_SYLLABLE_SYNC, value).apply()
     }
 
-    fun setShowLyricsLogs(value: Boolean) {
-        showLyricsLogs.value = value
-        prefs.edit().putBoolean(KEY_SHOW_LYRICS_LOGS, value).apply()
-    }
-
-    /**
-     * Puts the source list, its order and [prioritizeSyllableSync] back the
-     * way a fresh install finds them. [syncedLyrics] itself is left alone —
-     * this is "start over on *which* lyrics", not "turn lyrics off".
-     */
     fun resetLyricsSourceSettings() {
         setLyricsSources(LyricsSource.entries.toSet())
         setLyricsSourceOrder(LyricsSource.entries)
         setPrioritizeSyllableSync(false)
-        setShowLyricsLogs(false)
     }
 
     fun setAnimatedCanvas(value: Boolean) {
@@ -1448,7 +1433,6 @@ object AppSettings {
     private const val KEY_LYRICS_SOURCES = "lyrics_sources"
     private const val KEY_LYRICS_SOURCE_ORDER = "lyrics_source_order"
     private const val KEY_PRIORITIZE_SYLLABLE_SYNC = "prioritize_syllable_sync"
-    private const val KEY_SHOW_LYRICS_LOGS = "show_lyrics_logs"
     private const val KEY_REPLAY_GENRES = "replay_genres"
     private const val KEY_FILTER_NON_MUSIC_AUDIO = "filter_non_music_audio"
     private const val KEY_LOCAL_MUSIC_SORT = "local_music_sort"

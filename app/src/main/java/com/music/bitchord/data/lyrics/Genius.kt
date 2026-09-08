@@ -46,32 +46,26 @@ object Genius {
     }
 
     suspend fun lyrics(title: String, artist: String): List<LyricLine>? = withContext(Dispatchers.IO) {
-        LyricsLog.i("Genius", "Fallback scraper triggered for: \"$title\" by \"$artist\"")
         val cleanTitle = cleanQuery(title)
         val cleanArtist = cleanQuery(artist)
 
         val songUrl = searchSongUrl(cleanTitle, cleanArtist)
         if (songUrl == null) {
-            LyricsLog.w("Genius", "No matching song found on Genius")
             return@withContext null
         }
 
-        LyricsLog.i("Genius", "Found song page: $songUrl")
         val html = fetchHtml(songUrl)
         if (html.isNullOrBlank()) {
-            LyricsLog.e("Genius", "Failed to fetch HTML from song page")
             return@withContext null
         }
 
         val lines = parseHtml(html)
         if (lines.isNullOrEmpty()) {
-            LyricsLog.w("Genius", "HTML parsed but no lyric lines could be extracted")
             return@withContext null
         }
 
         val sectionCount = lines.count { isSectionHeader(it.text) }
         val sungCount = lines.count { !it.isGap && !isSectionHeader(it.text) }
-        LyricsLog.s("Genius", "Successfully scraped $sungCount lines and $sectionCount sections")
         lines
     }
 
@@ -81,10 +75,8 @@ object Genius {
     internal fun searchSongUrl(cleanTitle: String, cleanArtist: String): String? {
         val query = "$cleanArtist $cleanTitle".trim()
         val url = "https://genius.com/api/search/multi?q=${URLEncoder.encode(query, "UTF-8")}"
-        LyricsLog.i("Genius", "Querying Genius search API: $query")
 
         val responseBody = httpGet(url) ?: run {
-            LyricsLog.w("Genius", "Search API request failed")
             return null
         }
 
@@ -103,7 +95,6 @@ object Genius {
             val best = bestMatch(candidates, cleanTitle, cleanArtist)
             best?.get("url")?.jsonPrimitive?.contentOrNull
         }.onFailure {
-            LyricsLog.e("Genius", "Failed to parse search response: ${it.message}")
         }.getOrNull()
     }
 
@@ -129,7 +120,7 @@ object Genius {
             // Penalize translations / instrumentals / reviews unless specifically requested
             val path = item["path"]?.jsonPrimitive?.contentOrNull ?: ""
             if (path.contains("translation", ignoreCase = true) && !normTitle.contains("translation")) score -= 30
-            if (path.contains("türkçe", ignoreCase = true) || path.contains("polskie-tlumaczenie", ignoreCase = true)) score -= 40
+            if (path.contains("tÃ¼rkÃ§e", ignoreCase = true) || path.contains("polskie-tlumaczenie", ignoreCase = true)) score -= 40
             if (path.contains("tracklist", ignoreCase = true) || path.contains("album-art", ignoreCase = true)) score -= 50
 
             score

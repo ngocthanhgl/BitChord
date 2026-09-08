@@ -41,7 +41,6 @@ import androidx.compose.material.icons.rounded.HighQuality
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.PlaylistRemove
-import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.ThumbDown
 import androidx.compose.material.icons.rounded.ThumbDownOffAlt
@@ -152,11 +151,6 @@ fun SongActionsSheet(
      * except the player, where "this track" means something.
      */
     onCopyLog: (() -> Unit)? = null,
-    /**
-     * Writes the whole session log to Downloads. Same player-only rule as
-     * [onCopyLog]: the full story is only meaningful beside the player.
-     */
-    onSaveLog: (() -> Unit)? = null,
     /**
      * True while a lookup for this track's album/artist ids is still in
      * flight, so it isn't yet known whether "Open album" and "Open artist"
@@ -313,9 +307,6 @@ fun SongActionsSheet(
         // the one row here nobody reaches for by accident.
         onCopyLog?.let {
             ActionRow(Icons.Rounded.BugReport, stringResource(R.string.copy_log), accent = palette.accent, onClick = it)
-        }
-        onSaveLog?.let {
-            ActionRow(Icons.Rounded.Save, "Save Log to Downloads", accent = palette.accent, onClick = it)
         }
         Spacer(Modifier.height(24.dp))
     }

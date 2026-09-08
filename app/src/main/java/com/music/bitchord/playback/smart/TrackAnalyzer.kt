@@ -228,15 +228,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val seq = jobSeq.getAndIncrement()
         override fun run() {
             currentLane.set(lane)
-            // File every line of this job against its track, so a track's
-            // story reads whole in the session log (see TrackLog).
-            TrackLog.setWorking(track)
             lane.inFlight.incrementAndGet()
             try {
                 block()
             } finally {
                 currentLane.remove()
-                TrackLog.setWorking(null)
                 // Lane-local idle release: the old global `running.isEmpty()`
                 // close could land while the other lane was mid-inference.
                 // Zero here means nothing submitted or running on this lane,
