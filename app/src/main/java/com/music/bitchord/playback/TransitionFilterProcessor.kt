@@ -73,9 +73,16 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
      * DJ-style resonant peak at the cutoff. Applied to the low-pass only —
      * resonance on a high-pass sounds bad. Volatile like the cutoff targets
      * because the controller re-aims it once per fade tick.
+     *
+     * Click audit P1: this field is the TARGET. An instant Q jump on running
+     * audio is a coefficient discontinuity (a click), so the per-block loop
+     * chases [currentResonanceQ] toward it exactly like the cutoff glide.
      */
     @Volatile
     private var resonanceQ: Float = 1.0f
+
+    /** Live Q the coefficients are computed from; chases [resonanceQ]. */
+    private var currentResonanceQ = 1.0f
 
     private var channelCount = 0
     private var sampleRate = 0
@@ -111,12 +118,12 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     /**
      * Review v2.1 C1: aims the sweep resonance. Clamped to 1.0–2.5
      * (DJ standard 1.5–2.5); the controller parks it at 1.0 outside
-     * DJ_FILTER so resonance never leaks into other styles. Coefficients
-     * recompute immediately when the sample rate is known.
+     * DJ_FILTER so resonance never leaks into other styles. Target only —
+     * the per-block loop glides the live value, so re-aiming mid-sweep
+     * never steps the coefficients.
      */
     fun setResonance(q: Float) {
         resonanceQ = q.coerceIn(1.0f, 2.5f)
-        if (sampleRate > 0) updateLowCoefficients()
     }
 
     /**
@@ -195,6 +202,10 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             val block = min(remaining, GLIDE_FRAMES)
             currentLowPassHz = glide(currentLowPassHz, targetLow)
             currentHighPassHz = glide(currentHighPassHz, targetHigh)
+            // Q chases linearly: its range (1.0–2.5) is narrow enough that a
+            // log-domain glide buys nothing, and the same ~30 ms time constant
+            // keeps the resonant peak from ever stepping.
+            currentResonanceQ += (resonanceQ - currentResonanceQ) * GLIDE_RATE
             val lowOn = currentLowPassHz < OPEN_HZ - SETTLED_HZ
             val highOn = currentHighPassHz > OFF_HZ + SETTLED_HZ
             if (lowOn) updateLowCoefficients()
@@ -230,7 +241,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         for (stage in 0 until STAGES) {
             // C1: stage Q raised by the resonance multiplier — a peak grows
             // at the cutoff as the sweep closes, the DJ "whoosh".
-            val k = 1f / (BUTTERWORTH_Q[stage] * resonanceQ)
+            val k = 1f / (BUTTERWORTH_Q[stage] * currentResonanceQ)
             val a1 = 1f / (1f + g * (g + k))
             lowA1[stage] = a1
             lowA2[stage] = g * a1

@@ -330,6 +330,16 @@ class PlaybackService : MediaLibraryService() {
     private var activeReverb: ReverbProcessor = reverbSendA
     private var spareReverb: ReverbProcessor = reverbSendB
 
+    // Click audit P0: one splice guard per player, after the reverb send so
+    // the tail it throws is the guarded signal. Same role-swap contract as
+    // filters/echo/reverb. The guard self-arms its fade-in on every flush —
+    // only hard cuts need an explicit trigger (see SpliceGuards.cut).
+    private val spliceGuardA = SpliceGuardProcessor()
+    private val spliceGuardB = SpliceGuardProcessor()
+
+    private var activeSplice: SpliceGuardProcessor = spliceGuardA
+    private var spareSplice: SpliceGuardProcessor = spliceGuardB
+
     /** Automix's DSP analyzer — see [com.music.bitchord.playback.smart.TrackAnalyzer]. */
     private val trackAnalyzer = com.music.bitchord.playback.smart.TrackAnalyzer(this, AudioCache)
 
@@ -1126,8 +1136,8 @@ class PlaybackService : MediaLibraryService() {
             .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
 
         configuredFloatOutput = shouldEnableFloatOutput()
-        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, ownsSession = true)
-        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, ownsSession = false)
+        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
+        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
         player = exoPlayer
         spare = sparePlayer
         // Both sinks feed the same session id, so the system equalizer and any
@@ -1232,6 +1242,15 @@ class PlaybackService : MediaLibraryService() {
 
                 override fun outgoing(wet: Float, freeze: Boolean) =
                     spareReverb.setReverb(wet, freeze)
+            },
+            // Cut trigger needs no roles: at an INSTANT flip the outgoing is
+            // cut mid-waveform and the incoming opens mid-waveform, so both
+            // decks fire their own guard.
+            spliceGuards = object : SpliceGuards {
+                override fun cut() {
+                    activeSplice.triggerCut()
+                    spareSplice.triggerCut()
+                }
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
@@ -1441,9 +1460,10 @@ class PlaybackService : MediaLibraryService() {
         filter: TransitionFilterProcessor,
         echo: EchoSendProcessor,
         reverb: ReverbProcessor,
+        splice: SpliceGuardProcessor,
         ownsSession: Boolean,
     ): ExoPlayer = ExoPlayer.Builder(this)
-        .setRenderersFactory(silenceSkippingRenderers(spatial, filter, echo, reverb))
+        .setRenderersFactory(silenceSkippingRenderers(spatial, filter, echo, reverb, splice))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
         .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
@@ -1481,6 +1501,9 @@ class PlaybackService : MediaLibraryService() {
         val heldReverb = activeReverb
         activeReverb = spareReverb
         spareReverb = heldReverb
+        val heldSplice = activeSplice
+        activeSplice = spareSplice
+        spareSplice = heldSplice
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
@@ -3701,6 +3724,7 @@ class PlaybackService : MediaLibraryService() {
         transition: TransitionFilterProcessor,
         echo: EchoSendProcessor,
         reverb: ReverbProcessor,
+        splice: SpliceGuardProcessor,
     ) = object : DefaultRenderersFactory(this) {
         init {
             // Do not force PCM_FLOAT onto an OEM speaker mixer merely because
@@ -3748,7 +3772,11 @@ class PlaybackService : MediaLibraryService() {
                     // is the filtered signal, not the raw one. The reverb send
                     // rides after the echo (v2 §9) so its tail holds the echo
                     // wash too — a dissolve-ending needs one space, not two.
-                    arrayOf(spatial, transition, echo, reverb),
+                    // The splice guard rides last of the array: its micro-fades
+                    // must survive, and the silence skipper only removes
+                    // silence far longer than a 10 ms ramp, so it cannot eat
+                    // the fade-in.
+                    arrayOf(spatial, transition, echo, reverb, splice),
                     SilenceSkippingAudioProcessor(
                         MIN_SILENCE_US,
                         SilenceSkippingAudioProcessor.DEFAULT_SILENCE_RETENTION_RATIO,
@@ -3842,12 +3870,14 @@ class PlaybackService : MediaLibraryService() {
         spareEcho = echoSendB
         activeReverb = reverbSendA
         spareReverb = reverbSendB
+        activeSplice = spliceGuardA
+        spareSplice = spliceGuardB
         echoSendA.open()
         echoSendB.open()
         reverbSendA.open()
         reverbSendB.open()
-        val newActive = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, ownsSession = true)
-        val newSpare = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, ownsSession = false)
+        val newActive = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
+        val newSpare = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
         player = newActive
         spare = newSpare
         newSpare.audioSessionId = newActive.audioSessionId

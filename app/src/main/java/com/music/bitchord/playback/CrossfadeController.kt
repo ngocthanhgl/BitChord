@@ -188,6 +188,13 @@ class CrossfadeController(
      */
     private val reverbFilters: ReverbFilters = ReverbFilters.None,
     /**
+     * The splice-guard trigger both decks fire at an INSTANT flip. The
+     * fade-in side needs no call — every chain flush self-arms it — but a
+     * mid-stream cut has no flush, so the controller fires it explicitly.
+     * Defaults to [SpliceGuards.None].
+     */
+    private val spliceGuards: SpliceGuards = SpliceGuards.None,
+    /**
      * Whether a decode and inference for a media item is running right now.
      * Only feeds the stats line — nothing about a transition waits on it.
      */
@@ -344,7 +351,13 @@ class CrossfadeController(
     // itself is applied after rideFilters so it wins for exactly one tick
     // (~30 ms, the 2-frame intent at 60 fps) before the ride reclaims the band.
     private var emphasisIndex = 0
-    private var emphasisPulseArmed = false
+    // Click audit P1: the downbeat accent holds across 3 ticks
+    // (attack-hold-release) instead of a single tick — one 30 ms filter
+    // re-aim is two sharp edges the DSP glide cannot fully absorb.
+    private var emphasisTicksLeft = 0
+    // Click audit P0: edge-trigger for the INSTANT flip tick. Rearmed in
+    // begin() with every other per-transition flag.
+    private var cutFired = false
     private var bailStartedAt = 0L
     private var armDeadline = 0L
 
@@ -362,6 +375,12 @@ class CrossfadeController(
      * out starts from where it actually is rather than from full volume.
      */
     private var bailFromGain = 0f
+
+    /**
+     * Gain the incoming track was at when the fade was interrupted, so its
+     * ramp up starts from where it actually is rather than snapping to full.
+     */
+    private var bailFromGainIn = 0f
 
     /** Dedupes the per-tick plan log down to one line per distinct verdict. */
     private var lastPlanVerdict = ""
@@ -1084,6 +1103,7 @@ class CrossfadeController(
         render = renderStyle
         armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS
         handedOff = false
+        cutFired = false
         outgoing = out
         incoming = into
 
@@ -1117,6 +1137,13 @@ class CrossfadeController(
             ),
         )
         into.volume = 0f
+        // Click audit P2: the standby's filter may hold mid-sweep targets from
+        // the previous fade (instances swap roles at the handoff, never reset).
+        // Aim it open while still silent — via the outgoing route, which is the
+        // spare pre-handoff. Echo/reverb need nothing: their wet re-aims on the
+        // first FADING tick, and a wet start on a zeroed delay line renders dry
+        // silence building up, not a burst.
+        filters.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
         into.setMediaItems(items, nextIndex, incomingCueTimeMs)
         // Buffers without sounding. Started for real in [startFade].
         into.playWhenReady = false
@@ -1180,7 +1207,7 @@ class CrossfadeController(
         into.playWhenReady = true
         fadeStartedAt = SystemClock.elapsedRealtime()
         emphasisIndex = 0
-        emphasisPulseArmed = false
+        emphasisTicksLeft = 0
 
         // v2 §7d HALF_TIME: the outgoing deck joins the shared tempo it does
         // not own — the incoming side was already stretched at arm time
@@ -1313,6 +1340,13 @@ class CrossfadeController(
             VolumeCurve.INSTANT -> {
                 player.volume = if (inProgress >= 1f) 1f else 0f
                 out.volume = if (outProgress >= 1f) 0f else 1f
+                // Edge-trigger the splice guard at the flip tick: both decks
+                // step full-scale here, each mid-waveform. The guard's 8+8 ms
+                // ramps replace the step; the volume curve itself is untouched.
+                if (!cutFired && (inProgress >= 1f || outProgress >= 1f)) {
+                    cutFired = true
+                    spliceGuards.cut()
+                }
             }
             VolumeCurve.LINEAR -> {
                 player.volume = inProgress
@@ -1337,8 +1371,8 @@ class CrossfadeController(
         // next fade tick (~30 ms), which is the finest granularity the
         // ticker has. Applied after rideFilters so it wins for one tick
         // only, then the ride re-aims.
-        if (emphasisPulseArmed) {
-            emphasisPulseArmed = false
+        if (emphasisTicksLeft > 0) {
+            emphasisTicksLeft--
             filters.incoming(TransitionFilterProcessor.OPEN_HZ, 80f)
         }
         // Tempo glide-back: the incoming deck rode a stretched rate to sit on
@@ -1391,6 +1425,11 @@ class CrossfadeController(
         val progress = (SystemClock.elapsedRealtime() - bailStartedAt).toFloat() / BAIL_MS
         if (progress < 1f) {
             out.volume = bailFromGain * fallGain(progress)
+            // Mirror of the outgoing ramp: the incoming glides up from where
+            // it was instead of the old instant jump to full. fallGain-based
+            // so it lands at 1.0 with zero slope — the start kink is small
+            // (a fraction of full over 120 ms) where the old snap was full.
+            incoming?.volume = 1f - (1f - bailFromGainIn) * fallGain(progress)
             return
         }
         finish()
@@ -1426,8 +1465,13 @@ class CrossfadeController(
         filters.open()
         echoFilters.open()
         reverbFilters.open()
-        incoming?.volume = 1f
         bailFromGain = outgoing?.volume ?: 0f
+        bailFromGainIn = incoming?.volume ?: 0f
+        // Reset the glide while both decks are still at partial gain: the old
+        // order (snap in finish() at full volume) turned every interrupted
+        // stretched blend into an audible pitch jump. finish() keeps its own
+        // reset as the idempotent safety net.
+        incoming?.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
         bailStartedAt = SystemClock.elapsedRealtime()
         phase = Phase.BAILING
     }
@@ -1677,7 +1721,7 @@ class CrossfadeController(
      * which is what the offsets are expressed in.
      */
     private fun rideHalfTimeEmphasis(elapsedSec: Double) {
-        emphasisPulseArmed = false
+        emphasisTicksLeft = 0
         val offsets = render.halfTimeEmphasis
         if (offsets.isEmpty()) {
             emphasisIndex = 0
@@ -1685,7 +1729,7 @@ class CrossfadeController(
         }
         while (emphasisIndex < offsets.size && elapsedSec >= offsets[emphasisIndex]) {
             emphasisIndex++
-            emphasisPulseArmed = true
+            emphasisTicksLeft = 3
         }
     }
 
