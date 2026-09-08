@@ -68,7 +68,7 @@ class SpliceGuardProcessor : BaseAudioProcessor() {
         var position = inputBuffer.position()
         val limit = inputBuffer.limit()
         if (position >= limit) return
-        val out = replaceBuffer(limit - position)
+        val out = replaceOutputBuffer(limit - position)
         while (position < limit - 1) {
             val sample = inputBuffer.getShort(position).toInt()
             val gain = gainForNextSample()
