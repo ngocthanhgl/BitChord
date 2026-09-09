@@ -1147,8 +1147,6 @@ const val MIXSET_BUILDUP_FOOT_FRACTION = 0.4
 const val MIXSET_BUILDUP_MIN_SECONDS = 8.0
 /** v2 §10: relaxed for compressed tracks (was 0.5). */
 const val MIXSET_BUILDUP_RISE_MARGIN = 0.25
-/** Mixset blends are cuts between peaks, never long beds: overlap ceiling in beats. */
-const val MIXSET_MAX_BEATS = 16.0
 /**
  * Spec active-playtime ceiling: from one phrase before Drop 1 to the exit
  * the listener should hear at most 3 minutes of a track. Past that the exit

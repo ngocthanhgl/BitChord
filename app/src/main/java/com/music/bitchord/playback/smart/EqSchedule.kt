@@ -78,56 +78,78 @@ object EqSchedule {
 
     private fun outgoingKeys(type: TransitionType, duck: Boolean): List<Key> = when (type) {
         TransitionType.SMOOTH_CROSSFADE -> {
-            // Vocal duck reaches 0.30 by 0.70 (Rule 2); presence cuts from 0.80.
+            // Finetune-overlap: mids start receding at 0.15 (~3.4 s into a
+            // 22.5 s bed), highs follow at 0.75 — the listener tracks each
+            // band separately instead of hearing one fade.
             if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.55f, EqGains.UNITY),
-                    Key(0.70f, EqGains(1f, 0.30f, 1f)),
-                    Key(0.80f, EqGains(1f, 0.30f, 1f)),
+                    Key(0.15f, EqGains(1f, 0.88f, 1f)),
+                    Key(0.30f, EqGains(1f, 0.68f, 1f)),
+                    Key(0.45f, EqGains(1f, 0.48f, 1f)),
+                    Key(0.60f, EqGains(1f, 0.30f, 1f)),
+                    Key(0.75f, EqGains(1f, 0.22f, 0.82f)),
+                    Key(0.90f, EqGains(1f, 0.10f, 0.55f)),
                     Key(1f, EqGains.SILENT),
                 )
             } else {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.80f, EqGains.UNITY),
+                    Key(0.45f, EqGains.UNITY),
+                    Key(0.62f, EqGains(1f, 0.78f, 1f)),
+                    Key(0.78f, EqGains(1f, 0.50f, 0.85f)),
+                    Key(0.92f, EqGains(1f, 0.25f, 0.60f)),
                     Key(1f, EqGains.SILENT),
                 )
             }
         }
         TransitionType.HARMONIC_BLEND -> {
-            // Gentler duck than SMOOTH: mids coexist briefly, keys match.
+            // Finetune-overlap: perfect key match coexists long (unity to
+            // 0.52 voiceless); ducked mids taper from 0.18 over a ~26 s bed.
             if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.60f, EqGains.UNITY),
-                    Key(0.75f, EqGains(1f, 0.50f, 1f)),
+                    Key(0.18f, EqGains(1f, 0.92f, 1f)),
+                    Key(0.32f, EqGains(1f, 0.74f, 1f)),
+                    Key(0.46f, EqGains(1f, 0.54f, 1f)),
+                    Key(0.60f, EqGains(1f, 0.35f, 1f)),
+                    Key(0.74f, EqGains(1f, 0.22f, 0.88f)),
+                    Key(0.88f, EqGains(1f, 0.10f, 0.65f)),
                     Key(1f, EqGains.SILENT),
                 )
             } else {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.85f, EqGains.UNITY),
+                    Key(0.52f, EqGains.UNITY),
+                    Key(0.68f, EqGains(1f, 0.80f, 1f)),
+                    Key(0.82f, EqGains(1f, 0.52f, 0.88f)),
                     Key(1f, EqGains.SILENT),
                 )
             }
         }
         TransitionType.FILTER_SWEEP -> listOf(
-            // A holds full mix while B opens top-down; mid-kill masks the clash.
+            // Finetune-overlap: A exits highs-first (0.18) then mids, so the
+            // clash is masked before B's mids emerge — never full spectrum
+            // on both decks at once.
             Key(0f, EqGains.UNITY),
-            Key(0.45f, EqGains(1f, 1f, 1f)),
-            Key(0.55f, EqGains(1f, 1f, 0.60f)),
-            Key(0.70f, EqGains(1f, 0.40f, 0.20f)),
+            Key(0.18f, EqGains(1f, 1f, 0.82f)),
+            Key(0.30f, EqGains(1f, 1f, 0.58f)),
+            Key(0.42f, EqGains(1f, 0.72f, 0.32f)),
+            Key(0.56f, EqGains(1f, 0.42f, 0.14f)),
+            Key(0.70f, EqGains(1f, 0.18f, 0.04f)),
+            Key(0.84f, EqGains(1f, 0.05f, 0f)),
             Key(1f, EqGains.SILENT),
         )
         TransitionType.ECHO_REVERB_OUT -> listOf(
-            // Bass removed early (reverb bass is muddy), then mids duck out.
+            // Finetune-overlap: bass out at 0.30 (echo bass is muddy), then a
+            // long mid taper so A dissolves into pure reverb tail by 0.88.
             Key(0f, EqGains.UNITY),
-            Key(0.25f, EqGains(1f, 1f, 1f)),
-            Key(0.35f, EqGains(0f, 1f, 1f)),
-            Key(0.40f, EqGains(0f, 1f, 1f)),
-            Key(0.55f, EqGains(0f, 0.60f, 1f)),
-            Key(0.70f, EqGains(0f, 0.25f, 0.70f)),
+            Key(0.22f, EqGains(1f, 1f, 1f)),
+            Key(0.30f, EqGains(0f, 1f, 1f)),
+            Key(0.46f, EqGains(0f, 0.72f, 1f)),
+            Key(0.60f, EqGains(0f, 0.42f, 0.85f)),
+            Key(0.74f, EqGains(0f, 0.18f, 0.62f)),
+            Key(0.88f, EqGains(0f, 0.06f, 0.35f)),
             Key(1f, EqGains.SILENT),
         )
         TransitionType.LOOP_CUT_DROP -> listOf(
@@ -139,30 +161,37 @@ object EqSchedule {
             Key(1f, EqGains.SILENT),
         )
         TransitionType.HALF_TIME_BLEND -> {
-            // Rhythmic anchor hands off early (swap at 0.20); presence follows.
+            // Finetune-overlap: mids touch at 0.14 (swap lands at 0.20) and
+            // taper across the bed; voiceless pairs coexist to 0.42.
             if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.40f, EqGains.UNITY),
-                    Key(0.60f, EqGains(1f, 0.50f, 1f)),
-                    Key(0.80f, EqGains(1f, 0.20f, 0.70f)),
+                    Key(0.14f, EqGains(1f, 0.88f, 1f)),
+                    Key(0.26f, EqGains(1f, 0.68f, 1f)),
+                    Key(0.40f, EqGains(1f, 0.48f, 1f)),
+                    Key(0.55f, EqGains(1f, 0.30f, 1f)),
+                    Key(0.68f, EqGains(1f, 0.20f, 0.85f)),
+                    Key(0.82f, EqGains(1f, 0.10f, 0.58f)),
                     Key(1f, EqGains.SILENT),
                 )
             } else {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.60f, EqGains.UNITY),
-                    Key(0.80f, EqGains(1f, 1f, 0.70f)),
+                    Key(0.42f, EqGains.UNITY),
+                    Key(0.60f, EqGains(1f, 0.86f, 0.80f)),
+                    Key(0.78f, EqGains(1f, 0.58f, 0.55f)),
                     Key(1f, EqGains.SILENT),
                 )
             }
         }
         TransitionType.PLAIN_DISSOLVE -> listOf(
-            // No grid to rely on: bass separated immediately, mids fade late.
+            // Finetune-overlap: bass out early as before, plus a new mid cut
+            // at 0.72 so the dissolve keeps receding instead of stalling.
             Key(0f, EqGains.UNITY),
-            Key(0.10f, EqGains(1f, 1f, 1f)),
-            Key(0.20f, EqGains(0f, 1f, 1f)),
+            Key(0.14f, EqGains(1f, 1f, 1f)),
+            Key(0.24f, EqGains(0f, 1f, 1f)),
             Key(0.50f, EqGains(0f, 1f, 1f)),
+            Key(0.72f, EqGains(0f, 0.60f, 0.90f)),
             Key(1f, EqGains.SILENT),
         )
         TransitionType.HARD_CUT -> listOf(Key(0f, EqGains.UNITY), Key(1f, EqGains.UNITY))
@@ -172,11 +201,19 @@ object EqSchedule {
 
     private fun incomingKeys(type: TransitionType, delay: Boolean): List<Key> = when (type) {
         TransitionType.SMOOTH_CROSSFADE -> {
-            // Bass killed on entry; mids delayed only when B enters singing.
+            // Finetune-overlap: B's mids emerge gradually (0.28/0.40) and
+            // reach full at 0.52 — after the bass swap at 0.30/0.35. The
+            // voiceless entry keeps a tiny soft start under the swap.
             val mid = if (delay) {
-                listOf(Key(0f, EqGains(1f, 0f, 1f)), Key(0.15f, EqGains(1f, 0f, 1f)), Key(0.40f, EqGains.UNITY))
+                listOf(
+                    Key(0f, EqGains(1f, 0f, 1f)),
+                    Key(0.18f, EqGains(1f, 0f, 1f)),
+                    Key(0.28f, EqGains(1f, 0.28f, 1f)),
+                    Key(0.40f, EqGains(1f, 0.62f, 1f)),
+                    Key(0.52f, EqGains.UNITY),
+                )
             } else {
-                listOf(Key(0f, EqGains.UNITY))
+                listOf(Key(0f, EqGains(1f, 0.86f, 1f)), Key(0.12f, EqGains.UNITY))
             }
             mid + Key(1f, EqGains.UNITY)
         }
@@ -184,28 +221,33 @@ object EqSchedule {
             // Keys match: mids present from entry, only bass segregated.
             listOf(Key(0f, EqGains.UNITY), Key(1f, EqGains.UNITY))
         TransitionType.FILTER_SWEEP -> listOf(
-            // Top-down entry: high air first, mids only after A's highs cut.
-            Key(0f, EqGains(1f, 0f, 0.60f)),
-            Key(0.10f, EqGains(1f, 0f, 1f)),
-            Key(0.20f, EqGains(1f, 0f, 1f)),
-            Key(0.30f, EqGains(1f, 0.40f, 1f)),
-            Key(0.40f, EqGains(1f, 0.80f, 1f)),
+            // Finetune-overlap: B rises out of thin air — highs first, mids
+            // filling in only after the bass swap at 0.30, full by 0.70.
+            Key(0f, EqGains(1f, 0f, 0.40f)),
+            Key(0.12f, EqGains(1f, 0f, 0.80f)),
+            Key(0.22f, EqGains(1f, 0f, 1f)),
+            Key(0.32f, EqGains(1f, 0.20f, 1f)),
+            Key(0.46f, EqGains(1f, 0.52f, 1f)),
+            Key(0.60f, EqGains(1f, 0.78f, 1f)),
+            Key(0.70f, EqGains.UNITY),
             Key(1f, EqGains.UNITY),
         )
         TransitionType.ECHO_REVERB_OUT -> listOf(
-            // B enters in highs under the wash, opens fully as the wash decays.
+            // Finetune-overlap: B enters under the reverb tail at 0.38 and
+            // opens smoother (0.48/0.58), full by 0.68.
             Key(0f, EqGains(1f, 0f, 0.80f)),
-            Key(0.35f, EqGains(0f, 0f, 0.80f)),
-            Key(0.45f, EqGains(0f, 0.50f, 1f)),
-            Key(0.55f, EqGains(0.80f, 1f, 1f)),
+            Key(0.38f, EqGains(0f, 0f, 0.82f)),
+            Key(0.48f, EqGains(0f, 0.42f, 1f)),
+            Key(0.58f, EqGains(0.65f, 0.85f, 1f)),
+            Key(0.68f, EqGains.UNITY),
             Key(1f, EqGains.UNITY),
         )
         TransitionType.LOOP_CUT_DROP ->
             // B silent until the drop, then full mix — the payoff.
             listOf(Key(0f, EqGains.UNITY), Key(1f, EqGains.UNITY))
         TransitionType.HALF_TIME_BLEND -> listOf(
-            // Bass killed; mids slightly soft for the approach, open by 0.10.
-            Key(0f, EqGains(1f, 0.90f, 1f)),
+            // Bass killed; mids a touch softer on the approach, open by 0.10.
+            Key(0f, EqGains(1f, 0.88f, 1f)),
             Key(0.10f, EqGains.UNITY),
             Key(1f, EqGains.UNITY),
         )

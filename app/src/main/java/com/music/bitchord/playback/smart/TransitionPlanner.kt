@@ -108,6 +108,22 @@ private fun maxBeatsFor(type: TransitionType): Double = when (type) {
     TransitionType.PLAIN_DISSOLVE -> 16.0
 }
 
+/**
+ * Finetune-overlap §Fix 1: DJ Mode per-type overlap ceilings in beats. The
+ * old flat 16-beat cap (MIXSET_MAX_BEATS, deleted) strangled every blend to
+ * ~7.5 s @128 BPM while the EQ tables are designed for 18–30 s beds.
+ */
+private fun djModeMaxBeats(type: TransitionType): Double = when (type) {
+    TransitionType.SMOOTH_CROSSFADE -> 48.0
+    TransitionType.HARMONIC_BLEND -> 64.0
+    TransitionType.FILTER_SWEEP -> 32.0
+    TransitionType.ECHO_REVERB_OUT -> 24.0
+    TransitionType.LOOP_CUT_DROP -> 16.0
+    TransitionType.HARD_CUT -> 1.0
+    TransitionType.HALF_TIME_BLEND -> 48.0
+    TransitionType.PLAIN_DISSOLVE -> 12.0
+}
+
 /** Hard safety net no transition may exceed, however generous its budget. */
 private const val ABSOLUTE_MAX_TRANSITION_SECONDS = 90.0
 
@@ -538,7 +554,8 @@ private fun halfTimeBlendPlan(
     }
     val bars = if (short) 8 else 24
     val sharedBeat = 60.0 / shared
-    val fadeSec = minOf(bars * 4 * sharedBeat, ceilingFor(TransitionType.HALF_TIME_BLEND))
+    val halfCeiling = if (mixset) djModeCeilingFor(TransitionType.HALF_TIME_BLEND) else ceilingFor(TransitionType.HALF_TIME_BLEND)
+    val fadeSec = minOf(bars * 4 * sharedBeat, halfCeiling)
         .coerceAtLeast(MIN_TRANSITION_OVERLAP_SECONDS)
     val transitionStart = max(0.0, mixAnchor - fadeSec)
     val keyShift = if (analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
@@ -1527,12 +1544,52 @@ fun ceilingFor(type: TransitionType): Double = when (type) {
     TransitionType.PLAIN_DISSOLVE -> 4.0
 }
 
+/**
+ * Finetune-overlap: DJ Mode per-type ceilings in seconds. The normal-mode
+ * [ceilingFor] would clip the long DJ beds from the inside (a 30 s harmonic
+ * blend against a 28 s ceiling, a 15 s sweep against 9 s), so DJ Mode
+ * carries its own — each just fits its beat target at 128 BPM, still under
+ * the 90 s absolute net.
+ */
+private fun djModeCeilingFor(type: TransitionType): Double = when (type) {
+    TransitionType.SMOOTH_CROSSFADE -> 24.0
+    TransitionType.HARMONIC_BLEND -> 32.0
+    TransitionType.FILTER_SWEEP -> 16.0
+    TransitionType.ECHO_REVERB_OUT -> 12.5
+    TransitionType.LOOP_CUT_DROP -> 8.0
+    TransitionType.HARD_CUT -> 0.3
+    TransitionType.HALF_TIME_BLEND -> 24.0
+    TransitionType.PLAIN_DISSOLVE -> 6.0
+}
+
+/** Rail fallback: DJ Mode reads its own seconds ceiling, normal mode the classic one. */
+private fun djRailCeiling(type: TransitionType, mixset: Boolean): Double =
+    if (mixset) djModeCeilingFor(type) else ceilingFor(type)
+
+/**
+ * Finetune-overlap §Fix 4: when the EQ is already managing a vocal clash,
+ * the overlap is safe to run longer — the mid-duck, not silence, separates
+ * the voices. Capped by [djModeMaxBeats] at the call site.
+ */
+private fun eqOverlapBonusBeats(duckAMids: Boolean, delayBMids: Boolean, type: TransitionType): Int {
+    if (type == TransitionType.LOOP_CUT_DROP ||
+        type == TransitionType.HARD_CUT ||
+        type == TransitionType.PLAIN_DISSOLVE
+    ) return 0
+    return when {
+        duckAMids && delayBMids -> 8
+        duckAMids || delayBMids -> 4
+        else -> 0
+    }
+}
+
 private fun adaptiveOverlap(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
     transitionPoint: Double,
     entryPoint: Double,
     type: TransitionType = TransitionType.SMOOTH_CROSSFADE,
+    mixset: Boolean = false,
 ): Overlap {
     val currentBpm = analysis.bpm.orZero()
     val nextBpm = nextAnalysis.bpm.orZero()
@@ -1543,24 +1600,52 @@ private fun adaptiveOverlap(
     val ratio = normalizedTempoRatio(currentBpm, nextBpm)
     val distance = keyDistance(trustedKey(analysis), trustedKey(nextAnalysis))
     val vocalConflict = analysis.vocalProbability >= 0.62 && nextAnalysis.vocalProbability >= 0.62
-    // Finetune v1 §4.2: more room to mask mismatch (20), a viable minimum
-    // (12 beats = 5.6 s @128 BPM), and headroom to duck vocals (10).
-    val baseBeats = when {
-        vocalConflict -> 10
-        abs(1 - ratio) > 0.07 || (distance != null && distance > 4) -> 20
-        else -> 12
+    // Finetune-overlap §Fix 2: in DJ Mode the flat 10/20/12 base is replaced
+    // by pair-quality tiers — a perfect pair deserves a full bed, a poor one
+    // stays short. Normal mode keeps the old bases untouched.
+    val baseBeats = if (mixset) {
+        val tempoDeviation = abs(1 - ratio)
+        when {
+            tempoDeviation < 0.02 && (distance == null || distance <= 1) -> 56
+            tempoDeviation < 0.04 && (distance == null || distance <= 3) -> 40
+            tempoDeviation < 0.06 -> 28
+            else -> 20
+        }
+    } else {
+        // Finetune v1 §4.2: more room to mask mismatch (20), a viable minimum
+        // (12 beats = 5.6 s @128 BPM), and headroom to duck vocals (10).
+        when {
+            vocalConflict -> 10
+            abs(1 - ratio) > 0.07 || (distance != null && distance > 4) -> 20
+            else -> 12
+        }
     }
     // v2 §6: scale by arrangement energy direction — an outgoing track that
     // falls while the incoming one rises is the ideal long blend; two risers
     // fighting each other get tightened. Slopes over 16 bars each side.
     val energyFactor = overlapEnergyFactor(analysis, nextAnalysis, transitionPoint, entryPoint)
-    val transitionBeats = (baseBeats * energyFactor).roundToInt().coerceIn(4, 32)
+    val djBeatCeiling = djModeMaxBeats(type).toInt()
+    val bonusBeats = if (mixset) {
+        eqOverlapBonusBeats(
+            duckAMids = analysis.vocalProbability >= 0.62,
+            delayBMids = nextAnalysis.vocalProbability >= 0.62,
+            type = type,
+        )
+    } else {
+        0
+    }
+    val transitionBeats = ((baseBeats * energyFactor).roundToInt() + bonusBeats)
+        .coerceIn(if (mixset) 16 else 4, if (mixset) max(16, djBeatCeiling) else 32)
     val beatSeconds = 60 / currentBpm
     // Finetune v1 §4.2: minimum up 1 s across the board.
     val minimumOverlap = if (currentBpm >= 140) 7.0 else 5.0
 
     return Overlap(
-        overlap = clamp(transitionBeats * beatSeconds, minimumOverlap, ceilingFor(type)),
+        overlap = clamp(
+            transitionBeats * beatSeconds,
+            minimumOverlap,
+            if (mixset) djModeCeilingFor(type) else ceilingFor(type),
+        ),
         transitionBeats = transitionBeats,
         incomingPlaybackRate = if (ratio in 0.9..1.1) {
             (clamp(1 / ratio, 0.9, 1.1) * 10000).roundToInt() / 10000.0
@@ -1984,7 +2069,7 @@ private fun planTransitionInner(
         }
 
     val (overlap, transitionBeats, adaptiveRate) =
-        adaptiveOverlap(analysis, nextAnalysis, mixAnchor, proxyEntry, selectedType)
+        adaptiveOverlap(analysis, nextAnalysis, mixAnchor, proxyEntry, selectedType, mixset)
     // Spec finetune §7.1: DJ_ASSISTED never stretches — the filter masks the
     // drift instead. The adaptive tail still sizes the overlap, but the deck
     // rate stays unity.
@@ -2004,9 +2089,9 @@ private fun planTransitionInner(
         }
     val mixEnd = max(0.0, mixAnchor - outgoingArrangementOverlap)
     // The track plays its floor: in normal mode the overlap may not reach
-    // back past 80% of the track. Mixset cuts between peaks with short
-    // blends, so its ceiling is 16 beats on top of the usual rails.
-    val typeBeats = min(maxBeatsFor(selectedType), if (mixset) MIXSET_MAX_BEATS else Double.POSITIVE_INFINITY)
+    // back past 80% of the track. DJ Mode cuts between peaks with long beds,
+    // so its ceiling is the per-type table below on top of the usual rails.
+    val typeBeats = min(maxBeatsFor(selectedType), if (mixset) djModeMaxBeats(selectedType) else Double.POSITIVE_INFINITY)
     val floorRail = mixEnd - playFloorSeconds
     // Review v2.1 B6: the overlap must also leave the incoming track room
     // for its own entry — gate on its clearance (length minus entry), not
@@ -2014,10 +2099,10 @@ private fun planTransitionInner(
     // be read before the rails that consume it.
     val earlyIncomingCue = incomingStartPoint(nextAnalysis).coerceAtLeast(0.0)
     val maximumOverlap = minOf(
-        if (handoffBpm > 0) (typeBeats * 60) / handoffBpm else ceilingFor(selectedType),
+        if (handoffBpm > 0) (typeBeats * 60) / handoffBpm else djRailCeiling(selectedType, mixset),
         ABSOLUTE_MAX_TRANSITION_SECONDS,
         mixEnd * 0.6,
-        if (nextLength > 0) max(0.0, nextLength - earlyIncomingCue) * 0.60 else ceilingFor(selectedType),
+        if (nextLength > 0) max(0.0, nextLength - earlyIncomingCue) * 0.60 else djRailCeiling(selectedType, mixset),
         if (!mixset && floorRail >= MIN_TRANSITION_OVERLAP_SECONDS) floorRail else Double.POSITIVE_INFINITY,
     )
     val handoffBeats = if (sameBeatBlend) 8 else 4
