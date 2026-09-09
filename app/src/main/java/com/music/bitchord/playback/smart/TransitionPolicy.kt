@@ -1156,6 +1156,14 @@ const val MIXSET_MAX_BEATS = 16.0
  */
 const val MIXSET_MAX_ACTIVE_PLAY_SECONDS = 180.0
 /**
+ * DJ Mode anti-flap floor: the only duration rule left. The exit may land
+ * anywhere the analysis justifies, but never before one 16-bar phrase past
+ * the entry — without it a noisy curve could hop tracks seconds apart.
+ * [mixsetAntiFlapSeconds] computes it from the grid; this is the fallback
+ * when the track carries no tempo.
+ */
+const val MIXSET_ANTI_FLAP_FALLBACK_SECONDS = 30.0
+/**
  * Spec phrase = 16 bars. The native analyzer emits 8-bar phrase boundaries,
  * so the 16-bar grid is derived in Kotlin: every 16th downbeat (downbeats
  * are bar starts), else every 2nd phrase boundary, else synthesized from
@@ -1406,10 +1414,12 @@ fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: 
         n++
     }
     if (n == 0 || sum / n <= MIXSET_ENTRY_VOCAL_THRESHOLD) return buildupStartSec
+    // DJ Mode freeform: the advance may run to and past the drop looking for
+    // clear air — the old drop-minus-8-beats hard cap forced every entry
+    // pre-drop. The 8-bar advance budget still bounds the search.
     val maxAdvance = buildupStartSec + beat * MIXSET_ENTRY_VOCAL_ADVANCE_BARS
-    val hardCap = drop - beat * 8
     var cursor = buildupStartSec + beat * 4
-    while (cursor < minOf(maxAdvance, hardCap)) {
+    while (cursor < maxAdvance) {
         if (vocalAt(cursor) < MIXSET_ENTRY_VOCAL_ACCEPT) return cursor
         cursor += beat
     }
@@ -1417,17 +1427,19 @@ fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: 
 }
 
 /**
- * Mixset entry: the buildup foot when the curve shows one, else the peak.
- * One function so the hard/echo/plain cues, the WSOLA drop and the adaptive
- * handoff all agree on where the incoming track begins.
+ * DJ Mode entry, freeform: the buildup foot when the curve shows one, the
+ * drop itself when it does not, else the peak — so the cue may land
+ * mid-track rather than strictly at the head. One function so the hard/echo/
+ * plain cues, the WSOLA drop and the adaptive handoff all agree on where
+ * the incoming track begins.
  */
 fun mixsetEntryPoint(analysis: TrackAnalysis): Double? {
     val peak = bestPartCue(analysis) ?: return null
-    val entry = buildupStart(analysis, peak) ?: peak
+    val drop = firstDropSec(analysis)?.takeIf { it.isFinite() }
+    val entry = buildupStart(analysis, peak) ?: drop ?: peak
     // Spec: every entry decision happens at a phrase boundary.
     val snapped = snapToPhrase16(analysis, entry) ?: entry
-    val drop = firstDropSec(analysis)
-    if (drop == null || !drop.isFinite()) return snapped
+    if (drop == null) return snapped
     return adjustedMixsetEntry(snapped, analysis, drop)
 }
 
@@ -1560,15 +1572,24 @@ fun isColdOpen(analysis: TrackAnalysis, audibleStart: Double = audibleStartOf(an
 }
 
 /**
- * Mixset outgoing anchor, spec exit rules: (1) BREAK start right after Drop 1
- * — the first cooldown at/after the drop, snapped to the 16-bar grid;
- * (2) Drop 1 + 2 spec phrases; (3) 40% of duration. The anchor stays inside
- * the 60–120 s play window past the best part; when no spec tier lands in
- * the window the calm-vocal fallback decides. A mid-DROP landing is pushed
- * to the next 16-bar start — cutting inside the drop sounds like a power
- * outage. A rescue anchor just ahead of the playhead when it is already
- * past the window — a manually started track plays from 0, not from its
- * best cue, so the computed window can already be behind.
+ * One 16-bar phrase in seconds from the grid, else the fallback. The DJ Mode
+ * anti-flap floor is entry + this — the sole duration rule in DJ Mode.
+ */
+fun mixsetAntiFlapSeconds(analysis: TrackAnalysis): Double =
+    phrase16Seconds(analysis)?.takeIf { it.isFinite() && it > 0 } ?: MIXSET_ANTI_FLAP_FALLBACK_SECONDS
+
+/**
+ * DJ Mode outgoing anchor, freeform rules: the exit may land anywhere the
+ * analysis justifies — no 60 s floor, no 130 s cap, no 180 s active cap, no
+ * drop play-through floor. Tiers: (1) first cooldown at/after Drop 1 snapped
+ * to the 16-bar grid; (2) Drop 1 + 2 phrases; (3) calm-vocal fallback with
+ * the 40%-of-length escape hatch. The search runs from entry + one phrase
+ * (anti-flap) to the track end. A mid-DROP landing is still pushed to the
+ * next 16-bar start — cutting inside the drop sounds like a power outage,
+ * and that is musicality, not a duration rule. A rescue anchor just ahead of
+ * the playhead when it is already past the window — a manually started track
+ * plays from 0, not from its best cue, so the computed window can already be
+ * behind.
  */
 fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Double): MixOutAnchor {
     val rescue = MixOutAnchor(
@@ -1581,15 +1602,14 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
         logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(no-entry) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)}")
         return rescue
     }
-    val floor = entry + MIXSET_MIN_PLAY_SECONDS
+    val floor = entry + mixsetAntiFlapSeconds(analysis)
     val base = entry + mixsetTargetFor(genreClass(analysis))
-    val cap = entry + MIXSET_MAX_PLAY_SECONDS
-    if (playbackTime >= cap - 10.0) {
-        logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(past-window) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)} cap=${"%.1f".format(cap)}")
+    if (playbackTime >= length - 12.0) {
+        logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(past-window) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)}")
         return rescue
     }
     val from = max(0.0, floor)
-    val to = min(length, cap)
+    val to = max(0.0, length - 2.0)
     if (to <= from) {
         logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_rescue(window-collapse) t=${"%.1f".format(rescue.time)} len=${"%.1f".format(length)} pos=${"%.1f".format(playbackTime)} from=${"%.1f".format(from)} to=${"%.1f".format(to)}")
         return rescue
@@ -1625,21 +1645,8 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
             }
         }
     }
-    time = capActivePlaytime(analysis, entry, time, length)
     time = pushPastDrop(analysis, time, drop, length)
-    // Exit-entry spec Fix 5: drop play-through floor (safety net). The exit
-    // cannot fire until the listener has heard the drop: at least 2 phrases
-    // after it starts. Clamped to the track end — past-length deferral is
-    // impossible, and the 130 s cap / window-collapse rescue above already
-    // handled the too-short-track case by returning rescue early.
-    if (drop != null && drop.isFinite()) {
-        val phrase16 = phrase16Seconds(analysis)
-        if (phrase16 != null && phrase16.isFinite() && phrase16 > 0) {
-            time = maxOf(time, drop + MIN_DROP_PLAY_THROUGH_PHRASES * phrase16)
-                .coerceAtMost(max(0.0, length - 2.0))
-        }
-    }
-    logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_peak t=${"%.1f".format(time)} len=${"%.1f".format(length)} entry=${"%.1f".format(entry)} floor=${"%.1f".format(floor)} cap=${"%.1f".format(cap)}")
+    logMixsetAnchorOnce(analysis.trackId, "mixset anchor track=${analysis.trackId} type=mixset_peak t=${"%.1f".format(time)} len=${"%.1f".format(length)} entry=${"%.1f".format(entry)} floor=${"%.1f".format(floor)}")
     return MixOutAnchor(time = time, type = "mixset_peak", discardedMusicSeconds = max(0.0, length - time))
 }
 

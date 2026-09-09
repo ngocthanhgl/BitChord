@@ -992,19 +992,22 @@ private fun capIncomingEntry(
     mixsetActive: Boolean,
 ): Double {
     if (!cue.isFinite() || nextLength <= 0) return cue
-    // Finetune v1 §3.4: 30% at 5 min = 90 s, past the first chorus — 28%
-    // still clears a 64-bar intro at 120 BPM.
-    val fraction = if (mixsetActive) 0.5 else 0.28
+    // DJ Mode freeform: no part-pick ceiling — the cue may land anywhere
+    // mid-track the analysis justifies. Only the audible-start floor stays,
+    // so the handoff never aims at silence before the music begins.
     val audible = listOfNotNull(nextAnalysis.audibleStartTime, nextAnalysis.pickupTime)
         .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
-    return min(cue, max(fraction * nextLength, audible + 2.0)).coerceAtLeast(0.0)
+    if (mixsetActive) return max(cue, audible + 2.0)
+    // Finetune v1 §3.4: 30% at 5 min = 90 s, past the first chorus — 28%
+    // still clears a 64-bar intro at 120 BPM.
+    return min(cue, max(0.28 * nextLength, audible + 2.0)).coerceAtLeast(0.0)
 }
 
 /**
- * Mixset entry: the foot of the buildup, skipping the intro — the 50%
- * ceiling still applies so it stays a part pick, not a deep-album cut. The
- * handoff aims here, not at the peak: the peak arrives on its own time after
- * the takeover, which is what lets a long buildup breathe.
+ * DJ Mode entry: the foot of the buildup, the drop, or the peak — wherever
+ * the analysis justifies, mid-track included. Only the audible-start floor
+ * applies. The handoff aims here, not at the peak: the peak arrives on its
+ * own time after the takeover, which is what lets a long buildup breathe.
  */
 private fun mixsetEntryCue(nextAnalysis: TrackAnalysis, nextLength: Double): Double {
     val best = mixsetEntryPoint(nextAnalysis) ?: incomingStartPoint(nextAnalysis)
@@ -1635,33 +1638,14 @@ private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrac
 }
 
 /**
- * Mixset fire floor: no mixset blend may start before
- * [MIXSET_MIN_FIRE_SECONDS]. Anchors are floored at 60 s, but every branch
- * subtracts its own overlap/fade from the anchor, so the fire point is
- * clamped here instead of in each branch. The whole window shifts (start
- * and end together, fade unchanged) so every branch keeps its blend
- * character; the end is capped defensively at the track end, which only
- * binds on tracks shorter than the floor itself (already blocked upstream).
- *
- * Internal (not private) so MixsetTest can pin the arithmetic directly;
- * the planner paths are covered end to end separately.
+ * Mixset fire floor, retired: DJ Mode is freeform, so no blend may-start
+ * floor applies — the exit anchor already carries the sole duration rule
+ * (entry + one phrase anti-flap). Kept as a no-op (not deleted) because
+ * MixsetTest pins its arithmetic directly; every call site still routes
+ * through it.
  */
 internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: Boolean): TransitionPlan {
-    if (!mixset || plan.blocked || plan.transitionStart >= MIXSET_MIN_FIRE_SECONDS) return plan
-    val delta = MIXSET_MIN_FIRE_SECONDS - plan.transitionStart
-    val end = min(plan.transitionEnd + delta, max(length - 1.0, MIXSET_MIN_FIRE_SECONDS + 1.0))
-    TrackLog.d(
-        PLANNER_TAG,
-        "mixset fire-floor shift +${"%.1f".format(delta)}s " +
-            "start=${"%.1f".format(plan.transitionStart)}->${"%.1f".format(MIXSET_MIN_FIRE_SECONDS)} " +
-            "end=${"%.1f".format(plan.transitionEnd)}->${"%.1f".format(end)} type=${plan.type}",
-    )
-    return plan.copy(
-        transitionStart = MIXSET_MIN_FIRE_SECONDS,
-        transitionEnd = end,
-        fadeSeconds = max(0.0, end - MIXSET_MIN_FIRE_SECONDS),
-        overlapSeconds = max(0.0, end - MIXSET_MIN_FIRE_SECONDS),
-    )
+    return plan
 }
 
 /**

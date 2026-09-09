@@ -354,6 +354,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     fun request(trackId: String, uri: Uri, durationSeconds: Double, priority: Int = PRIORITY_NORMAL) {
         if (trackId.isBlank()) return
         if (trackId in running) return
+        // Long-track skip, before anything is fetched, queued or decoded: a
+        // 10+ minute track is recorded ready-but-empty (bpm 0, hence unusable)
+        // so the planner renders it plainly and no later tick retries this.
+        if (durationSeconds.isFinite() && durationSeconds > MAX_ANALYSIS_DURATION_SECONDS) {
+            if (results[trackId] == null) {
+                TrackLog.d(TAG, "Skipping analysis of $trackId: ${durationSeconds}s exceeds ${MAX_ANALYSIS_DURATION_SECONDS}s")
+                results[trackId] = empty(trackId, durationSeconds)
+            }
+            return
+        }
         val analysisUri = analysisUriFor(trackId, uri) ?: return
 
         // Only the canonical YouTube rendition of this recording will do, not
@@ -1625,6 +1635,15 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
         /** Uncaught throws before a track is written off rather than retried. */
         const val MAX_THROW_ATTEMPTS = 3
+
+        /**
+         * Tracks longer than this are never analyzed: a full decode plus
+         * inference pass over 10+ minutes costs heat and battery for
+         * transitions the track will rarely need, and the planner already
+         * knows how to render an unmeasured track (plain dissolve). Recorded
+         * as ready-but-empty at the [request] gate, so it is not retried.
+         */
+        const val MAX_ANALYSIS_DURATION_SECONDS = 600.0
 
         /** Null open/decode passes before the copy is burnt rather than deferred. */
         const val MAX_OPEN_FAIL_ATTEMPTS = 3

@@ -204,8 +204,8 @@
     <string name="crossfade">Crossfade</string>
     <string name="crossfade_subtitle">Blends one track into the next</string>
     <string name="automix">Automix [BETA]</string>
-    <string name="mixset">Mixset Mode</string>
-    <string name="mixset_subtitle">Switches tracks faster - plays about 90 seconds of each song\'s highest-energy part before moving on</string>
+    <string name="mixset">DJ Mode [BETA]</string>
+    <string name="mixset_subtitle">Freeform mixing with DJ-style effects</string>
     <string name="automix_performance">Automix performance</string>
     <string name="automix_performance_subtitle">Sets how much CPU background analysis may use</string>
     <string name="automix_performance_warning">Higher performance analyses tracks faster, but can use more battery and make the phone warmer.</string>
