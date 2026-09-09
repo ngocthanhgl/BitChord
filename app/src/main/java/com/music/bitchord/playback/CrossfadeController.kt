@@ -25,8 +25,10 @@ import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
 import com.music.bitchord.playback.smart.TransitionTrackInfo
 import com.music.bitchord.playback.smart.TransitionType
+import com.music.bitchord.playback.smart.EqSchedule
 import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
+import com.music.bitchord.playback.smart.vocalActivityBetween
 import com.music.bitchord.playback.smart.plainDissolvePlan
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -195,6 +197,13 @@ class CrossfadeController(
      */
     private val spliceGuards: SpliceGuards = SpliceGuards.None,
     /**
+     * The 3-band DJ EQ riding each side of a blend. Mirrors [filters]: the EQ
+     * schedule for the active transition type re-aims both decks once per
+     * fade tick. Defaults to [EqFilters.None], which renders every plan as
+     * the pre-EQ volume-plus-sweep blend.
+     */
+    private val eqFilters: EqFilters = EqFilters.None,
+    /**
      * Whether a decode and inference for a media item is running right now.
      * Only feeds the stats line — nothing about a transition waits on it.
      */
@@ -343,6 +352,27 @@ class CrossfadeController(
         val keyScore: Double = 1.0,
         /** v2 §7a: overlap length in seconds, gating the mid-kill. */
         val overlapSeconds: Double = 0.0,
+        /**
+         * DJ-EQ spec: which schedule table this fade rides. The standard
+         * (non-Smart) path leaves the default; only [considerSmartTransition]
+         * voices a real type, because only it snapshots the grids the bass
+         * swap needs.
+         */
+        val eqType: TransitionType = TransitionType.SMOOTH_CROSSFADE,
+        /** DJ-EQ spec: false = leave both decks at unity (standard fades). */
+        val eqEnabled: Boolean = false,
+        /** DJ-EQ spec: A sings in the transition zone — duck its mids. */
+        val duckAMids: Boolean = false,
+        /** DJ-EQ spec: B enters singing — delay its mids. */
+        val delayBMids: Boolean = false,
+        /**
+         * DJ-EQ spec: blend progress at which the bass swap fires, pre-snapped
+         * to the next downbeat at ARM time. +Inf = no downbeat swap (the LOW
+         * band comes from the schedule tables instead).
+         */
+        val eqSwapFireProgress: Float = Float.POSITIVE_INFINITY,
+        /** DJ-EQ spec: one outgoing beat in seconds; the swap runs 2 bars. */
+        val eqSwapBeatSec: Double = 0.0,
     )
 
     private var fadeStartedAt = 0L
@@ -358,6 +388,10 @@ class CrossfadeController(
     // Click audit P0: edge-trigger for the INSTANT flip tick. Rearmed in
     // begin() with every other per-transition flag.
     private var cutFired = false
+    // DJ-EQ spec: bass-swap state machine. Armed at the schedule's progress,
+    // fired once, then the LOW handover ramps over 2 bars. Rearmed in begin().
+    private var eqSwapFired = false
+    private var eqSwapStartProgress = 0f
     private var bailStartedAt = 0L
     private var armDeadline = 0L
 
@@ -898,6 +932,31 @@ class CrossfadeController(
         val armLeadMs = if (nextAnalysis?.isUsable == true) ARM_LEAD_RESOLVED_MS else ARM_LEAD_MS
         if (remaining > armLeadMs) return
 
+        // DJ-EQ spec §Vocal EQ: evaluated ONCE here at ARM time, not during the
+        // blend. A-zone = first 70% of the overlap; B-entry = first 4 bars
+        // from the cue. Null (no mask) never blocks — absence of a mask is
+        // not absence of a vocal.
+        val duckAMids = currentAnalysis?.let { a ->
+            vocalActivityBetween(a, plan.transitionStart, plan.transitionStart + plan.fadeSeconds * 0.70)
+        }?.let { it > 0.50 } ?: false
+        val delayBMids = nextAnalysis?.let { b ->
+            val entryBeats = if (b.beatInterval > 0) b.beatInterval * 16 else 8.0
+            vocalActivityBetween(b, plan.incomingCueTime, plan.incomingCueTime + entryBeats)
+        }?.let { it > 0.45 } ?: false
+        // DJ-EQ spec §Bass swap protocol: arm at the type's progress, fire on
+        // the next downbeat after it. Pre-snapped here (grids are ARM-time
+        // data); the fade only compares progress against it.
+        val swapProgress = EqSchedule.BASS_SWAP_PROGRESS[plan.type]
+        val eqSwapFireProgress = if (swapProgress != null && plan.fadeSeconds > 0) {
+            val beatSec = currentAnalysis?.beatInterval?.takeIf { it > 0 } ?: 0.0
+            val ideal = plan.transitionStart + swapProgress * plan.fadeSeconds
+            val snap = currentAnalysis?.downbeats?.firstOrNull { it > ideal }
+                ?: if (beatSec > 0) ideal + beatSec else ideal
+            ((snap - plan.transitionStart) / plan.fadeSeconds).toFloat().coerceIn(0f, 1f)
+        } else {
+            Float.POSITIVE_INFINITY
+        }
+
         if (!begin(
             fade,
             endMs = (plan.transitionEnd * 1000).roundToLong(),
@@ -934,6 +993,12 @@ class CrossfadeController(
                 sharedBpm = if (plan.type == TransitionType.HALF_TIME_BLEND) plan.outgoingBpm else 0.0,
                 keyScore = plan.score.key,
                 overlapSeconds = plan.fadeSeconds,
+                eqType = plan.type,
+                eqEnabled = true,
+                duckAMids = duckAMids,
+                delayBMids = delayBMids,
+                eqSwapFireProgress = eqSwapFireProgress,
+                eqSwapBeatSec = currentAnalysis?.beatInterval ?: 0.0,
             ),
         )) {
             logGuardOnce("smart", "no arm: begin() refused (anchor passed or no next item)")
@@ -1144,6 +1209,13 @@ class CrossfadeController(
         // first FADING tick, and a wet start on a zeroed delay line renders dry
         // silence building up, not a burst.
         filters.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        // DJ-EQ spec: park both decks at unity while still silent. Same
+        // outgoing-route reasoning as the filter above — and the swap machine
+        // rearms here with every other per-transition flag.
+        eqFilters.outgoing(1f, 1f, 1f)
+        eqFilters.incoming(1f, 1f, 1f)
+        eqSwapFired = false
+        eqSwapStartProgress = 0f
         into.setMediaItems(items, nextIndex, incomingCueTimeMs)
         // Buffers without sounding. Started for real in [startFade].
         into.playWhenReady = false
@@ -1208,6 +1280,10 @@ class CrossfadeController(
         fadeStartedAt = SystemClock.elapsedRealtime()
         emphasisIndex = 0
         emphasisTicksLeft = 0
+        // DJ-EQ spec: the swap machine rearms with the fade, like the emphasis
+        // cursor above — a repeat-all lap must schedule fresh, not inherit.
+        eqSwapFired = false
+        eqSwapStartProgress = 0f
 
         // v2 §7d HALF_TIME: the outgoing deck joins the shared tempo it does
         // not own — the incoming side was already stretched at arm time
@@ -1365,6 +1441,10 @@ class CrossfadeController(
         // handoff, and [filters] describes the split between the track arriving
         // and the track leaving, which only exists once both are audible.
         rideFilters(progress)
+        // DJ-EQ spec: per-tick 3-band targets from the type schedule. Runs
+        // after the sweep ride; the emphasis pulse below touches the SVF, not
+        // the EQ, so ordering between them is irrelevant.
+        rideEq(progress)
         // v2 §7d/§11.2: no shelf on the processor, so the "low-shelf +3dB"
         // accent is a one-tick dip of the incoming high-pass to 80 Hz at
         // each planned phrase start — the spec's 16 ms pulse lands on the
@@ -1465,6 +1545,7 @@ class CrossfadeController(
         filters.open()
         echoFilters.open()
         reverbFilters.open()
+        eqFilters.open()
         bailFromGain = outgoing?.volume ?: 0f
         bailFromGainIn = incoming?.volume ?: 0f
         // Reset the glide while both decks are still at partial gain: the old
@@ -1493,6 +1574,7 @@ class CrossfadeController(
         filters.open()
         echoFilters.open()
         reverbFilters.open()
+        eqFilters.open()
         render = Render()
 
         if (handedOff) {
@@ -1575,6 +1657,45 @@ class CrossfadeController(
      * Phase 4. Driven off the same `progress` as the gains so the two stay
      * locked: a pause parks the filter exactly where it parks the fade.
      */
+    /**
+     * DJ-EQ spec: per-tick 3-band targets from the type schedule tables.
+     *
+     * MID/HIGH come straight from [EqSchedule] keyframes (already continuous
+     * ramps, so 30 ms re-aims stay under the Rule 3 jump budget). LOW belongs
+     * to the bass-swap state machine on swap types: A holds bass until the
+     * pre-snapped downbeat fires, then both decks hand over across 2 bars; on
+     * table-driven types the LOW keyframes ride as written. Disabled entirely
+     * for standard fades, which snapshot no grids.
+     */
+    private fun rideEq(progress: Float) {
+        if (!render.eqEnabled) return
+        val out = EqSchedule.outgoingGains(render.eqType, progress, render.duckAMids)
+        val into = EqSchedule.incomingGains(render.eqType, progress, render.delayBMids)
+        val swapAt = render.eqSwapFireProgress
+        val (lowOut, lowIn) = if (swapAt.isFinite()) {
+            if (!eqSwapFired && progress >= swapAt) {
+                eqSwapFired = true
+                eqSwapStartProgress = progress
+            }
+            if (!eqSwapFired) {
+                1f to 0f
+            } else {
+                val overlap = render.overlapSeconds.toFloat()
+                val swapSec = (render.eqSwapBeatSec * EqSchedule.SWAP_BARS).toFloat()
+                val t = if (overlap > 0f && swapSec > 0f) {
+                    ((progress - eqSwapStartProgress) * overlap / swapSec).coerceIn(0f, 1f)
+                } else {
+                    1f
+                }
+                (1f - t) to t
+            }
+        } else {
+            out.low to into.low
+        }
+        eqFilters.outgoing(lowOut, out.mid, out.high)
+        eqFilters.incoming(lowIn, into.mid, into.high)
+    }
+
     private fun rideFilters(progress: Float) {
         // Resonance belongs to the sweep gesture only; every other style
         // re-parks it so a previous DJ_FILTER transition never leaks Q.

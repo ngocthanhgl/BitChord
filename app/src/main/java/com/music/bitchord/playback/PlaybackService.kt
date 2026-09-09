@@ -340,6 +340,15 @@ class PlaybackService : MediaLibraryService() {
     private var activeSplice: SpliceGuardProcessor = spliceGuardA
     private var spareSplice: SpliceGuardProcessor = spliceGuardB
 
+    // DJ-EQ spec: one 3-band EQ per player at the head of the chain, so every
+    // downstream stage (widening, sweep, echo, reverb, guard) works on the
+    // already-EQ'd signal. Same role-swap contract as the other processors.
+    private val djEqA = DJBandEQ()
+    private val djEqB = DJBandEQ()
+
+    private var activeEq: DJBandEQ = djEqA
+    private var spareEq: DJBandEQ = djEqB
+
     /** Automix's DSP analyzer — see [com.music.bitchord.playback.smart.TrackAnalyzer]. */
     private val trackAnalyzer = com.music.bitchord.playback.smart.TrackAnalyzer(this, AudioCache)
 
@@ -1136,8 +1145,8 @@ class PlaybackService : MediaLibraryService() {
             .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
 
         configuredFloatOutput = shouldEnableFloatOutput()
-        val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
-        val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
+        val exoPlayer = buildPlayer(djEqA, spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
+        val sparePlayer = buildPlayer(djEqB, spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
         player = exoPlayer
         spare = sparePlayer
         // Both sinks feed the same session id, so the system equalizer and any
@@ -1251,6 +1260,16 @@ class PlaybackService : MediaLibraryService() {
                     activeSplice.triggerCut()
                     spareSplice.triggerCut()
                 }
+            },
+            // Same role wiring as the filters: after the handoff the incoming
+            // track sits on the session player and the outgoing one on the
+            // spare, so these read the role fields fresh on every call.
+            eqFilters = object : EqFilters {
+                override fun incoming(low: Float, mid: Float, high: Float) =
+                    activeEq.setGains(low, mid, high)
+
+                override fun outgoing(low: Float, mid: Float, high: Float) =
+                    spareEq.setGains(low, mid, high)
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
@@ -1456,6 +1475,7 @@ class PlaybackService : MediaLibraryService() {
      * re-resolving a stream URL for audio that is already local.
      */
     private fun buildPlayer(
+        eq: DJBandEQ,
         spatial: SpatialAudioProcessor,
         filter: TransitionFilterProcessor,
         echo: EchoSendProcessor,
@@ -1463,7 +1483,7 @@ class PlaybackService : MediaLibraryService() {
         splice: SpliceGuardProcessor,
         ownsSession: Boolean,
     ): ExoPlayer = ExoPlayer.Builder(this)
-        .setRenderersFactory(silenceSkippingRenderers(spatial, filter, echo, reverb, splice))
+        .setRenderersFactory(silenceSkippingRenderers(eq, spatial, filter, echo, reverb, splice))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
         .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
@@ -1504,6 +1524,9 @@ class PlaybackService : MediaLibraryService() {
         val heldSplice = activeSplice
         activeSplice = spareSplice
         spareSplice = heldSplice
+        val heldEq = activeEq
+        activeEq = spareEq
+        spareEq = heldEq
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
@@ -3720,6 +3743,7 @@ class PlaybackService : MediaLibraryService() {
      * `skipSilenceEnabled` keeps driving it as before.
      */
     private fun silenceSkippingRenderers(
+        eq: DJBandEQ,
         spatial: SpatialAudioProcessor,
         transition: TransitionFilterProcessor,
         echo: EchoSendProcessor,
@@ -3776,7 +3800,10 @@ class PlaybackService : MediaLibraryService() {
                     // must survive, and the silence skipper only removes
                     // silence far longer than a 10 ms ramp, so it cannot eat
                     // the fade-in.
-                    arrayOf(spatial, transition, echo, reverb, splice),
+                    // DJ-EQ spec §EQ-vs-volume: the EQ shapes the spectrum first
+                    // at the head of the chain; widening, sweep, echo, reverb
+                    // and the splice guard all work on the already-EQ'd signal.
+                    arrayOf(eq, spatial, transition, echo, reverb, splice),
                     SilenceSkippingAudioProcessor(
                         MIN_SILENCE_US,
                         SilenceSkippingAudioProcessor.DEFAULT_SILENCE_RETENTION_RATIO,
@@ -3872,12 +3899,16 @@ class PlaybackService : MediaLibraryService() {
         spareReverb = reverbSendB
         activeSplice = spliceGuardA
         spareSplice = spliceGuardB
+        activeEq = djEqA
+        spareEq = djEqB
         echoSendA.open()
         echoSendB.open()
         reverbSendA.open()
         reverbSendB.open()
-        val newActive = buildPlayer(spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
-        val newSpare = buildPlayer(spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
+        djEqA.open()
+        djEqB.open()
+        val newActive = buildPlayer(djEqA, spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
+        val newSpare = buildPlayer(djEqB, spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
         player = newActive
         spare = newSpare
         newSpare.audioSessionId = newActive.audioSessionId
