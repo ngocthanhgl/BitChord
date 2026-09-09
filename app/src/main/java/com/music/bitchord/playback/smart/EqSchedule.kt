@@ -86,11 +86,11 @@ object EqSchedule {
                 listOf(
                     Key(0f, EqGains.UNITY),
                     Key(0.15f, EqGains(1f, 0.82f, 1f)),
-                    Key(0.30f, EqGains(1f, 0.38f, 1f)),
-                    Key(0.45f, EqGains(1f, 0.28f, 1f)),
+                    Key(0.30f, EqGains(1f, 0.45f, 1f)),
+                    Key(0.45f, EqGains(1f, 0.32f, 1f)),
                     Key(0.60f, EqGains(1f, 0.20f, 1f)),
-                    Key(0.75f, EqGains(1f, 0.12f, 0.82f)),
-                    Key(0.90f, EqGains(1f, 0.10f, 0.55f)),
+                    Key(0.75f, EqGains(1f, 0.12f, 0.88f)),
+                    Key(0.90f, EqGains(1f, 0.10f, 0.62f)),
                     Key(1f, EqGains.SILENT),
                 )
             } else {
@@ -137,8 +137,8 @@ object EqSchedule {
             Key(0.30f, EqGains(1f, 1f, 0.58f)),
             Key(0.42f, EqGains(1f, 0.72f, 0.32f)),
             Key(0.56f, EqGains(1f, 0.42f, 0.14f)),
-            Key(0.70f, EqGains(1f, 0.18f, 0.04f)),
-            Key(0.84f, EqGains(1f, 0.05f, 0f)),
+            Key(0.70f, EqGains(1f, 0.18f, 0.10f)),
+            Key(0.84f, EqGains(1f, 0.05f, 0.03f)),
             Key(1f, EqGains.SILENT),
         )
         TransitionType.ECHO_REVERB_OUT -> listOf(
@@ -168,8 +168,8 @@ object EqSchedule {
                 listOf(
                     Key(0f, EqGains.UNITY),
                     Key(0.14f, EqGains(1f, 0.75f, 1f)),
-                    Key(0.26f, EqGains(1f, 0.50f, 1f)),
-                    Key(0.40f, EqGains(1f, 0.35f, 1f)),
+                    Key(0.26f, EqGains(1f, 0.55f, 1f)),
+                    Key(0.40f, EqGains(1f, 0.40f, 1f)),
                     Key(0.55f, EqGains(1f, 0.22f, 1f)),
                     Key(0.68f, EqGains(1f, 0.15f, 0.85f)),
                     Key(0.82f, EqGains(1f, 0.10f, 0.58f)),
@@ -186,12 +186,12 @@ object EqSchedule {
             }
         }
         TransitionType.PLAIN_DISSOLVE -> listOf(
-            // Finetune-overlap: bass out early as before, plus a new mid cut
-            // at 0.72 so the dissolve keeps receding instead of stalling.
+            // Hollow-fix: A holds its bass to 0.35 (was 0.24) so it overlaps
+            // B's low return — complementary handover, never both at 0.
             Key(0f, EqGains.UNITY),
-            Key(0.14f, EqGains(1f, 1f, 1f)),
-            Key(0.24f, EqGains(0f, 1f, 1f)),
-            Key(0.50f, EqGains(0f, 1f, 1f)),
+            Key(0.14f, EqGains.UNITY),
+            Key(0.35f, EqGains(1f, 1f, 1f)),
+            Key(0.45f, EqGains(0f, 1f, 1f)),
             Key(0.72f, EqGains(0f, 0.60f, 0.90f)),
             Key(1f, EqGains.SILENT),
         )
@@ -202,16 +202,15 @@ object EqSchedule {
 
     private fun incomingKeys(type: TransitionType, delay: Boolean): List<Key> = when (type) {
         TransitionType.SMOOTH_CROSSFADE -> {
-            // Finetune-overlap: B's mids emerge gradually (0.28/0.40) and
-            // reach full at 0.52 — after the bass swap at 0.30/0.35. The
-            // voiceless entry keeps a tiny soft start under the swap.
+            // Hollow-fix: B mids hand over from A without a gap — full by
+            // 0.45 so combined mids stay >= ~0.7 through the swap region.
             val mid = if (delay) {
                 listOf(
                     Key(0f, EqGains(1f, 0f, 1f)),
                     Key(0.18f, EqGains(1f, 0f, 1f)),
-                    Key(0.28f, EqGains(1f, 0.28f, 1f)),
-                    Key(0.40f, EqGains(1f, 0.62f, 1f)),
-                    Key(0.52f, EqGains.UNITY),
+                    Key(0.28f, EqGains(1f, 0.32f, 1f)),
+                    Key(0.38f, EqGains(1f, 0.68f, 1f)),
+                    Key(0.45f, EqGains.UNITY),
                 )
             } else {
                 listOf(Key(0f, EqGains(1f, 0.86f, 1f)), Key(0.12f, EqGains.UNITY))
@@ -234,12 +233,13 @@ object EqSchedule {
             Key(1f, EqGains.UNITY),
         )
         TransitionType.ECHO_REVERB_OUT -> listOf(
-            // Finetune-overlap: B enters under the reverb tail at 0.38 and
-            // opens smoother (0.48/0.58), full by 0.68.
+            // Hollow-fix: B low never hits 0 — it dips shallow (0.55) exactly
+            // when A kills its bass at 0.30, then carries the low end while A
+            // dissolves into tail. DJ rule: one deck always holds the bass.
             Key(0f, EqGains(1f, 0f, 0.80f)),
-            Key(0.38f, EqGains(0f, 0f, 0.82f)),
-            Key(0.48f, EqGains(0f, 0.42f, 1f)),
-            Key(0.58f, EqGains(0.65f, 0.85f, 1f)),
+            Key(0.30f, EqGains(0.55f, 0f, 0.82f)),
+            Key(0.45f, EqGains(0.75f, 0.45f, 1f)),
+            Key(0.58f, EqGains(0.90f, 0.85f, 1f)),
             Key(0.68f, EqGains.UNITY),
             Key(1f, EqGains.UNITY),
         )
@@ -253,10 +253,12 @@ object EqSchedule {
             Key(1f, EqGains.UNITY),
         )
         TransitionType.PLAIN_DISSOLVE -> listOf(
-            // No bass until A's is gone, then in after the midpoint.
-            Key(0f, EqGains(1f, 1f, 1f)),
-            Key(0.50f, EqGains(0f, 1f, 1f)),
-            Key(0.60f, EqGains.UNITY),
+            // Hollow-fix: B carries a reduced bass bed (0.45) from the start
+            // and rises to meet A as A lets go at 0.35-0.45 — no dead zone.
+            Key(0f, EqGains(0.45f, 1f, 1f)),
+            Key(0.30f, EqGains(0.45f, 1f, 1f)),
+            Key(0.45f, EqGains(0.85f, 1f, 1f)),
+            Key(0.58f, EqGains.UNITY),
             Key(1f, EqGains.UNITY),
         )
         TransitionType.HARD_CUT -> listOf(Key(0f, EqGains.UNITY), Key(1f, EqGains.UNITY))
