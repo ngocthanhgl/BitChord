@@ -26,10 +26,14 @@ import kotlin.math.sin
  *
  * ## The filter
  *
- * Two cascaded 2-pole Butterworth crossovers (Q = 1/sqrt(2), maximally flat so
- * LP + HP sums back to the input). The high band is derived as input minus the
- * two low-pass outputs, so unity gains reproduce the input bit-exactly apart
- * from float rounding.
+ * Linkwitz-Riley 4th-order crossovers: two cascaded identical 2-pole
+ * Butterworth biquads per crossover (per-stage Q = 1/sqrt(2)), giving
+ * 24 dB/octave with in-phase outputs, so LP + complementary HP sums back
+ * to the input flat. The old single-biquad 12 dB/octave slope leaked bass
+ * an octave above the crossover — both kicks fully present 200–400 Hz —
+ * which is the "two basslines at once" mud the satisfaction round chased.
+ * The high band is derived as input minus the two low-pass outputs, so
+ * unity gains reproduce the input bit-exactly apart from float rounding.
  *
  * ## I/O format
  *
@@ -66,11 +70,14 @@ class DJBandEQ : BaseAudioProcessor() {
     private var channelCount = 0
 
     /**
-     * Biquad state per crossover per channel: x1, x2, y1, y2.
-     * Sized [channelCount * 4] in [onConfigure], zeroed in [onFlush].
+     * Biquad state per crossover per channel: x1, x2, y1, y2, times two
+     * cascaded LR4 stages. Sized [channelCount * 8] in [onConfigure], zeroed
+     * in [onFlush]. The A arrays hold stage 1, the B arrays stage 2.
      */
     private var lowState = FloatArray(0)
+    private var lowStateB = FloatArray(0)
     private var highState = FloatArray(0)
+    private var highStateB = FloatArray(0)
 
     private var lowB0 = 0f
     private var lowB1 = 0f
@@ -109,8 +116,10 @@ class DJBandEQ : BaseAudioProcessor() {
         val sampleRate = inputAudioFormat.sampleRate
         computeCoefficients(LOW_CROSSOVER_HZ, sampleRate, true)
         computeCoefficients(HIGH_CROSSOVER_HZ, sampleRate, false)
-        lowState = FloatArray(channelCount * 4)
-        highState = FloatArray(channelCount * 4)
+        lowState = FloatArray(channelCount * 8)
+        lowStateB = FloatArray(channelCount * 8)
+        highState = FloatArray(channelCount * 8)
+        highStateB = FloatArray(channelCount * 8)
         smoothLow = targetLow
         smoothMid = targetMid
         smoothHigh = targetHigh
@@ -119,7 +128,9 @@ class DJBandEQ : BaseAudioProcessor() {
 
     override fun onFlush() {
         lowState.fill(0f)
+        lowStateB.fill(0f)
         highState.fill(0f)
+        highStateB.fill(0f)
         // Snapped, not glided: a flush means a seek or a fresh source, so there
         // is no continuous signal for a glide to be continuous with.
         smoothLow = targetLow
@@ -132,7 +143,9 @@ class DJBandEQ : BaseAudioProcessor() {
         targetMid = 1f
         targetHigh = 1f
         lowState = FloatArray(0)
+        lowStateB = FloatArray(0)
         highState = FloatArray(0)
+        highStateB = FloatArray(0)
     }
 
     override fun queueInput(inputBuffer: java.nio.ByteBuffer) {
@@ -154,6 +167,24 @@ class DJBandEQ : BaseAudioProcessor() {
             smoothLow > 1f - SETTLED_GAIN && smoothMid > 1f - SETTLED_GAIN &&
             smoothHigh > 1f - SETTLED_GAIN
         if (parked) {
+            // Keep the biquad states warm while parked: disengaging from
+            // seconds-old x1/y1 against fresh input starts the filters from
+            // stale memory (audible transient). Compute-and-discard costs two
+            // biquads and keeps re-engage continuous.
+            inputBuffer.mark()
+            inputBuffer.order(ByteOrder.nativeOrder())
+            repeat(frameCount) {
+                for (channel in 0 until channelCount) {
+                    val sample = inputBuffer.short.toFloat() / SHORT_SCALE
+                    val base = channel * 8
+                    val low1 = processLP(lowState, base, lowB0, lowB1, lowB2, lowA1, lowA2, sample)
+                    val low = processLP(lowStateB, base, lowB0, lowB1, lowB2, lowA1, lowA2, low1)
+                    val rest = sample - low
+                    val mid1 = processLP(highState, base, highB0, highB1, highB2, highA1, highA2, rest)
+                    processLP(highStateB, base, highB0, highB1, highB2, highA1, highA2, mid1)
+                }
+            }
+            inputBuffer.reset()
             outputBuffer.put(inputBuffer)
             outputBuffer.flip()
             return
@@ -175,10 +206,12 @@ class DJBandEQ : BaseAudioProcessor() {
             repeat(block) {
                 for (channel in 0 until channelCount) {
                     val sample = inputBuffer.short.toFloat() / SHORT_SCALE
-                    val base = channel * 4
-                    val low = processLP(lowState, base, lowB0, lowB1, lowB2, lowA1, lowA2, sample)
+                    val base = channel * 8
+                    val low1 = processLP(lowState, base, lowB0, lowB1, lowB2, lowA1, lowA2, sample)
+                    val low = processLP(lowStateB, base, lowB0, lowB1, lowB2, lowA1, lowA2, low1)
                     val rest = sample - low
-                    val mid = processLP(highState, base, highB0, highB1, highB2, highA1, highA2, rest)
+                    val mid1 = processLP(highState, base, highB0, highB1, highB2, highA1, highA2, rest)
+                    val mid = processLP(highStateB, base, highB0, highB1, highB2, highA1, highA2, mid1)
                     val high = rest - mid
                     outputBuffer.putShort(clampToShort((low * gLow + mid * gMid + high * gHigh) * SHORT_SCALE))
                 }
@@ -233,8 +266,8 @@ class DJBandEQ : BaseAudioProcessor() {
     companion object {
         private const val TAG = "BitChordDJBandEQ"
 
-        /** Kick/bass live below this; DJ mixers put the low crossover at 100–200 Hz. */
-        const val LOW_CROSSOVER_HZ = 200f
+        /** Kick lives 40–120 Hz with harmonics to ~250; the low crossover sits just above the harmonics. */
+        const val LOW_CROSSOVER_HZ = 250f
 
         /** Vocal formants peak at 1–4 kHz, so intelligibility stays in MID below this. */
         const val HIGH_CROSSOVER_HZ = 4000f

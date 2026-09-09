@@ -391,6 +391,10 @@ class CrossfadeController(
     // Progress of the last driveFade tick: finish() uses it to decide whether
     // the completion guard may fire (mid-fade) or must stand down (done).
     private var lastProgress = 0f
+    // Blend-feel audit: the incoming-track cap below truncates the planned
+    // span silently. Logged once per fade (rearmed in begin()) so a shortened
+    // blend leaves a planned-vs-actual trace.
+    private var spanCapLogged = false
     // DJ-EQ spec: bass-swap state machine. Armed at the schedule's progress,
     // fired once, then the LOW handover ramps over 2 bars. Rearmed in begin().
     private var eqSwapFired = false
@@ -1173,6 +1177,7 @@ class CrossfadeController(
         handedOff = false
         cutFired = false
         lastProgress = 0f
+        spanCapLogged = false
         outgoing = out
         incoming = into
 
@@ -1425,7 +1430,7 @@ class CrossfadeController(
             .takeIf { it != C.TIME_UNSET && it > 0L }
             ?.minus(incomingCueTimeMs)
             ?.coerceAtLeast(0L)
-        val incomingCap = remainingIncoming?.div(3) ?: Long.MAX_VALUE
+        val incomingCap = remainingIncoming?.div(2) ?: Long.MAX_VALUE
         // A short incoming track (or late cue) shortens the blend but never
         // vaporises it: below 2 s the ear hears a cut, not a mix. Completion
         // is still safe — `done` below also fires on the outgoing track
@@ -1439,6 +1444,14 @@ class CrossfadeController(
             minOf(fadeMs, incomingCap).coerceAtLeast(1L)
         } else {
             minOf(fadeMs, incomingCap).coerceAtLeast(2000L)
+        }
+        if (!spanCapLogged && incomingCap < fadeMs && incomingCap != Long.MAX_VALUE) {
+            spanCapLogged = true
+            TrackLog.d(
+                TAG,
+                "span truncated: planned=${fadeMs}ms actual=${span}ms " +
+                    "remainingIncoming=${remainingIncoming}ms",
+            )
         }
         val elapsed = (player.currentPosition - incomingCueTimeMs).coerceAtLeast(0L)
         val progress = (elapsed.toFloat() / span).coerceIn(0f, 1f)
@@ -1514,14 +1527,23 @@ class CrossfadeController(
         // after the sweep ride; the emphasis pulse below touches the SVF, not
         // the EQ, so ordering between them is irrelevant.
         rideEq(progress)
-        // The decisive cut: from 80% the outgoing track is done being heard.
-        // Player volume is downstream of the whole chain (applied at the sink),
-        // so zeroing it silences the dry path absolutely while the EQ kill
-        // starves the sends of new feed — tails ring from their lines only.
-        // Placed after rideEq so it wins every tick; the EQ glide (~145 ms)
-        // makes the kill a fast smooth ramp, not a step. Echo-out is exempt:
-        // its tail-over-entry IS the style and dies with a volume mute.
-        if (smartFadeActive && render.style != TransitionStyle.ECHO_REVERB_OUT && outProgress >= 0.80f) {
+        // The decisive cut, per style: long blends (DJ_BLEND) ring out to
+        // 0.95 so the release lands — the ear needs the tail to call the
+        // blend satisfying. Punchy types (DJ_FILTER/HARD/LOOP) keep the 0.80
+        // kill; echo and dissolve are exempt entirely (their tails ARE the
+        // style). Player volume is downstream of the whole chain (applied at
+        // the sink), so zeroing it silences the dry path absolutely while
+        // the EQ kill starves the sends of new feed. Placed after rideEq so
+        // it wins every tick; the EQ glide (~145 ms) makes the kill a fast
+        // smooth ramp, not a step.
+        val muteCutoff = when (render.style) {
+            TransitionStyle.DJ_BLEND -> 0.95f
+            TransitionStyle.ECHO_REVERB_OUT,
+            TransitionStyle.PLAIN_DISSOLVE,
+            -> Float.MAX_VALUE // exempt: never mutes
+            else -> 0.80f
+        }
+        if (smartFadeActive && outProgress >= muteCutoff) {
             out.volume = 0f
             eqFilters.outgoing(0f, 0f, 0f)
         } else if (!smartFadeActive && progress >= 0.80f) {
@@ -2025,21 +2047,36 @@ class CrossfadeController(
                     MID_KILL_LP_HZ.toFloat(),
                     TransitionFilterProcessor.OFF_HZ,
                 )
+                filters.incoming(
+                    TransitionFilterProcessor.OPEN_HZ,
+                    TransitionFilterProcessor.OFF_HZ,
+                )
             }
-            else -> filters.outgoing(
-                MID_KILL_BED_HZ.toFloat(),
-                TransitionFilterProcessor.OFF_HZ,
-            )
+            else -> {
+                filters.outgoing(
+                    MID_KILL_BED_HZ.toFloat(),
+                    TransitionFilterProcessor.OFF_HZ,
+                )
+                filters.incoming(
+                    TransitionFilterProcessor.OPEN_HZ,
+                    TransitionFilterProcessor.OFF_HZ,
+                )
+            }
         }
     }
 
     /**
      * Review v2.1 C2 proactive mid-cut: long smooth blends (overlap > 16 s)
      * put two full-range mixes on top of each other with no clash evidence to
-     * trigger the reactive kills. While the handoff crosses (0.30–0.70) the
+     * trigger the reactive kills. While the handoff crosses (0.40–0.60) the
      * outgoing LP sits at 600 Hz and the incoming HP at 300 Hz — gentler
      * than the reactive kill because nothing has proven a collision. Outside
      * the window the filters open (glided by the processor, never snapped).
+     *
+     * Satisfaction round §3: narrower window (was 0.30–0.70 — the old one
+     * was audible as processing) and gated on measured vocal overlap. A long
+     * bed with no clash evidence stays open; the EQ ducks plus the late bass
+     * swap already shape those.
      *
      * Deviation noted: the review gates this on similar spectral centroids,
      * but Render carries no centroid fields; overlap length alone is the
@@ -2047,7 +2084,7 @@ class CrossfadeController(
      */
     private fun rideProactiveMidCut(progress: Float) {
         val p = progress.toDouble()
-        if (p < 0.30 || p > 0.70) {
+        if (p < 0.40 || p > 0.60 || render.vocalOverlap <= 0.0) {
             filters.open()
             return
         }

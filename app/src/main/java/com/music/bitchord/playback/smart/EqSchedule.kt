@@ -35,8 +35,13 @@ object EqSchedule {
      * Null = no downbeat swap; the LOW band comes from the tables instead.
      */
     val BASS_SWAP_PROGRESS: Map<TransitionType, Float> = mapOf(
-        TransitionType.SMOOTH_CROSSFADE to 0.35f,
-        TransitionType.HARMONIC_BLEND to 0.30f,
+        // Satisfaction round §2: long beds swap late. On a ~20 s SMOOTH/HARM
+        // bed the old 0.35 arm fired the swap ~7 s in and stranded the rest
+        // of the blend bass-less. 0.65 fires ~13 s in — the swap stays the
+        // midpoint event. FILTER keeps 0.30: its B-mid keys (0.32-0.46) are
+        // ordered after the swap, and the sweep itself is the announcement.
+        TransitionType.SMOOTH_CROSSFADE to 0.65f,
+        TransitionType.HARMONIC_BLEND to 0.65f,
         TransitionType.FILTER_SWEEP to 0.30f,
         TransitionType.HALF_TIME_BLEND to 0.20f,
     )
@@ -225,12 +230,14 @@ object EqSchedule {
             listOf(Key(0f, EqGains.UNITY), Key(1f, EqGains.UNITY))
         TransitionType.FILTER_SWEEP -> listOf(
             // Finetune-overlap: B rises out of thin air — highs first, mids
-            // filling in only after the bass swap at 0.30, full by 0.70.
+            // filling in from 0.32 (after the 0.30 bass swap), half by 0.40,
+            // full by 0.70. Satisfaction round: the old 0.20-at-0.32 key left
+            // a mid hole exactly when A's mids were exiting.
             Key(0f, EqGains(1f, 0f, 0.40f)),
             Key(0.12f, EqGains(1f, 0f, 0.80f)),
             Key(0.22f, EqGains(1f, 0f, 1f)),
-            Key(0.32f, EqGains(1f, 0.20f, 1f)),
-            Key(0.46f, EqGains(1f, 0.52f, 1f)),
+            Key(0.32f, EqGains(1f, 0.35f, 1f)),
+            Key(0.40f, EqGains(1f, 0.52f, 1f)),
             Key(0.60f, EqGains(1f, 0.78f, 1f)),
             Key(0.70f, EqGains.UNITY),
             Key(1f, EqGains.UNITY),

@@ -1357,10 +1357,16 @@ fun planWsolaTransition(
 
     val audibleStart = incomingAudibleStart(nextAnalysis)
     val availableFadeBeats = max(0.0, incomingDropTime - audibleStart) / incomingBeatSeconds
-    val cappedByOverlap = floor(floor(MAX_OVERLAP_SECONDS / incomingBeatSeconds) / 4).toInt() * 4
+    // Satisfaction round §1: DJ Mode is long beds, not 7 s bridges. Lift the
+    // phrase-switch ceiling when the pair asked for mixset — the intro length
+    // still bounds it via availableFadeBeats below, and the clash shrink loop
+    // keeps vocals safe.
+    val overlapCeilingSeconds = if (mixset) 32.0 else MAX_OVERLAP_SECONDS
+    val maxFadeBeats = if (mixset) 48 else MAX_FADE_BEATS
+    val cappedByOverlap = floor(floor(overlapCeilingSeconds / incomingBeatSeconds) / 4).toInt() * 4
     if (cappedByOverlap < MIN_FADE_BEATS) return WsolaPlanResult.Refused("overlap-too-long")
     var fadeBeats = minOf(
-        MAX_FADE_BEATS,
+        maxFadeBeats,
         cappedByOverlap,
         floor(availableFadeBeats / 4).toInt() * 4,
     )
@@ -1619,9 +1625,9 @@ private fun adaptiveOverlap(
         val tempoDeviation = abs(1 - ratio)
         when {
             tempoDeviation < 0.02 && (distance == null || distance <= 1) -> 56
-            tempoDeviation < 0.04 && (distance == null || distance <= 3) -> 40
-            tempoDeviation < 0.06 -> 28
-            else -> 20
+            tempoDeviation < 0.04 && (distance == null || distance <= 3) -> 44
+            tempoDeviation < 0.06 -> 40
+            else -> 28
         }
     } else {
         // Finetune v1 §4.2: more room to mask mismatch (20), a viable minimum
@@ -1636,19 +1642,29 @@ private fun adaptiveOverlap(
     // falls while the incoming one rises is the ideal long blend; two risers
     // fighting each other get tightened. Slopes over 16 bars each side.
     val energyFactor = overlapEnergyFactor(analysis, nextAnalysis, transitionPoint, entryPoint)
+    val beatSeconds = 60 / currentBpm
     val djBeatCeiling = djModeMaxBeats(type).toInt()
     val bonusBeats = if (mixset) {
-        eqOverlapBonusBeats(
-            duckAMids = analysis.vocalProbability >= 0.62,
-            delayBMids = nextAnalysis.vocalProbability >= 0.62,
-            type = type,
-        )
+        // Satisfaction round §3: the bonus buys ducked seconds, so it is
+        // gated on the same ARM-time masks the renderer will arm — A-zone
+        // (first 70% of the estimated overlap back from the anchor) and
+        // B-entry (first 16 beats from the entry). The old whole-track
+        // scalars granted +8 beats to tracks that sing everywhere except
+        // inside the overlap, where no ducking would ever fire.
+        val estOverlap = (baseBeats * energyFactor).roundToInt() * beatSeconds
+        val duckA = vocalActivityBetween(
+            analysis, transitionPoint - estOverlap, transitionPoint - estOverlap * 0.30,
+        )?.let { it > 0.50 } ?: false
+        val entryWindow = nextAnalysis.beatInterval.takeIf { it > 0 }?.times(16) ?: 8.0
+        val delayB = vocalActivityBetween(
+            nextAnalysis, entryPoint, entryPoint + entryWindow,
+        )?.let { it > 0.45 } ?: false
+        eqOverlapBonusBeats(duckAMids = duckA, delayBMids = delayB, type = type)
     } else {
         0
     }
     val transitionBeats = ((baseBeats * energyFactor).roundToInt() + bonusBeats)
         .coerceIn(if (mixset) 16 else 4, if (mixset) max(16, djBeatCeiling) else 32)
-    val beatSeconds = 60 / currentBpm
     // Finetune v1 §4.2: minimum up 1 s across the board.
     val minimumOverlap = if (currentBpm >= 140) 7.0 else 5.0
 
