@@ -23,7 +23,7 @@ import org.junit.Test
  * localize by listening. Sine probes pin each band to its frequency range,
  * and the unity test pins the spec's flatness requirement (sum ≈ flat).
  */
-@OptIn(UnstableApi::class)
+@UnstableApi
 class DJBandEQTest {
 
     private val sampleRate = 44_100
