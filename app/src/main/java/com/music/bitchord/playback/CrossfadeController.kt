@@ -388,6 +388,9 @@ class CrossfadeController(
     // Click audit P0: edge-trigger for the INSTANT flip tick. Rearmed in
     // begin() with every other per-transition flag.
     private var cutFired = false
+    // Progress of the last driveFade tick: finish() uses it to decide whether
+    // the completion guard may fire (mid-fade) or must stand down (done).
+    private var lastProgress = 0f
     // DJ-EQ spec: bass-swap state machine. Armed at the schedule's progress,
     // fired once, then the LOW handover ramps over 2 bars. Rearmed in begin().
     private var eqSwapFired = false
@@ -1169,6 +1172,7 @@ class CrossfadeController(
         armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS
         handedOff = false
         cutFired = false
+        lastProgress = 0f
         outgoing = out
         incoming = into
 
@@ -1280,6 +1284,11 @@ class CrossfadeController(
         val into = incoming ?: return bail()
         reconcileQueue(out, into)
         TrackLog.d(TAG, "late handoff at cue=${into.currentPosition}ms out=${out.currentPosition}ms end=${fadeEndMs}ms")
+        // The incoming deck jumps 0→1 mid-waveform and the outgoing deck is
+        // retired at full gain: both edges land inside one guard window.
+        // lastProgress marks the rescue so finish()'s own guard agrees.
+        spliceGuards.cut()
+        lastProgress = 0f
         into.volume = 1f
         into.playWhenReady = true
         fadeStartedAt = SystemClock.elapsedRealtime()
@@ -1500,11 +1509,24 @@ class CrossfadeController(
         // Only from here, never during ARMING: the standby is silent until the
         // handoff, and [filters] describes the split between the track arriving
         // and the track leaving, which only exists once both are audible.
-        rideFilters(progress)
+        rideFilters(progress, inProgress)
         // DJ-EQ spec: per-tick 3-band targets from the type schedule. Runs
         // after the sweep ride; the emphasis pulse below touches the SVF, not
         // the EQ, so ordering between them is irrelevant.
         rideEq(progress)
+        // The decisive cut: from 80% the outgoing track is done being heard.
+        // Player volume is downstream of the whole chain (applied at the sink),
+        // so zeroing it silences the dry path absolutely while the EQ kill
+        // starves the sends of new feed — tails ring from their lines only.
+        // Placed after rideEq so it wins every tick; the EQ glide (~145 ms)
+        // makes the kill a fast smooth ramp, not a step. Echo-out is exempt:
+        // its tail-over-entry IS the style and dies with a volume mute.
+        if (smartFadeActive && render.style != TransitionStyle.ECHO_REVERB_OUT && outProgress >= 0.80f) {
+            out.volume = 0f
+            eqFilters.outgoing(0f, 0f, 0f)
+        } else if (!smartFadeActive && progress >= 0.80f) {
+            out.volume = 0f
+        }
         // v2 §7d/§11.2: no shelf on the processor, so the "low-shelf +3dB"
         // accent is a one-tick dip of the incoming high-pass to 80 Hz at
         // each planned phrase start — the spec's 16 ms pulse lands on the
@@ -1556,7 +1578,9 @@ class CrossfadeController(
             // Early done (natural end, cap clamp, toggled off) lands finish()
             // at progress < 1, where its volume/tempo snaps are audible. A
             // micro-fade here covers the settle; a completed fade skips it —
-            // at gain ≈ 1 an 8 ms dip would be the click.
+            // at gain ≈ 1 an 8 ms dip would be the click. lastProgress records
+            // the tick so finish() can apply the same rule independently.
+            lastProgress = progress
             if (progress < 0.98f) spliceGuards.cut()
             finish()
         }
@@ -1653,12 +1677,19 @@ class CrossfadeController(
             // The roles have already traded: the incoming player is the session
             // and owns the queue from here, and the outgoing one is spare.
             incoming?.let {
-                it.volume = 1f
+                // No redundant writes: setting what is already set is free on
+                // paper, but every sink call is a chance for the platform to
+                // do work at full volume.
+                if (it.volume < 0.999f) it.volume = 1f
                 // Undoes whatever [begin] stacked on for a beatmatched handoff —
                 // speed AND pitch. setPlaybackSpeed would leave a shifted pitch
                 // behind to leak into the next track, so both reset together.
                 // Skipped when nothing was applied: no pipeline re-prepare, no snap.
-                if (rateApplied) {
+                // And skipped when the glide already landed home: the deck is
+                // at its own tempo, so "resetting" would re-prepare the
+                // pipeline to arrive where it already is — the end-of-mix snap
+                // on every beatmatched blend.
+                if (rateApplied && tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02) {
                     it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
                 }
             }
@@ -1699,6 +1730,11 @@ class CrossfadeController(
      * of preparing it.
      */
     private fun retire(player: ExoPlayer) {
+        // Volume first, then stop: a spare retired mid-gain (late handoff,
+        // early done) would otherwise chop full-scale content into the next
+        // transition. The completion guard covers the PCM-16 splice; this
+        // covers everything downstream of it.
+        player.volume = 0f
         player.stop()
         player.clearMediaItems()
         player.volume = 1f
@@ -1774,7 +1810,7 @@ class CrossfadeController(
         eqFilters.incoming(lowIn, into.mid, into.high)
     }
 
-    private fun rideFilters(progress: Float) {
+    private fun rideFilters(progress: Float, inProgress: Float) {
         // Resonance belongs to the sweep gesture only; every other style
         // re-parks it so a previous DJ_FILTER transition never leaks Q.
         if (render.style != TransitionStyle.DJ_FILTER) filters.setResonance(1.0f)
@@ -1818,19 +1854,26 @@ class CrossfadeController(
             // behind a closing low-pass scaled by the plan's wet amount while
             // the incoming one opens dry. The dedicated echo send (P1) rides
             // on top of this; the wash alone already decays, never clashes.
-            TransitionStyle.ECHO_REVERB_OUT -> {
-                // Spec finetune §5 heavy clash: the plan carries a reverb
+                TransitionStyle.ECHO_REVERB_OUT -> {
+                // Spec finetune §5: the plan carries a reverb
                 // offset, and the envelope below replaces the P0 wash — the
                 // outgoing track holds full for 3 s, then sinks behind echo
                 // (1.0→0.70 wet) and reverb (→0.75, decaying — freeze removed:
                 // unity-feedback sustain clipped terrifyingly loud) while the
                 // incoming track waits out its delay before ramping in.
+                // ADSR release: as B enters (inProgress), the wash gets out
+                // of its way — wet multiplies down by the remaining entry
+                // headroom, so A's tail decays under B instead of parking
+                // loud over it. Series headroom: echo+reverb wet never
+                // exceeds the cap; the stack can't rebuild the clip the
+                // gain-staging removed.
                 val freezeAt = render.reverbFreezeAtSec
                 if (freezeAt != null && freezeAt.isFinite()) {
                     // No span field on Render: the plan stamps the overlap it
                     // sized into overlapSeconds, and the rides read it back.
                     val spanSec = render.overlapSeconds.toFloat().coerceAtLeast(1f)
                     val wetRamp = (progress * spanSec / HEAVY_CLASH_WET_RAMP_SEC).coerceIn(0f, 1f)
+                    val release = 1f - inProgress.coerceIn(0f, 1f)
                     filters.outgoing(20000f, 20f)
                     // Spec finetune §5: B enters under a 500 Hz high-pass that
                     // relaxes over 3.5 s from its start (4.5 s into the window),
@@ -1838,9 +1881,16 @@ class CrossfadeController(
                     val bElapsed = progress * spanSec - 4.5f
                     val bOpen = (bElapsed / 3.5f).coerceIn(0f, 1f)
                     filters.incoming(20000f, 500f * (1f - bOpen) + 20f * bOpen)
-                    echoFilters.outgoing(HEAVY_CLASH_ECHO_WET * wetRamp, render.echoBeatSeconds.toFloat())
+                    // The plan's graded echo amount, not the file constant:
+                    // heavyClashPlan scales it by the vocal gate, and a const
+                    // here would silently undo that grading.
+                    val echoW = render.echoAmount.toFloat() * wetRamp * release
+                    val verbW = (render.reverbAmount * wetRamp * release).toFloat()
+                    val wetSum = echoW + verbW
+                    val headroom = if (wetSum > SERIES_WET_CAP) SERIES_WET_CAP / wetSum else 1f
+                    echoFilters.outgoing(echoW * headroom, render.echoBeatSeconds.toFloat())
                     echoFilters.incoming(0f, 0f)
-                    reverbFilters.outgoing((render.reverbAmount * wetRamp).toFloat(), false)
+                    reverbFilters.outgoing(verbW * headroom, false)
                     reverbFilters.incoming(0f, false)
                 } else {
                     val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)
@@ -2306,16 +2356,20 @@ class CrossfadeController(
 
         /**
          * Spec v2 §9b: the heavy-clash wet ramps ride over this many seconds
-         * of the 8 s window (echo →0.60, reverb →0.60), then hold. Voiced so
-         * the echo-into-reverb stack never runs both sends at max together.
+         * of the 8 s window, then hold. Voiced so the echo-into-reverb stack
+         * never runs both sends at max together (see [SERIES_WET_CAP]).
          */
         const val HEAVY_CLASH_WET_RAMP_SEC = 3.5f
 
-        /** Spec v2 §9b: echo target at the end of the heavy-clash ramp. */
-        const val HEAVY_CLASH_ECHO_WET = 0.60f
-
         /** Spec v2 §9a: incoming reverb entry wet, draining over the fade. */
         const val PLAIN_DISSOLVE_IN_WET = 0.30f
+
+        /**
+         * Series headroom: echo + reverb wet on one deck never sum past this.
+         * The two sends stack (echo into reverb), so two modest wets rebuild
+         * the clip each avoids alone. 0.6 keeps the stack gain-staged.
+         */
+        const val SERIES_WET_CAP = 0.6f
 
         /** Spec v2 §9a: seconds for the incoming wet to drain to zero. */
         const val PLAIN_DISSOLVE_IN_DRAIN_SEC = 3.0f

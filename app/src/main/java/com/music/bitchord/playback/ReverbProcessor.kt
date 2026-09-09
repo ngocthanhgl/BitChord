@@ -42,6 +42,12 @@ class ReverbProcessor : BaseAudioProcessor() {
     private var combPos = IntArray(0)
     private var allpasses = Array(0) { FloatArray(0) }
     private var allpassPos = IntArray(0)
+    // Input darkening: one-pole low-pass state per channel. Schroeder combs
+    // ring hardest where sustained highs pile up; feeding them a darkened
+    // input keeps the tail airy without the metallic edge. Coefficient is
+    // derived from the sample rate at configure time.
+    private var darkState = FloatArray(0)
+    private var darkAlpha = 0.3f
 
     /**
      * Aims the send. [wet] 0..1 is the reverberated level against dry;
@@ -62,6 +68,7 @@ class ReverbProcessor : BaseAudioProcessor() {
         allpasses.forEach { it.fill(0f) }
         combPos.fill(0)
         allpassPos.fill(0)
+        darkState.fill(0f)
         currentWet = targetWet
     }
 
@@ -85,6 +92,11 @@ class ReverbProcessor : BaseAudioProcessor() {
         }
         allpassPos = IntArray(ALLPASS_DELAYS_MS.size)
         currentWet = targetWet
+        // ~5.5 kHz one-pole: alpha = dt/(RC+dt), RC = 1/(2π·f).
+        val rc = 1f / (6.2831853f * INPUT_DARKEN_HZ)
+        val dt = 1f / sampleRate.coerceAtLeast(8000)
+        darkAlpha = (dt / (rc + dt)).coerceIn(0.05f, 1f)
+        darkState = FloatArray(channelCount)
         return inputAudioFormat
     }
 
@@ -98,6 +110,7 @@ class ReverbProcessor : BaseAudioProcessor() {
         combPos = IntArray(0)
         allpasses = Array(0) { FloatArray(0) }
         allpassPos = IntArray(0)
+        darkState = FloatArray(0)
     }
 
     override fun queueInput(inputBuffer: java.nio.ByteBuffer) {
@@ -128,7 +141,12 @@ class ReverbProcessor : BaseAudioProcessor() {
             repeat(block) {
                 for (channel in 0 until channelCount) {
                     val dry = inputBuffer.short.toFloat()
-                    val input = if (freeze) 0f else dry
+                    // Darkened feed: highs excite the combs' metallic modes
+                    // far more than they contribute body; the dry path keeps
+                    // the full spectrum, only the tail input is rolled off.
+                    val darkened = darkState[channel] + darkAlpha * (dry - darkState[channel])
+                    darkState[channel] = darkened
+                    val input = if (freeze) 0f else darkened
                     var acc = 0f
                     for (i in combs.indices) {
                         val line = combs[i]
@@ -152,7 +170,7 @@ class ReverbProcessor : BaseAudioProcessor() {
                     }
                     // Gain-staged send, mirroring the echo: dry ducks as the tail
                     // rises so dense sustained input can't push the sum into
-                    // the hard clip. Unity when parked, ~0.70 dry at max wet.
+                    // the hard clip. Unity when parked, ~0.92 dry at max wet.
                     outputBuffer.putShort(clampToShort(dry * (1f - wet * DRY_COMP) + acc * wet))
                 }
                 for (i in combs.indices) {
@@ -176,14 +194,14 @@ class ReverbProcessor : BaseAudioProcessor() {
     companion object {
         private const val TAG = "BitChordReverb"
 
-        /** Matches the echo send: a send, not an instrument. */
-        private const val MAX_WET = 0.6f
+        /** Matches the echo send: a send, not an instrument. −9 dB at max. */
+        private const val MAX_WET = 0.34f
 
         /**
          * Dry-compensation slope, mirroring the echo send so the series stack
          * (echo into reverb) stays gain-staged at both stages.
          */
-        private const val DRY_COMP = 0.5f
+        private const val DRY_COMP = 0.25f
 
         /** Musical decay: ~2.5 s to −60 dB across the four combs. */
         private const val COMB_FEEDBACK = 0.84f
@@ -192,6 +210,9 @@ class ReverbProcessor : BaseAudioProcessor() {
         /** Classic Schroeder spacings, mutually near-prime. */
         private val COMB_DELAYS_MS = floatArrayOf(29.7f, 37.1f, 41.1f, 43.7f)
         private val ALLPASS_DELAYS_MS = floatArrayOf(5.0f, 1.7f)
+
+        /** Corner of the input-darkening one-pole. Above the vocal band. */
+        private const val INPUT_DARKEN_HZ = 5500f
 
         private const val BYTES_PER_SAMPLE = 2
         private const val GLIDE_FRAMES = 64

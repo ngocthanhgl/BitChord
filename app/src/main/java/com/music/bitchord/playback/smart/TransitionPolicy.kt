@@ -245,11 +245,11 @@ const val MIXSET_COOLDOWN_SLOPE_THRESHOLD = -0.002
 /** v2 §9a: silence-gap cutter thresholds. */
 const val SILENCE_RMS_THRESHOLD = 0.08
 const val SILENCE_MIN_DURATION_SECONDS = 0.6
-/** v2 §9a: PLAIN_DISSOLVE reverb wet on the outgoing track. */
-const val PLAIN_DISSOLVE_REVERB_WET = 0.55
-/** v2 §9b: heavy-clash forced echo/reverb amounts (voiced at the DSP caps). */
-const val HEAVY_CLASH_REVERB_WET = 0.60
-const val HEAVY_CLASH_ECHO_AMOUNT = 0.72
+/** v2 §9a: PLAIN_DISSOLVE reverb wet on the outgoing track. Voiced under the DSP cap. */
+const val PLAIN_DISSOLVE_REVERB_WET = 0.40
+/** v2 §9b: heavy-clash forced echo/reverb amounts (voiced under the DSP caps). */
+const val HEAVY_CLASH_REVERB_WET = 0.45
+const val HEAVY_CLASH_ECHO_AMOUNT = 0.50
 /** v2 §9b: reverb freeze point after transition start. */
 const val HEAVY_CLASH_FREEZE_OFFSET_SEC = 3.5
 

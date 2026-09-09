@@ -144,12 +144,15 @@ object EqSchedule {
         TransitionType.ECHO_REVERB_OUT -> listOf(
             // Finetune-overlap: bass out at 0.30 (echo bass is muddy), then a
             // long mid taper so A dissolves into pure reverb tail by 0.88.
+            // The mid dive starts at 0.70 on the schedule: B's entry band
+            // clears before the echo tail crosses it, and the tail retains
+            // the air while the mud leaves first.
             Key(0f, EqGains.UNITY),
             Key(0.22f, EqGains(1f, 1f, 1f)),
             Key(0.30f, EqGains(0f, 1f, 1f)),
             Key(0.46f, EqGains(0f, 0.72f, 1f)),
-            Key(0.60f, EqGains(0f, 0.42f, 0.85f)),
-            Key(0.74f, EqGains(0f, 0.18f, 0.62f)),
+            Key(0.58f, EqGains(0f, 0.42f, 0.85f)),
+            Key(0.70f, EqGains(0f, 0.18f, 0.62f)),
             Key(0.88f, EqGains(0f, 0.06f, 0.35f)),
             Key(1f, EqGains.SILENT),
         )

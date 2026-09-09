@@ -126,7 +126,7 @@ class EchoSendProcessor : BaseAudioProcessor() {
                     line[writePos * channelCount + channel] = dry + delayed * FEEDBACK
                     // Gain-staged send: dry ducks as the repeats rise, so a hot
                     // tail can never stack past full scale into the hard clip.
-                    // Unity when parked (wet = 0), ~0.64 dry at max wet.
+                    // Unity when parked (wet = 0), ~0.88 dry at max wet.
                     outputBuffer.putShort(clampToShort(dry * (1f - wet * DRY_COMP) + delayed * wet))
                 }
                 writePos = (writePos + 1) % lineFrames
@@ -142,18 +142,19 @@ class EchoSendProcessor : BaseAudioProcessor() {
     companion object {
         private const val TAG = "BitChordEchoSend"
 
-        /** Repeats never exceed dry: this is a send, not an instrument. */
-        private const val MAX_WET = 0.72f
+        /** Repeats sit under dry: this is a send, not an instrument. −6 dB at max. */
+        private const val MAX_WET = 0.50f
 
         /** Each repeat keeps this much of itself. ~4 audible tails per throw. */
         private const val FEEDBACK = 0.38f
 
         /**
          * Dry-compensation slope: dry scales by (1 − wet·DRY_COMP) as the send
-         * rises. 0.5 keeps the summed bus under full scale on dense material
-         * without thinning the dry at musical wet levels.
+         * rises. 0.25 keeps the summed bus under full scale without thinning
+         * the dry at musical wet levels — the old 0.5 ducked the vocal just
+         * when it needed to sit above the repeats.
          */
-        private const val DRY_COMP = 0.5f
+        private const val DRY_COMP = 0.25f
 
         /** Longest single throw. A 1-bar delay at 60 BPM is 4 s; cap above it. */
         private const val MAX_DELAY_SECONDS = 4.5f

@@ -626,6 +626,13 @@ private fun heavyClashPlan(
     val fadeSec = 8.0
     val transitionStart = max(0.0, mixAnchor - fadeSec)
     val started = playbackTime >= transitionStart
+    // Vocal gate: the clash that summoned this plan grades its own wash. A
+    // full double-chorus collision gets the floor (×0.35) — maximum words
+    // need minimum wash — while a mild brush keeps most of it. The renderer
+    // releases the rest as B enters, so this gate sets the peak, not the tail.
+    val clash = plannedVocalOverlap(analysis, nextAnalysis, transitionStart, mixAnchor, entry, 1.0)
+        .coerceIn(0.0, 1.0)
+    val clashGate = (1.0 - clash).coerceIn(0.35, 1.0)
     return TransitionPlan(
         shouldStart = started,
         markerVisible = true,
@@ -640,12 +647,16 @@ private fun heavyClashPlan(
         type = TransitionType.ECHO_REVERB_OUT,
         score = score,
         overlapSeconds = fadeSec,
-        echoAmount = HEAVY_CLASH_ECHO_AMOUNT,
-        reverbAmount = HEAVY_CLASH_REVERB_WET,
+        echoAmount = HEAVY_CLASH_ECHO_AMOUNT * clashGate,
+        reverbAmount = HEAVY_CLASH_REVERB_WET * clashGate,
         reverbFreezeAtSec = HEAVY_CLASH_FREEZE_OFFSET_SEC,
         incomingStartDelaySec = 4.5,
         outgoingHoldSec = 3.0,
-        volumeCurve = VolumeCurve.S_CURVE,
+        // LOGARITHMIC, not the S-curve: this plan only exists for vocal
+        // clashes, and the log's fast early drop clears A's voice before B
+        // arrives. (The central choke would do it anyway; stating it here
+        // keeps the plan self-describing.)
+        volumeCurve = VolumeCurve.LOGARITHMIC,
         policyReasons = reasons,
         reason = if (started) "smart-heavy-clash-echo" else "before-heavy-clash",
     )
@@ -743,8 +754,8 @@ private fun echoOutPlan(
     val maxHandoff = nextLength - MIN_INCOMING_CLEARANCE_SECONDS
     val handoff = if (nextLength > 0 && maxHandoff >= cue) min(cue, maxHandoff) else cue
     val started = playbackTime >= transitionStart
-    // Voiced at the echo DSP cap: the plan never asks for wet the send clamps.
-    val echoAmount = ((0.50 - score.bpm) / 0.50).coerceIn(0.3, 0.72)
+    // Voiced under the echo DSP cap: the plan never asks for wet the send clamps.
+    val echoAmount = ((0.50 - score.bpm) / 0.50).coerceIn(0.3, 0.50)
     return TransitionPlan(
         shouldStart = started,
         markerVisible = true,
@@ -1731,6 +1742,13 @@ private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrac
  * through it.
  */
 internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: Boolean): TransitionPlan {
+    // Vocal-heavy blends ride LOGARITHMIC: on matched grids the S-curve's
+    // slow middle stacks two voices at near-full level, while the log's fast
+    // early drop of the outgoing track clears the band B is entering.
+    // Central choke — every smart plan passes through here.
+    if (plan.vocalOverlap > 0.5 && plan.volumeCurve == VolumeCurve.S_CURVE) {
+        return plan.copy(volumeCurve = VolumeCurve.LOGARITHMIC)
+    }
     return plan
 }
 

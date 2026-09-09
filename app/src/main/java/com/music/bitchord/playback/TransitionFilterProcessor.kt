@@ -314,6 +314,8 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
          * 1.5–2.5. Outgoing LP only — resonance on a high-pass sounds bad.
          */
         const val FILTER_SWEEP_Q_FACTOR = 1.8f
+        /** Resonance park value: unity multiplier, the state outside DJ_FILTER. */
+        const val NEUTRAL_Q = 1.0f
 
         private const val MIN_HZ = 10f
         private const val BYTES_PER_SAMPLE = 2
@@ -356,6 +358,11 @@ interface TransitionFilters {
 
     /** Parks both. Called whenever a transition ends, however it ended. */
     fun open() {
+        // Resonance parks too: a DJ_FILTER arm's Q=1.8 left aimed would meet
+        // the next transition's first sweep target mid-glide — the click the
+        // resonant-sweep audit chased. Neutral Q is unity-adjacent, so the
+        // chase home is inaudible.
+        setResonance(TransitionFilterProcessor.NEUTRAL_Q)
         incoming(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
         outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
     }
