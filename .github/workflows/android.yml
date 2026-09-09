@@ -100,5 +100,6 @@ jobs:
         NOTES="Automated prod release (build ${{ github.run_number }}, commit ${{ github.sha }}).
         DJ Automix: beat-matched blends, isolator bass swap, gain-staged reverb/echo, click-free handoffs."
         gh release create "$TAG" dist/*.apk \
+          --repo "ngocthanhgl/BitChord" \
           --title "BitChord DJ Mix v1.5.2 (build ${{ github.run_number }})" \
           --notes "$NOTES"
