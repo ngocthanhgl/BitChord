@@ -743,7 +743,8 @@ private fun echoOutPlan(
     val maxHandoff = nextLength - MIN_INCOMING_CLEARANCE_SECONDS
     val handoff = if (nextLength > 0 && maxHandoff >= cue) min(cue, maxHandoff) else cue
     val started = playbackTime >= transitionStart
-    val echoAmount = ((0.50 - score.bpm) / 0.50).coerceIn(0.3, 1.0)
+    // Voiced at the echo DSP cap: the plan never asks for wet the send clamps.
+    val echoAmount = ((0.50 - score.bpm) / 0.50).coerceIn(0.3, 0.72)
     return TransitionPlan(
         shouldStart = started,
         markerVisible = true,

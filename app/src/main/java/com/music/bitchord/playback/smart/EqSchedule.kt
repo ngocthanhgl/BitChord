@@ -45,7 +45,8 @@ object EqSchedule {
      * Swap duration in bars. The spec voices 2 bars for every downbeat swap;
      * the table-driven types don't swap at all.
      */
-    const val SWAP_BARS = 2.0
+    /** DJ hard swap: the LOW handover completes in 2 beats on the fired downbeat. */
+    const val SWAP_BARS = 0.5
 
     fun outgoingGains(type: TransitionType, progress: Float, duckAMids: Boolean): EqGains =
         at(outgoingKeys(type, duckAMids), progress)
@@ -84,11 +85,11 @@ object EqSchedule {
             if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.15f, EqGains(1f, 0.88f, 1f)),
-                    Key(0.30f, EqGains(1f, 0.68f, 1f)),
-                    Key(0.45f, EqGains(1f, 0.48f, 1f)),
-                    Key(0.60f, EqGains(1f, 0.30f, 1f)),
-                    Key(0.75f, EqGains(1f, 0.22f, 0.82f)),
+                    Key(0.15f, EqGains(1f, 0.82f, 1f)),
+                    Key(0.30f, EqGains(1f, 0.38f, 1f)),
+                    Key(0.45f, EqGains(1f, 0.28f, 1f)),
+                    Key(0.60f, EqGains(1f, 0.20f, 1f)),
+                    Key(0.75f, EqGains(1f, 0.12f, 0.82f)),
                     Key(0.90f, EqGains(1f, 0.10f, 0.55f)),
                     Key(1f, EqGains.SILENT),
                 )
@@ -109,11 +110,11 @@ object EqSchedule {
             if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.18f, EqGains(1f, 0.92f, 1f)),
-                    Key(0.32f, EqGains(1f, 0.74f, 1f)),
-                    Key(0.46f, EqGains(1f, 0.54f, 1f)),
-                    Key(0.60f, EqGains(1f, 0.35f, 1f)),
-                    Key(0.74f, EqGains(1f, 0.22f, 0.88f)),
+                    Key(0.18f, EqGains(1f, 0.80f, 1f)),
+                    Key(0.32f, EqGains(1f, 0.55f, 1f)),
+                    Key(0.46f, EqGains(1f, 0.38f, 1f)),
+                    Key(0.60f, EqGains(1f, 0.25f, 1f)),
+                    Key(0.74f, EqGains(1f, 0.15f, 0.88f)),
                     Key(0.88f, EqGains(1f, 0.10f, 0.65f)),
                     Key(1f, EqGains.SILENT),
                 )
@@ -166,11 +167,11 @@ object EqSchedule {
             if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
-                    Key(0.14f, EqGains(1f, 0.88f, 1f)),
-                    Key(0.26f, EqGains(1f, 0.68f, 1f)),
-                    Key(0.40f, EqGains(1f, 0.48f, 1f)),
-                    Key(0.55f, EqGains(1f, 0.30f, 1f)),
-                    Key(0.68f, EqGains(1f, 0.20f, 0.85f)),
+                    Key(0.14f, EqGains(1f, 0.75f, 1f)),
+                    Key(0.26f, EqGains(1f, 0.50f, 1f)),
+                    Key(0.40f, EqGains(1f, 0.35f, 1f)),
+                    Key(0.55f, EqGains(1f, 0.22f, 1f)),
+                    Key(0.68f, EqGains(1f, 0.15f, 0.85f)),
                     Key(0.82f, EqGains(1f, 0.10f, 0.58f)),
                     Key(1f, EqGains.SILENT),
                 )

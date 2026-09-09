@@ -1462,8 +1462,20 @@ class CrossfadeController(
                 out.volume = (1f - outProgress).pow(2f)
             }
             VolumeCurve.INSTANT -> {
-                player.volume = if (inProgress >= 1f) 1f else 0f
-                out.volume = if (outProgress >= 1f) 0f else 1f
+                // The final 90 ms rides a linear settle toward the flip
+                // endpoints instead of holding then stepping: identical
+                // endpoints, no timing change, but no full-scale step for the
+                // speaker when the splice guard bows out (non-PCM-16 input).
+                // Spans under 90 ms behave exactly as before.
+                val remainingMs = span - elapsed
+                if (remainingMs <= INSTANT_SETTLE_MS) {
+                    val s = (1f - remainingMs.toFloat() / INSTANT_SETTLE_MS).coerceIn(0f, 1f)
+                    player.volume = s
+                    out.volume = 1f - s
+                } else {
+                    player.volume = if (inProgress >= 1f) 1f else 0f
+                    out.volume = if (outProgress >= 1f) 0f else 1f
+                }
                 // Edge-trigger the splice guard at the flip tick: both decks
                 // step full-scale here, each mid-waveform. The guard's 8+8 ms
                 // ramps replace the step; the volume curve itself is untouched.
@@ -1540,7 +1552,14 @@ class CrossfadeController(
             out.playbackState == Player.STATE_ENDED ||
             out.playbackState == Player.STATE_IDLE ||
             settingSwitchedOff
-        if (done) finish()
+        if (done) {
+            // Early done (natural end, cap clamp, toggled off) lands finish()
+            // at progress < 1, where its volume/tempo snaps are audible. A
+            // micro-fade here covers the settle; a completed fade skips it —
+            // at gain ≈ 1 an 8 ms dip would be the click.
+            if (progress < 0.98f) spliceGuards.cut()
+            finish()
+        }
     }
 
     /** Ramps the outgoing track away rather than cutting it, so an interruption has no click in it. */
@@ -1617,6 +1636,11 @@ class CrossfadeController(
         }
         AppSettings.smartMixInProgress.value = false
         AppSettings.sharedHalfTimeBpm.value = null
+        // Capture before Render() is parked below: the tempo/pitch reset must
+        // only run when a stretch or shift was actually applied. An
+        // unconditional setPlaybackParameters re-prepares ExoPlayer's audio
+        // pipeline at full volume — the end-of-mix snap on every plain blend.
+        val rateApplied = incomingPlaybackRate != 1.0 || render.keyShiftSemitones != 0
         // Unconditional and idempotent, like the speed reset below: correct
         // whether or not this transition ever filtered anything.
         filters.open()
@@ -1633,9 +1657,10 @@ class CrossfadeController(
                 // Undoes whatever [begin] stacked on for a beatmatched handoff —
                 // speed AND pitch. setPlaybackSpeed would leave a shifted pitch
                 // behind to leak into the next track, so both reset together.
-                // Unconditional and idempotent, so this is correct whether or
-                // not a stretch or shift was ever actually applied.
-                it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
+                // Skipped when nothing was applied: no pipeline re-prepare, no snap.
+                if (rateApplied) {
+                    it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
+                }
             }
             outgoing?.let(::retire)
         } else {
@@ -1735,7 +1760,12 @@ class CrossfadeController(
                 } else {
                     1f
                 }
-                (1f - t) to t
+                // DJ hard swap: the 2-beat handover rides a smoothstep, not a
+                // line — full speed mid-swap, zero slope at both ends so the
+                // 30 ms re-aims never step. Endpoints identical to the linear
+                // trade, only the gesture changes.
+                val s = t * t * (3f - 2f * t)
+                (1f - s) to s
             }
         } else {
             out.low to into.low
@@ -2268,13 +2298,21 @@ class CrossfadeController(
         const val BAIL_MS = 120L
 
         /**
+         * The INSTANT flip settles over this long instead of stepping: the
+         * endpoints are identical, only the last window changes, so hard cuts
+         * keep their timing while losing the full-scale step.
+         */
+        const val INSTANT_SETTLE_MS = 90L
+
+        /**
          * Spec v2 §9b: the heavy-clash wet ramps ride over this many seconds
-         * of the 8 s window (echo 1.0→0.70, reverb →0.80), then hold.
+         * of the 8 s window (echo →0.60, reverb →0.60), then hold. Voiced so
+         * the echo-into-reverb stack never runs both sends at max together.
          */
         const val HEAVY_CLASH_WET_RAMP_SEC = 3.5f
 
         /** Spec v2 §9b: echo target at the end of the heavy-clash ramp. */
-        const val HEAVY_CLASH_ECHO_WET = 0.70f
+        const val HEAVY_CLASH_ECHO_WET = 0.60f
 
         /** Spec v2 §9a: incoming reverb entry wet, draining over the fade. */
         const val PLAIN_DISSOLVE_IN_WET = 0.30f

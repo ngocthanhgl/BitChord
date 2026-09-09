@@ -150,7 +150,10 @@ class ReverbProcessor : BaseAudioProcessor() {
                         line[pos * channelCount + channel] = acc + ALLPASS_FEEDBACK * delayed
                         acc = out
                     }
-                    outputBuffer.putShort(clampToShort(dry + acc * wet))
+                    // Gain-staged send, mirroring the echo: dry ducks as the tail
+                    // rises so dense sustained input can't push the sum into
+                    // the hard clip. Unity when parked, ~0.70 dry at max wet.
+                    outputBuffer.putShort(clampToShort(dry * (1f - wet * DRY_COMP) + acc * wet))
                 }
                 for (i in combs.indices) {
                     combPos[i] = (combPos[i] + 1) % (combs[i].size / channelCount)
@@ -175,6 +178,12 @@ class ReverbProcessor : BaseAudioProcessor() {
 
         /** Matches the echo send: a send, not an instrument. */
         private const val MAX_WET = 0.6f
+
+        /**
+         * Dry-compensation slope, mirroring the echo send so the series stack
+         * (echo into reverb) stays gain-staged at both stages.
+         */
+        private const val DRY_COMP = 0.5f
 
         /** Musical decay: ~2.5 s to −60 dB across the four combs. */
         private const val COMB_FEEDBACK = 0.84f
