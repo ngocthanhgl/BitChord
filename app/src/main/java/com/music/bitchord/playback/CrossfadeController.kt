@@ -1254,7 +1254,46 @@ class CrossfadeController(
         // analyzed mix-out anchor when it ends before the file does.
         val atFadePoint = fadeEndMs <= 0L || fadeEndMs - out.currentPosition <= fadeMs
         if (!atFadePoint) return
-        if (ready) startFade()
+        if (!ready) return
+        // Late-start guard: the whole fade window elapsed while the standby
+        // buffered, so starting the blend now would run every ride at
+        // progress ~1 on its first ticks — the effect compressed into a
+        // second and finish() snapping B to full volume. An honest immediate
+        // handoff instead of a fake blend.
+        val overshootMs = out.currentPosition - (fadeEndMs - fadeMs)
+        if (fadeEndMs > 0L && fadeMs > 0L && overshootMs >= fadeMs) {
+            startLateHandoff()
+        } else {
+            startFade()
+        }
+    }
+
+    /**
+     * The fade window fully passed before the standby was ready: B enters at
+     * full volume from its cue and A retires now, with the same bookkeeping
+     * as [startFade] (queue, session, marker) but no zero-volume charade on
+     * the way in. [finish] does the retiring — handedOff is set, so it keeps
+     * the incoming player at full and stops the outgoing one.
+     */
+    private fun startLateHandoff() {
+        val out = outgoing ?: return bail()
+        val into = incoming ?: return bail()
+        reconcileQueue(out, into)
+        TrackLog.d(TAG, "late handoff at cue=${into.currentPosition}ms out=${out.currentPosition}ms end=${fadeEndMs}ms")
+        into.volume = 1f
+        into.playWhenReady = true
+        fadeStartedAt = SystemClock.elapsedRealtime()
+        listenTo(into)
+        handedOff = true
+        onHandoff(out, into)
+        if (out.mediaItemCount > out.currentMediaItemIndex + 1) {
+            out.removeMediaItems(out.currentMediaItemIndex + 1, out.mediaItemCount)
+        }
+        AppSettings.smartMixInProgress.value = false
+        AppSettings.smartTransitionWindow.value = null
+        clearMarkerLatch()
+        phase = Phase.FADING
+        finish()
     }
 
     /**
@@ -1382,7 +1421,16 @@ class CrossfadeController(
         // vaporises it: below 2 s the ear hears a cut, not a mix. Completion
         // is still safe — `done` below also fires on the outgoing track
         // ending, so an over-long span cannot hang the handoff.
-        val span = minOf(fadeMs, incomingCap).coerceAtLeast(2000L)
+        // An INSTANT plan (hard cut, loop drop) flips on a tick, it never
+        // blends: stretching it to the 2 s audibility floor manufactures
+        // seconds of B-side silence ending in a flip — the "nothing, then the
+        // next track at full volume" complaint. The floor stays for every
+        // curve that actually travels it.
+        val span = if (render.volumeCurve == VolumeCurve.INSTANT) {
+            minOf(fadeMs, incomingCap).coerceAtLeast(1L)
+        } else {
+            minOf(fadeMs, incomingCap).coerceAtLeast(2000L)
+        }
         val elapsed = (player.currentPosition - incomingCueTimeMs).coerceAtLeast(0L)
         val progress = (elapsed.toFloat() / span).coerceIn(0f, 1f)
 

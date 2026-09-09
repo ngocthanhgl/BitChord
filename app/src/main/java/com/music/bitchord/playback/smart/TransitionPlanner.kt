@@ -1888,8 +1888,15 @@ private fun planTransitionInner(
     val buildupB = buildupStart(nextAnalysis, dropInB ?: proxyEntry) ?: proxyEntry
     val highEnergyB = isHighEnergyAt(nextAnalysis, buildupB)
     val beatOrHalf = policy.tier == TransitionTier.BEATMATCHED || policy.tier == TransitionTier.HALF_TIME
+    // LOOP needs a real drop, not a lone spike: firstDropSec fires on any
+    // 1.5×-mean peak past the intro (a loud fill, a mastered chorus entry),
+    // and an 8 s B-gated hole on a phantom drop is the "nothing, then the
+    // next track at full volume" complaint. A drop with a findable buildup
+    // foot is a structure; without one the pair stays a blend-matrix
+    // candidate, never a cut.
+    val realDropInB = dropInB != null && buildupStart(nextAnalysis, dropInB) != null
     val selectedType = if (beatOrHalf || policy.tier == TransitionTier.DJ_ASSISTED) {
-        selectTransitionType(proxyScore, policy.tier, highEnergyA, highEnergyB, dropInB != null)
+        selectTransitionType(proxyScore, policy.tier, highEnergyA, highEnergyB, realDropInB)
     } else {
         // Unreachable today (PLAIN returns upstream), kept as the closed
         // default so a future tier degrades to a blend, never to a crash.
