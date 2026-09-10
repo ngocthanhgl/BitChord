@@ -1892,7 +1892,10 @@ internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: 
     // M3: the flip is paired with the duck-voiced EQ key set (see
     // forceDuckKeys) and logged, so the curve and the EQ never disagree
     // about how vocal this blend is.
-    if (plan.vocalOverlap > 0.5 && plan.volumeCurve == VolumeCurve.S_CURVE) {
+    // P2.2: the old >0.5 bar (≈ both sides hot simultaneously) almost never
+    // fired, leaving vocal pairs on the shallow non-duck taper. >0.2 voices
+    // the duck set for any real collision while still ignoring trace reads.
+    if (plan.vocalOverlap > 0.2 && plan.volumeCurve == VolumeCurve.S_CURVE) {
         return plan.copy(
             volumeCurve = VolumeCurve.LOGARITHMIC,
             forceDuckKeys = true,

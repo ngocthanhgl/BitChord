@@ -33,6 +33,8 @@ import com.music.bitchord.playback.smart.VOCAL_ACTIVE_THRESHOLD
 import com.music.bitchord.playback.smart.MIN_GUARANTEED_BLEND_SECONDS
 import kotlin.math.max
 import com.music.bitchord.playback.smart.plainDissolvePlan
+import com.music.bitchord.playback.smart.MixRecipe
+import com.music.bitchord.playback.smart.selectMixRecipe
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -362,6 +364,12 @@ class CrossfadeController(
          * swap needs.
          */
         val eqType: TransitionType = TransitionType.SMOOTH_CROSSFADE,
+        /**
+         * P2-smart: the conductor's recipe for this pair (see MixConductor).
+         * Decided once at ARM time from the model's evidence; the render
+         * actors perform it without re-deciding. Default is the neutral bed.
+         */
+        val mixRecipe: MixRecipe = MixRecipe.INSTRUMENTAL_BED,
         /** DJ-EQ spec: false = leave both decks at unity (standard fades). */
         val eqEnabled: Boolean = false,
         /** DJ-EQ spec: A sings in the transition zone — duck its mids. */
@@ -408,6 +416,12 @@ class CrossfadeController(
     // Click audit P0: edge-trigger for the INSTANT flip tick. Rearmed in
     // begin() with every other per-transition flag.
     private var cutFired = false
+    /**
+     * P2-smart kill-once: once the mute block disposes the dry path, the
+     * schedule has nothing left to voice — rideEq holds the kill instead of
+     * re-aiming nonzero gains every tick (DSP churn with no audible effect).
+     */
+    private var dryKilled = false
     // Progress of the last driveFade tick: finish() uses it to decide whether
     // the completion guard may fire (mid-fade) or must stand down (done).
     private var lastProgress = 0f
@@ -1107,6 +1121,17 @@ class CrossfadeController(
             Float.POSITIVE_INFINITY
         }
 
+        // P2-smart: the conductor reads the model's evidence once and picks
+        // the pair's recipe — the render then performs it without voting.
+        // dropConfidence is null for unmeasured fallback drops (never a cut).
+        val mixRecipe = selectMixRecipe(
+            type = plan.type,
+            duckA = duckAMids,
+            delayB = delayBMids,
+            forceDuck = plan.forceDuckKeys,
+            vocalOverlap = plan.vocalOverlap,
+            dropConfidence = nextAnalysis?.dropConfidence,
+        )
         if (!begin(
             fade,
             endMs = (plan.transitionEnd * 1000).roundToLong(),
@@ -1150,6 +1175,7 @@ class CrossfadeController(
                 overlapSeconds = plan.fadeSeconds,
                 eqType = plan.type,
                 eqEnabled = true,
+                mixRecipe = mixRecipe,
                 duckAMids = duckAMids,
                 delayBMids = delayBMids,
                 forceDuckKeys = plan.forceDuckKeys,
@@ -1335,6 +1361,7 @@ class CrossfadeController(
         armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS
         handedOff = false
         cutFired = false
+        dryKilled = false
         lastProgress = 0f
         lastCommittedRate = null
         lastRateCommitAt = 0L
@@ -1434,9 +1461,12 @@ class CrossfadeController(
             // used to land as one rate step at startFade, mid-fade and
             // audible. Instead the outgoing deck eases onto the grid during
             // the last 4 s before the fade point — the DJ nudging the pitch
-            // fader before touching the crossfader. Arming ticks are slow
-            // (~4/s), so these commits are sparse by construction; startFade
-            // keeps its exact set as the idempotent landing for the residual.
+            // fader before touching the crossfader. P1.1: coalesced like the
+            // in-fade glide — an uncoalesced commit every 40 ms ARM tick
+            // re-prepares the audible pipeline ~25×/s with growing deltas,
+            // heard as pre-mix chatter 1–2 s before the blend. Same 0.15% /
+            // 150 ms gate as driveFade; startFade keeps its exact set as the
+            // idempotent landing for the residual.
             if (render.outgoingPlaybackRate != 1.0 && fadeEndMs > 0L && fadeMs > 0L) {
                 val leadMs = minOf(4000L, fadeMs).coerceAtLeast(1L)
                 val leadStart = fadeEndMs - fadeMs - leadMs
@@ -1445,7 +1475,15 @@ class CrossfadeController(
                     val eased = ramp * ramp * (3f - 2f * ramp) // smoothstep
                     val rate = (AppSettings.playbackSpeed.value *
                         (1.0 + (render.outgoingPlaybackRate - 1.0) * eased)).toFloat()
-                    out.setPlaybackParameters(PlaybackParameters(rate, 1f))
+                    val now = SystemClock.uptimeMillis()
+                    val last = lastCommittedRate
+                    if (last == null || abs(rate - last) / max(abs(last), 1e-6f) >= 0.0015f ||
+                        now - lastRateCommitAt >= 150L
+                    ) {
+                        out.setPlaybackParameters(PlaybackParameters(rate, 1f))
+                        lastCommittedRate = rate
+                        lastRateCommitAt = now
+                    }
                 }
             }
             return
@@ -1481,6 +1519,14 @@ class CrossfadeController(
         // lastProgress marks the rescue so finish()'s own guard agrees.
         spliceGuards.cut()
         lastProgress = 0f
+        // P1.2: undo begin()'s stacked rate while the deck is still silent.
+        // finish() would do it at full volume (lastProgress=0 → glide 1.0 →
+        // guard passes) — the end-of-mix snap on the rescue path. deckRateReset
+        // tells finish() the deck is already home (rearmed in begin()).
+        if (incomingPlaybackRate != 1.0f || render.keyShiftSemitones != 0) {
+            into.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
+            deckRateReset = true
+        }
         into.volume = 1f
         into.playWhenReady = true
         fadeStartedAt = SystemClock.elapsedRealtime()
@@ -1739,11 +1785,19 @@ class CrossfadeController(
             TransitionStyle.ECHO_REVERB_OUT,
             TransitionStyle.PLAIN_DISSOLVE,
             -> Float.MAX_VALUE // exempt: never mutes
+            // P1.3: CUT families hold full gain until the flip by contract
+            // (INSTANT curve); the 0.80 mute manufactured seconds of silence
+            // before the guard fires. The edge-triggered splice guard + 90 ms
+            // settle own the click here, not the mute.
+            TransitionStyle.HARD_CUT,
+            TransitionStyle.LOOP_CUT_DROP,
+            -> Float.MAX_VALUE // exempt: flip owns the handoff
             else -> 0.80f
         }
         if (smartFadeActive && outProgress >= muteCutoff) {
             out.volume = 0f
             eqFilters.outgoing(0f, 0f, 0f)
+            dryKilled = true
         } else if (!smartFadeActive && progress >= 0.80f) {
             out.volume = 0f
         }
@@ -2068,7 +2122,29 @@ class CrossfadeController(
         } else {
             out.low to into.low
         }
-        eqFilters.outgoing(lowOut, out.mid, out.high)
+        // P2-smart ownership: the recipe — not the schedule — owns the outgoing
+        // mids/highs once the incoming voice is in play. The DJ vocal
+        // handoff: the old vocal yields its band gradually, reaching ~0 at
+        // outProgress 0.80, while its bass stays for the swap machine and the
+        // incoming deck keeps full mids. From there the listener hears only
+        // the new vocal; the volume mute later disposes an already-empty band.
+        // WASH_OUT gets the same early mid-cut (its wet tail still rings —
+        // sends are starved, not drained). Kill-once: after the mute fires,
+        // hold the kill instead of re-voicing the schedule every tick.
+        val incomingSings = delay || liveDelayB > 0.5f || render.forceDuckKeys
+        if (dryKilled) {
+            eqFilters.outgoing(0f, 0f, 0f)
+        } else {
+            val ownership = if (
+                (render.mixRecipe == MixRecipe.VOCAL_DUEL || render.mixRecipe == MixRecipe.WASH_OUT) &&
+                incomingSings
+            ) {
+                ((0.80f - outProgress) / 0.80f).coerceIn(0f, 1f)
+            } else {
+                1f
+            }
+            eqFilters.outgoing(lowOut, out.mid * ownership, out.high * ownership)
+        }
         eqFilters.incoming(lowIn, into.mid, into.high)
     }
 
@@ -2329,8 +2405,12 @@ class CrossfadeController(
      */
     private fun rideProactiveMidCut(progress: Float) {
         val p = progress.toDouble()
+        // P2-smart: outside its window the proactive cut holds — it never
+        // opens the filter anymore. The old unconditional open() erased the
+        // separation/sweep shaping gliding underneath every tick (audible
+        // pumping at the window edges); the recipe owns the band plan, this
+        // actor only voices its window.
         if (p < 0.40 || p > 0.60 || render.vocalOverlap <= 0.0) {
-            filters.open()
             return
         }
         filters.outgoing(
