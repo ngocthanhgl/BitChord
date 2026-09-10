@@ -1755,6 +1755,21 @@ class CrossfadeController(
                 out.volume = fallGain(outProgress)
             }
         }
+        // DJ level-ride: both faders stay up, EQ tells the story. For the
+        // long-blend recipes the outgoing deck holds full level instead of
+        // riding the crossfade decay — the handoff is the EQ ownership ramp
+        // + bass swap + the existing mute disposal, never a volume valley.
+        // The vocal choke's LOG flip is bypassed here (its forceDuckKeys
+        // still drive the EQ below); wash and cut families keep their curves.
+        // Flat absolute: bands never stack (bass swaps, mids yield by 0.80),
+        // so the sum stays clean without a coexistence pad.
+        val levelRide = render.eqEnabled &&
+            (render.style == TransitionStyle.DJ_BLEND || render.style == TransitionStyle.DJ_FILTER) &&
+            (render.mixRecipe == MixRecipe.VOCAL_DUEL || render.mixRecipe == MixRecipe.INSTRUMENTAL_BED)
+        if (levelRide) {
+            player.volume = riseGain(inProgress)
+            out.volume = 1f
+        }
         // Half-time downbeat emphasis (§11.2): a 2-frame low-pass pulse as the
         // stretched grid crosses each planned phrase start. Tracked so a pulse
         // fires once per offset even across pause-parked ticks.
