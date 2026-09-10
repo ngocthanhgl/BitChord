@@ -632,7 +632,13 @@ private fun heavyClashPlan(
     // releases the rest as B enters, so this gate sets the peak, not the tail.
     val clash = plannedVocalOverlap(analysis, nextAnalysis, transitionStart, mixAnchor, entry, 1.0)
         .coerceIn(0.0, 1.0)
-    val clashGate = (1.0 - clash).coerceIn(0.35, 1.0)
+    // Full-audit P0.4: unknown is not clean. The graded sense below reads
+    // clash=0 as "clean" and grants maximum wash — the loudest echo/reverb
+    // tail under B's entry exactly when nothing is known about the clash
+    // windows. Unknown gets the floor; measured collisions grade as before.
+    val outKnown = vocalActivityBetween(analysis, transitionStart, mixAnchor) != null
+    val inKnown = vocalActivityBetween(nextAnalysis, entry, entry + fadeSec) != null
+    val clashGate = if (!outKnown || !inKnown) 0.35 else (1.0 - clash).coerceIn(0.35, 1.0)
     return TransitionPlan(
         shouldStart = started,
         markerVisible = true,
@@ -687,7 +693,7 @@ private fun hardCutPlan(
     val cue = if (mixset) {
         mixsetEntryCue(nextAnalysis, nextLength)
     } else {
-        capIncomingEntry(incomingStartPoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+        vocalAwareCutCue(nextAnalysis, nextLength)
     }
     val started = playbackTime >= cutAt
     return TransitionPlan(
@@ -749,7 +755,7 @@ private fun echoOutPlan(
     val cue = if (mixset) {
         mixsetEntryCue(nextAnalysis, nextLength)
     } else {
-        capIncomingEntry(incomingStartPoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+        vocalAwareCutCue(nextAnalysis, nextLength)
     }
     val maxHandoff = nextLength - MIN_INCOMING_CLEARANCE_SECONDS
     val handoff = if (nextLength > 0 && maxHandoff >= cue) min(cue, maxHandoff) else cue
@@ -1006,6 +1012,24 @@ internal fun incomingCuePoint(analysis: TrackAnalysis): Double {
 private fun incomingStartPoint(analysis: TrackAnalysis): Double =
     listOfNotNull(analysis.audibleStartTime, analysis.pickupTime, analysis.firstBeat)
         .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
+
+/**
+ * Full-audit P0.4: vocal-aware cue for the cut paths (ECHO/HARD). Those cued
+ * at audible start — the first sound even when it is a vocal onset — and the
+ * echo tail / instant chop smeared the two voices together. Route through
+ * the ranked mix-in list (vocal-penalised) like the beat-matched path; when
+ * the cue window still sings (or has no mask coverage while the scalar says
+ * vocal-heavy), offset past the opening phrase. Bounded by the entry cap.
+ */
+private fun vocalAwareCutCue(nextAnalysis: TrackAnalysis, nextLength: Double): Double {
+    val cue = incomingCuePoint(nextAnalysis)
+    val beat = nextAnalysis.beatInterval.takeIf { it > 0 } ?: 0.5
+    val windowVocal = vocalActivityBetween(nextAnalysis, cue, cue + beat * 16)
+    val sings = windowVocal?.let { it >= VOCAL_ACTIVE_THRESHOLD }
+        ?: (nextAnalysis.vocalProbability >= 0.62)
+    val offset = if (sings) beat * 16 else 0.0
+    return capIncomingEntry(cue + offset, nextAnalysis, nextLength, mixsetActive = false)
+}
 
 /**
  * Incoming entries stay in the opening stretch: 30% of the incoming track
@@ -1335,16 +1359,21 @@ fun planWsolaTransition(
 
     val contentEnd = analysis.contentEndTime.orZero().takeIf { it != 0.0 } ?: outgoingLength
     // In Mixset Mode the caller hands down the peak anchor it already
-    // resolved: re-resolving here would silently move the window back to the
-    // tail and the early cut would never happen.
+    // resolved — but the override is advisory, not a veto. A fresh resolution
+    // that lands earlier (a comedown the upstream pass could not see) wins:
+    // cementing a stale override is what dragged exits onto peaks. The
+    // override still wins whenever it is the earlier point, so designed early
+    // cuts are preserved.
+    val resolvedAnchor = resolveMixOutAnchor(analysis, contentEnd = contentEnd, duration = outgoingLength)
     val mixOutAnchor = if (mixset && mixAnchorOverride != null && mixAnchorOverride.isFinite()) {
-        MixOutAnchor(
-            time = mixAnchorOverride.coerceIn(0.0, outgoingLength),
+        val coerced = mixAnchorOverride.coerceIn(0.0, outgoingLength)
+        if (resolvedAnchor.time < coerced) resolvedAnchor else MixOutAnchor(
+            time = coerced,
             type = "mixset_peak",
-            discardedMusicSeconds = max(0.0, outgoingLength - mixAnchorOverride),
+            discardedMusicSeconds = max(0.0, outgoingLength - coerced),
         )
     } else {
-        resolveMixOutAnchor(analysis, contentEnd = contentEnd, duration = outgoingLength)
+        resolvedAnchor
     }
     val unshiftedOverlapEnd = min(outgoingLength, mixOutAnchor.time)
     val outgoingArrangementOverlap =
@@ -1658,7 +1687,9 @@ private fun adaptiveOverlap(
         val entryWindow = nextAnalysis.beatInterval.takeIf { it > 0 }?.times(16) ?: 8.0
         val delayB = vocalActivityBetween(
             nextAnalysis, entryPoint, entryPoint + entryWindow,
-        )?.let { it > 0.45 } ?: false
+            // Full-audit P0.4: same scale as the ARM gate — neutral (0.5)
+            // windows must not earn ducked seconds.
+        )?.let { it >= VOCAL_ACTIVE_THRESHOLD } ?: false
         eqOverlapBonusBeats(duckAMids = duckA, delayBMids = delayB, type = type)
     } else {
         0
@@ -1939,6 +1970,32 @@ private fun planTransitionInner(
         )
     }
 
+    // Full-audit P0.1: both-sides-analyzed hard gate. A smart/DJ blend without
+    // vocal masks on BOTH sides is blind — every vocal mitigation defaults to
+    // off (duck/delay false, separation open, proactive open) while the scalar
+    // path can still grant a long overlap. No evidence, no long blend: route
+    // to a short silence-seeking dissolve until the masks land. The two sides
+    // need different evidence: the outgoing side contributes its tail (mix-out,
+    // clash windows), so only a whole-track mask satisfies it; the incoming
+    // side only ever reads its entry window, so a provisional head mask
+    // (P0.2) is exactly the evidence it needs. Same-file repeats are exempt
+    // (no second voice enters, nothing to clash).
+    val sameFileRepeat = currentTrack != null && nextTrack != null &&
+        currentTrack.id.isNotBlank() && currentTrack.id == nextTrack.id
+    val outgoingMasked = analysis.vocalActivityMask.isNotEmpty() && !analysis.provisionalHead
+    val incomingMasked = nextAnalysis.vocalActivityMask.isNotEmpty()
+    if (!sameFileRepeat && (!outgoingMasked || !incomingMasked)) {
+        return applyMixsetFireFloor(
+            plainDissolvePlan(
+                analysis, nextAnalysis, length,
+                max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack)),
+                playbackTime, mixset,
+                listOf("vocal-mask-gate"),
+            ),
+            length, mixset,
+        )
+    }
+
     val preferredMixAnchor = min(length, mixOutAnchor.time)
     // A mixset anchor is interior by design — the playhead reaching it is the
     // transition arriving, not a missed window to abandon for the track end.
@@ -2014,7 +2071,12 @@ private fun planTransitionInner(
     // next track at full volume" complaint. A drop with a findable buildup
     // foot is a structure; without one the pair stays a blend-matrix
     // candidate, never a cut.
-    val realDropInB = dropInB != null && buildupStart(nextAnalysis, dropInB) != null
+    // Full-audit P0.3: a drop with a findable buildup foot is a structure —
+    // without one the pair stays a blend-matrix candidate, never a cut. The
+    // old test (any buildupStart, including fabricated drop−phrase16/drop−8s
+    // arithmetic) read phantom drops as real and unlocked LOOP_CUT_DROP /
+    // phrase-switch routing that assumes a genuine arrival.
+    val realDropInB = dropInB != null && dropInB.isFinite() && isDropTrusted(nextAnalysis)
     val selectedType = if (beatOrHalf || policy.tier == TransitionTier.DJ_ASSISTED) {
         selectTransitionType(proxyScore, policy.tier, highEnergyA, highEnergyB, realDropInB)
     } else {

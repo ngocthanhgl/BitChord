@@ -29,6 +29,7 @@ import com.music.bitchord.playback.smart.EqSchedule
 import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
 import com.music.bitchord.playback.smart.vocalActivityBetween
+import com.music.bitchord.playback.smart.VOCAL_ACTIVE_THRESHOLD
 import com.music.bitchord.playback.smart.plainDissolvePlan
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -949,7 +950,10 @@ class CrossfadeController(
         val delayBMids = nextAnalysis?.let { b ->
             val entryBeats = if (b.beatInterval > 0) b.beatInterval * 16 else 8.0
             vocalActivityBetween(b, plan.incomingCueTime, plan.incomingCueTime + entryBeats)
-        }?.let { it > 0.45 } ?: false
+            // Full-audit P0.4: the gate sits ON the vocal scale (0.6), not
+            // below the analyzer's 0.5 neutral — an unmeasured window averages
+            // exactly neutral and must read as "no evidence", not "delay".
+        }?.let { it >= VOCAL_ACTIVE_THRESHOLD } ?: false
         // DJ-EQ spec §Bass swap protocol: arm at the type's progress, fire on
         // the next downbeat after it. Pre-snapped here (grids are ARM-time
         // data); the fade only compares progress against it.

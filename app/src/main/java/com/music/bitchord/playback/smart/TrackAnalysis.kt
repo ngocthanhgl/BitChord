@@ -133,6 +133,15 @@ data class TrackAnalysis(
      * Persisted; computed once in [TrackAnalyzer.detectStructure].
      */
     val plainCutBreathSec: Double? = null,
+    /**
+     * Full-audit P0.2: true when this result came from the head-only pass —
+     * the curve/mask below cover the opening window only, not the track.
+     * The outgoing side needs tail evidence (mix-out, clash windows), so a
+     * provisional result never satisfies the both-sides gate for it; the
+     * incoming side only ever reads its entry window, so a provisional mask
+     * is exactly the evidence it needs. Never persisted (see AnalysisStore).
+     */
+    val provisionalHead: Boolean = false,
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing

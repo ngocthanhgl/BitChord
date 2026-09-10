@@ -779,6 +779,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 "over ${"%.1f".format(Locale.ROOT, head.seconds)}s",
         )
 
+        // Full-audit P0.2: the head window's vocal mask IS shipped now, indexed
+        // against the head window's own energy curve and flagged provisional.
+        // The incoming side of a transition only ever reads its entry window —
+        // exactly what this pass measured — so a provisional mask is the
+        // evidence it needs. The outgoing side needs tail evidence, which this
+        // pass cannot have; the planner's both-sides gate (P0.1) therefore only
+        // honours a provisional mask for the incoming side. Curve and mask are
+        // attached together or not at all: the policy requires equal lengths,
+        // and a bare curve would mislead every energy consumer with no vocal
+        // benefit in return.
+        val headMask = head.vocalMask?.toList().orEmpty()
+        val headCurve = entry?.energyCurve.orEmpty()
+        val shipHeadEvidence = headMask.isNotEmpty() && headMask.size == headCurve.size
         return TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
             trackId = trackId,
@@ -795,6 +808,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             introEndTime = entry?.introEndTime ?: 0.0,
             mixInTime = entry?.mixInTime ?: 0.0,
             mixInCandidates = entry?.mixInCandidates.orEmpty(),
+            energyCurve = if (shipHeadEvidence) headCurve else emptyList(),
+            vocalActivityMask = if (shipHeadEvidence) headMask else emptyList(),
+            provisionalHead = shipHeadEvidence,
         )
     }
 

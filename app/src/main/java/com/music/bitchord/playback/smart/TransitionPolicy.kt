@@ -1296,13 +1296,16 @@ fun buildupStart(analysis: TrackAnalysis, peakTime: Double): Double? {
     return validateBuildupStart(raw, drop, phrase16Seconds(analysis))
 }
 
-private fun buildupStartRaw(analysis: TrackAnalysis, peakTime: Double): Double? {
-    // Spec finetune §6.1 five-step chain: (1) stored map buildup, (2a)
-    // validated gradient inflection, (2b) unvalidated inflection with a
-    // monotonic lean, (3) structural BUILD ending near the drop, (4)
-    // drop minus one phrase (or drop−8 s when there is no buildup),
-    // (5) drop−8 s hard floor; the legacy foot walk stays as last resort
-    // for dropless tracks.
+/**
+ * Full-audit P0.3: the measured-foot half of the buildup chain — stored map
+ * buildup, validated gradient inflection, monotonic-lean inflection, or a
+ * structural BUILD ending near the drop. Null when the drop has no findable
+ * foot (cold open, step entry, flat bed, short intro): arithmetic fallbacks
+ * (drop−phrase, drop−8 s) are numbers, not feet, and must never unlock
+ * drop-gated routing. [buildupStartRaw] below falls back to them for
+ * rendering continuity; trust decisions use this.
+ */
+fun trustedBuildupStart(analysis: TrackAnalysis): Double? {
     analysis.structuredBuildupSec?.takeIf { it.isFinite() }?.let { stored ->
         return snapToPhrase16(analysis, stored) ?: stored
     }
@@ -1334,6 +1337,32 @@ private fun buildupStartRaw(analysis: TrackAnalysis, peakTime: Double): Double? 
         if (buildNearDrop != null && buildNearDrop > 0) {
             return snapToPhrase16(analysis, buildNearDrop) ?: buildNearDrop
         }
+    }
+    return null
+}
+
+/**
+ * Full-audit P0.3: a drop is trusted only when a measured foot stands before
+ * it. A lone in-zone spike (cold-open hit, single loud chorus, flat-master
+ * slope) becomes a "drop" through the max-RMS / 1.5×-mean fallbacks with no
+ * BUILD before it — and every downstream consumer treats it as measured.
+ */
+fun isDropTrusted(analysis: TrackAnalysis): Boolean {
+    val drop = firstDropSec(analysis) ?: return false
+    if (!drop.isFinite()) return false
+    return trustedBuildupStart(analysis) != null
+}
+
+private fun buildupStartRaw(analysis: TrackAnalysis, peakTime: Double): Double? {
+    // Spec finetune §6.1 five-step chain: (1-3) measured foot via
+    // [trustedBuildupStart], (4) drop minus one phrase (or drop−8 s when
+    // there is no buildup), (5) drop−8 s hard floor; the legacy foot walk
+    // stays as last resort for dropless tracks. Steps 4-5 are arithmetic,
+    // not feet — see [isDropTrusted].
+    trustedBuildupStart(analysis)?.let { return it }
+    val drop = firstDropSec(analysis)
+    if (drop != null && drop.isFinite()) {
+        val phrase16 = phrase16Seconds(analysis)
         if (phrase16 != null) {
             val fallback = drop - phrase16
             if (fallback > 0) {
@@ -1397,6 +1426,11 @@ private fun legacyBuildupFoot(analysis: TrackAnalysis, peakTime: Double): Double
  */
 fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: Double): Double {
     val beat = analysis.beatInterval.takeIf { it.isFinite() && it > 0 } ?: return buildupStartSec
+    // Full-audit P0.3: never return an entry inside [drop−2s, drop+4s] — that
+    // is the peak itself. Retreat below the zone, don't advance through it.
+    // (The old freeform advance could run to and past the drop looking for
+    // clean air; clean air past the drop is the next track already playing.)
+    if (buildupStartSec > drop - 2.0) return max(0.0, drop - 2.0)
     val mask = analysis.vocalActivityMask
     fun vocalAt(t: Double): Double {
         val idx = (t / 0.25).toInt()
@@ -1412,10 +1446,13 @@ fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: 
         n++
     }
     if (n == 0 || sum / n <= MIXSET_ENTRY_VOCAL_THRESHOLD) return buildupStartSec
-    // DJ Mode freeform: the advance may run to and past the drop looking for
-    // clear air — the old drop-minus-8-beats hard cap forced every entry
-    // pre-drop. The 8-bar advance budget still bounds the search.
-    val maxAdvance = buildupStartSec + beat * MIXSET_ENTRY_VOCAL_ADVANCE_BARS
+    // The advance looks for clean air before the drop only: capped at
+    // drop−2 s (see the zone retreat above), bounded by the 8-bar budget.
+    // No clean bar → keep the original (never overshoot into the drop).
+    val maxAdvance = min(
+        buildupStartSec + beat * MIXSET_ENTRY_VOCAL_ADVANCE_BARS,
+        drop - 2.0,
+    )
     var cursor = buildupStartSec + beat * 4
     while (cursor < maxAdvance) {
         if (vocalAt(cursor) < MIXSET_ENTRY_VOCAL_ACCEPT) return cursor
@@ -1434,9 +1471,20 @@ fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: 
 fun mixsetEntryPoint(analysis: TrackAnalysis): Double? {
     val peak = bestPartCue(analysis) ?: return null
     val drop = firstDropSec(analysis)?.takeIf { it.isFinite() }
-    val entry = buildupStart(analysis, peak) ?: drop ?: peak
+    // Full-audit P0.3: the drop itself is never an entry — cueing at your own
+    // drop fires the transition onto the peak. A trusted measured foot, else
+    // an 8 s retreat before the drop; dropless tracks keep the legacy foot
+    // walk via buildupStart.
+    val entry = if (drop == null || isDropTrusted(analysis)) {
+        buildupStart(analysis, peak)
+    } else {
+        null
+    }
+    val cue = entry
+        ?: drop?.let { (it - MIXSET_BUILDUP_MIN_SECONDS).takeIf { r -> r > 0 } }
+        ?: peak
     // Spec: every entry decision happens at a phrase boundary.
-    val snapped = snapToPhrase16(analysis, entry) ?: entry
+    val snapped = snapToPhrase16(analysis, cue) ?: cue
     if (drop == null) return snapped
     return adjustedMixsetEntry(snapped, analysis, drop)
 }
@@ -1673,6 +1721,11 @@ private fun capActivePlaytime(analysis: TrackAnalysis, entry: Double, time: Doub
  */
 private fun pushPastDrop(analysis: TrackAnalysis, time: Double, drop: Double?, length: Double): Double {
     if (drop == null || !drop.isFinite() || !time.isFinite()) return time
+    // Full-audit P0.3: only a trusted drop may drag the exit. On a phantom
+    // drop this fires exactly when the anchor is correctly staged at a
+    // buildup climax — mistaking "buildup climax" for "already in the drop"
+    // and jumping the exit onto/through the real peak.
+    if (!isDropTrusted(analysis)) return time
     if (time < drop - 1.0) return time
     val dropEnergy = energyAt(analysis, drop) ?: return time
     if (dropEnergy <= 0) return time
