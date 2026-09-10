@@ -1473,8 +1473,13 @@ class CrossfadeController(
                 val ramp = ((out.currentPosition - leadStart).toFloat() / leadMs).coerceIn(0f, 1f)
                 if (ramp > 0f) {
                     val eased = ramp * ramp * (3f - 2f * ramp) // smoothstep
+                    // Tempo-transparency fix: the pre-fade slew never exceeds
+                    // ±2 % — with HALF_TIME retired this branch is nearly dead,
+                    // but any residual stays under the audibility band.
+                    val cappedDelta = ((render.outgoingPlaybackRate - 1.0) * eased)
+                        .toFloat().coerceIn(-0.02f, 0.02f)
                     val rate = (AppSettings.playbackSpeed.value *
-                        (1.0 + (render.outgoingPlaybackRate - 1.0) * eased)).toFloat()
+                        (1.0 + cappedDelta)).toFloat()
                     val now = SystemClock.uptimeMillis()
                     val last = lastCommittedRate
                     if (last == null || abs(rate - last) / max(abs(last), 1e-6f) >= 0.0015f ||

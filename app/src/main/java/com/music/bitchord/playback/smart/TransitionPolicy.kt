@@ -81,8 +81,10 @@ const val MIN_DJ_CONFIDENCE = 0.2
 const val MIN_BPM = 40.0
 const val MAX_BPM = 220.0
 
-/** How far a tempo pairing may drift from unity and still be considered transparent to stretch. */
-const val MAX_STRETCH_DEVIATION = 0.04
+/** How far a tempo pairing may drift from unity and still be considered transparent to stretch.
+ * Tempo-transparency fix: ±2 % (≈1/3 semitone) stays under the audibility band;
+ * anything wider falls back to a wash at rate 1.0 instead of a stretched beatmatch. */
+const val MAX_STRETCH_DEVIATION = 0.02
 
 /**
  * A vocal-activity mask value at or above this counts as singing. A fallback
@@ -877,20 +879,20 @@ val SUPPORTED_BPM_RATIOS = doubleArrayOf(
     RATIO_5_4, RATIO_4_5,
 )
 
-/** Multi-candidate §Q1: per-ratio deviation caps. Entries above 0.04 absorb
- * ±1-2 BPM model error at genre edges (a perfect 4:3 reads up to ~1.4 % off);
- * all stay at/below the ~6 % transparent-stretch threshold. Ratios absent from
+/** Multi-candidate §Q1: per-ratio deviation caps. Tempo-transparency fix: all
+ * ratios share the ±2 % inaudibility band — wider pairings fall back to a
+ * wash at rate 1.0 instead of a stretched beatmatch. Ratios absent from
  * this map fall back to [MAX_STRETCH_DEVIATION]. */
 val RATIO_DEVIATION_CAP: Map<Double, Double> = mapOf(
-    RATIO_1_1 to 0.04,
-    RATIO_2_1 to 0.04,
-    RATIO_1_2 to 0.04,
-    RATIO_3_2 to 0.04,
-    RATIO_2_3 to 0.04,
-    RATIO_4_3 to 0.05,
-    RATIO_3_4 to 0.05,
-    RATIO_5_4 to 0.05,
-    RATIO_4_5 to 0.05,
+    RATIO_1_1 to 0.02,
+    RATIO_2_1 to 0.02,
+    RATIO_1_2 to 0.02,
+    RATIO_3_2 to 0.02,
+    RATIO_2_3 to 0.02,
+    RATIO_4_3 to 0.02,
+    RATIO_3_4 to 0.02,
+    RATIO_5_4 to 0.02,
+    RATIO_4_5 to 0.02,
 )
 
 /**

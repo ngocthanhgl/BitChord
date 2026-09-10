@@ -890,7 +890,9 @@ private fun loopCutPlan(
     }
     val bpmIn = nextAnalysis.bpm.orZero()
     val ratio = if (bpmOut > 0 && bpmIn > 0) normalizedTempoRatio(bpmOut, bpmIn) else 1.0
-    val rate = if (ratio in 0.9..1.1) 1.0 / ratio else 1.0
+    // Tempo-transparency fix: refuse sustained stretch beyond ±2 % — rate 1.0
+    // (bevelled by the cut) instead of an audible speedup under the loop.
+    val rate = if (ratio in 0.98..1.02) 1.0 / ratio else 1.0
     val dropSnap = nearestTimedValue(nextAnalysis.downbeats, dropTime, tolerance = beatOut * 4)
         ?: dropTime
     val buildInSec = (mixAnchor - transitionStart) * rate
@@ -2152,11 +2154,15 @@ private fun planTransitionInner(
                 "genres=${genreClass(analysis)}/${genreClass(nextAnalysis)} " +
                 "tier=${policy.tier} ratio=${policy.matchedRatio}",
         )
+        // Tempo-transparency fix: HALF_TIME tier pairs (even perfect 2:1)
+        // would sustain +12–41 % deck speeds — clearly audible speedup with
+        // pitch coupled. They fall back to an echo wash at rate 1.0 instead;
+        // the grid lock is surrendered, the tempo is not touched.
         if (policy.tier == TransitionTier.HALF_TIME) {
             return applyMixsetFireFloor(
-                halfTimeBlendPlan(
+                echoOutPlan(
                     analysis, nextAnalysis, length, nextLength,
-                    playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = true, mixset = mixset,
+                    playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
                 ),
                 length, mixset,
             )
@@ -2272,10 +2278,12 @@ private fun planTransitionInner(
         )
     }
     if (selectedType == TransitionType.HALF_TIME_BLEND) {
+        // Tempo-transparency fix (see weak-pair site above): no sustained
+        // off-1.0 deck speeds — the harmonic pair gets an echo wash at 1.0.
         return applyMixsetFireFloor(
-            halfTimeBlendPlan(
+            echoOutPlan(
                 analysis, nextAnalysis, length, nextLength,
-                playbackTime, mixAnchor, proxyEntry, proxyScore, policy, short = false, mixset = mixset,
+                playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
             ),
             length, mixset,
         )
@@ -2317,7 +2325,7 @@ private fun planTransitionInner(
         } else {
             0.0
         }
-    val mixEnd = max(0.0, mixAnchor - outgoingArrangementOverlap)
+    var mixEnd = max(0.0, mixAnchor - outgoingArrangementOverlap)
     // The track plays its floor: in normal mode the overlap may not reach
     // back past 80% of the track. DJ Mode cuts between peaks with long beds,
     // so its ceiling is the per-type table below on top of the usual rails.
@@ -2383,8 +2391,8 @@ private fun planTransitionInner(
             max(0.8, incomingPlaybackRate),
     )
 
-    val finalIncomingCueTime: Double
-    val transitionStart: Double
+    var finalIncomingCueTime: Double
+    var transitionStart: Double
 
     if (sameBeatBlend && beatSeconds > 0) {
         val introDropTime = incomingHandoffTime / max(0.8, incomingPlaybackRate)
@@ -2419,7 +2427,56 @@ private fun planTransitionInner(
         }
     }
 
-    val alignedOverlap = mixEnd - transitionStart
+    var alignedOverlap = mixEnd - transitionStart
+    // Late-peak pull-back (kiểu 1): if the outgoing tail spikes inside the
+    // last quarter of a long same-grid blend while the incoming side carries
+    // no vocal, pull the handoff earlier into the pre-peak valley
+    // (downbeat-snapped), preserving the overlap length. A DJ mixes out
+    // before the last-shot fill; the overlap never covers it.
+    if (sameBeatBlend && beatSeconds > 0 && alignedOverlap >= 8.0) {
+        val window = analysis.energyCurve.filter {
+            it.time.isFinite() && it.energy.isFinite() &&
+                it.time >= transitionStart && it.time <= mixEnd
+        }
+        if (window.size >= 8) {
+            val mean = window.sumOf { it.energy } / window.size
+            val lastQuarter = transitionStart + alignedOverlap * 0.75
+            val peak = window.filter { it.time >= lastQuarter }.maxByOrNull { it.energy }
+            val entryWindow = nextAnalysis.beatInterval.takeIf { it > 0 }?.times(16) ?: 8.0
+            val singsIn = vocalActivityBetween(
+                nextAnalysis, finalIncomingCueTime, finalIncomingCueTime + entryWindow,
+            )?.let { it >= VOCAL_ACTIVE_THRESHOLD } ?: true
+            if (peak != null && mean > 0 && peak.energy / mean >= 1.5 && !singsIn) {
+                val beat = analysis.beatInterval.orZero().takeIf { it > 0 }
+                    ?: if (currentBpm > 0) 60 / currentBpm else 0.5
+                val valley = window.filter { it.time < peak.time - beat * 0.5 }
+                    .minByOrNull { it.energy }?.time
+                if (valley != null) {
+                    val snapped = timedValueNearOrBefore(
+                        analysis.downbeats, valley, max(0.75, beat * 2), transitionStart,
+                    ) ?: valley
+                    if (snapped > transitionStart + MIN_TRANSITION_OVERLAP_SECONDS &&
+                        mixEnd - snapped <= MAX_DISCARDED_MUSIC_SECONDS
+                    ) {
+                        val delta = mixEnd - snapped
+                        mixEnd = snapped
+                        transitionStart = alignedTransitionStart(
+                            analysis,
+                            max(0.0, transitionStart - delta),
+                            mixEnd - 0.05,
+                            preferEarlier = true,
+                            minimum = max(0.0, mixEnd - maximumOverlap),
+                        )
+                        finalIncomingCueTime = max(
+                            0.0,
+                            incomingHandoffTime - (mixEnd - transitionStart) * incomingPlaybackRate,
+                        )
+                        alignedOverlap = mixEnd - transitionStart
+                    }
+                }
+            }
+        }
+    }
     val hasBassContent = analysis.lowEnergyCurve.isNotEmpty() || nextAnalysis.lowEnergyCurve.isNotEmpty()
     val finalScore = scoreCompatibility(analysis, nextAnalysis, transitionStart, finalIncomingCueTime)
     // Blueprint §5.7 FILTER_SWEEP DSP rule: shift the incoming track toward
