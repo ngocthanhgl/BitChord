@@ -382,6 +382,17 @@ class CrossfadeController(
         val eqSwapFireProgress: Float = Float.POSITIVE_INFINITY,
         /** DJ-EQ spec: one outgoing beat in seconds; the swap runs 2 bars. */
         val eqSwapBeatSec: Double = 0.0,
+        /**
+         * Full-audit P2 S1: live vocal recompute. ARM-time snapshots of the
+         * vocal masks + energy times (empty = ungated pair, no evidence).
+         * rideEq slides a 2 s window over them as the blend travels, so a
+         * vocal entering mid-blend still gets ducked/delayed instead of
+         * stacking — the ARM flags only knew the planned zone.
+         */
+        val outgoingVocalTimes: DoubleArray = doubleArrayOf(),
+        val outgoingVocalMask: DoubleArray = doubleArrayOf(),
+        val incomingVocalTimes: DoubleArray = doubleArrayOf(),
+        val incomingVocalMask: DoubleArray = doubleArrayOf(),
     )
 
     private var fadeStartedAt = 0L
@@ -400,6 +411,77 @@ class CrossfadeController(
     // Progress of the last driveFade tick: finish() uses it to decide whether
     // the completion guard may fire (mid-fade) or must stand down (done).
     private var lastProgress = 0f
+    // Full-audit P2: rate-commit coalescing state (see driveFade). Rearmed
+    // in begin() with every other per-transition flag.
+    private var lastCommittedRate: Float? = null
+    private var lastRateCommitAt = 0L
+    // Full-audit P2: bail() already restored the deck rate at partial gain
+    // (masked by the 120 ms bail ramp); finish() must not commit a second
+    // pipeline re-prepare at full volume for the same restore.
+    private var deckRateReset = false
+    // Full-audit P2: latched fade span (see driveFade). Rearmed in begin().
+    private var spanLatched = 0L
+    // Full-audit P2 S1: live vocal flags (see updateLiveVocalFlags).
+    // Rearmed in begin() with every other per-transition flag.
+    private var liveDuckA = 0f
+    private var liveDelayB = 0f
+    private var lastVocalSlewAt = 0L
+    private var liveVocalLogged = false
+
+    /**
+     * Mean mask activity over [start]..[end] track seconds, or null without
+     * evidence. Same windowing as [vocalActivityBetween], but over the
+     * ARM-time snapshot arrays carried on the render (the controller never
+     * retains the analyses themselves).
+     */
+    private fun maskActivity(times: DoubleArray, mask: DoubleArray, start: Double, end: Double): Double? {
+        if (times.size != mask.size || times.isEmpty() || end <= start) return null
+        var sum = 0.0
+        var count = 0
+        for (i in times.indices) {
+            val t = times[i]
+            if (!t.isFinite() || t < start || t > end) continue
+            val v = mask[i]
+            if (!v.isFinite()) continue
+            sum += v
+            count++
+        }
+        return if (count > 0) sum / count else null
+    }
+
+    /**
+     * Slides a 2 s vocal window over both decks as the blend travels and
+     * slews the live flags toward what it sees (~500 ms time constant, so a
+     * single hot frame cannot flap the mids). Silence when ungated (empty
+     * snapshot = no evidence, never a block) or when the overlap is unknown.
+     */
+    private fun updateLiveVocalFlags(outProgress: Float, inProgress: Float) {
+        val overlap = render.overlapSeconds
+        if (overlap <= 0.0 || fadeEndMs <= 0L) return
+        val now = SystemClock.elapsedRealtime()
+        val dt = ((now - lastVocalSlewAt).coerceAtLeast(0L) / 500.0).toFloat().coerceAtMost(1f)
+        lastVocalSlewAt = now
+        if (dt <= 0f) return
+        // A deck's blend portion ends at the fade end; B deck's starts at cue.
+        val aNow = fadeEndMs / 1000.0 - (1.0 - outProgress) * overlap
+        val bNow = incomingCueTimeMs / 1000.0 + inProgress * overlap
+        val aTarget =
+            if ((maskActivity(render.outgoingVocalTimes, render.outgoingVocalMask, aNow - 2.0, aNow)
+                    ?: 0.0) >= VOCAL_ACTIVE_THRESHOLD
+            ) 1f else 0f
+        val bTarget =
+            if ((maskActivity(render.incomingVocalTimes, render.incomingVocalMask, bNow - 2.0, bNow)
+                    ?: 0.0) >= VOCAL_ACTIVE_THRESHOLD
+            ) 1f else 0f
+        liveDuckA += (aTarget - liveDuckA) * dt
+        liveDelayB += (bTarget - liveDelayB) * dt
+        // Full-audit P2 C2: leave a trace when the live path engages beyond
+        // the ARM flags — once per fade, like the span-cap log.
+        if (!liveVocalLogged && (liveDuckA > 0.5f || liveDelayB > 0.5f)) {
+            liveVocalLogged = true
+            TrackLog.d(TAG, "live vocal engaged mid-blend (duckA=$liveDuckA delayB=$liveDelayB)")
+        }
+    }
     // Blend-feel audit: the incoming-track cap below truncates the planned
     // span silently. Logged once per fade (rearmed in begin()) so a shortened
     // blend leaves a planned-vs-actual trace.
@@ -1073,6 +1155,16 @@ class CrossfadeController(
                 forceDuckKeys = plan.forceDuckKeys,
                 eqSwapFireProgress = eqSwapFireProgress,
                 eqSwapBeatSec = currentAnalysis?.beatInterval ?: 0.0,
+                // Full-audit P2 S1: snapshot the vocal evidence for the live
+                // recompute in rideEq (ARM flags only knew the planned zone).
+                outgoingVocalTimes = currentAnalysis?.energyCurve?.map { it.time }?.toDoubleArray()
+                    ?: doubleArrayOf(),
+                outgoingVocalMask = currentAnalysis?.vocalActivityMask?.toDoubleArray()
+                    ?: doubleArrayOf(),
+                incomingVocalTimes = nextAnalysis?.energyCurve?.map { it.time }?.toDoubleArray()
+                    ?: doubleArrayOf(),
+                incomingVocalMask = nextAnalysis?.vocalActivityMask?.toDoubleArray()
+                    ?: doubleArrayOf(),
             ),
         )) {
             logGuardOnce("smart", "no arm: begin() refused (anchor passed or no next item)")
@@ -1244,6 +1336,14 @@ class CrossfadeController(
         handedOff = false
         cutFired = false
         lastProgress = 0f
+        lastCommittedRate = null
+        lastRateCommitAt = 0L
+        deckRateReset = false
+        spanLatched = 0L
+        liveDuckA = 0f
+        liveDelayB = 0f
+        lastVocalSlewAt = 0L
+        liveVocalLogged = false
         spanCapLogged = false
         outgoing = out
         incoming = into
@@ -1329,7 +1429,27 @@ class CrossfadeController(
         // the track's own duration in standard mode, or a Automix plan's
         // analyzed mix-out anchor when it ends before the file does.
         val atFadePoint = fadeEndMs <= 0L || fadeEndMs - out.currentPosition <= fadeMs
-        if (!atFadePoint) return
+        if (!atFadePoint) {
+            // Full-audit P2: pre-fade outgoing ramp. The shared-grid join
+            // used to land as one rate step at startFade, mid-fade and
+            // audible. Instead the outgoing deck eases onto the grid during
+            // the last 4 s before the fade point — the DJ nudging the pitch
+            // fader before touching the crossfader. Arming ticks are slow
+            // (~4/s), so these commits are sparse by construction; startFade
+            // keeps its exact set as the idempotent landing for the residual.
+            if (render.outgoingPlaybackRate != 1.0 && fadeEndMs > 0L && fadeMs > 0L) {
+                val leadMs = minOf(4000L, fadeMs).coerceAtLeast(1L)
+                val leadStart = fadeEndMs - fadeMs - leadMs
+                val ramp = ((out.currentPosition - leadStart).toFloat() / leadMs).coerceIn(0f, 1f)
+                if (ramp > 0f) {
+                    val eased = ramp * ramp * (3f - 2f * ramp) // smoothstep
+                    val rate = (AppSettings.playbackSpeed.value *
+                        (1.0 + (render.outgoingPlaybackRate - 1.0) * eased)).toFloat()
+                    out.setPlaybackParameters(PlaybackParameters(rate, 1f))
+                }
+            }
+            return
+        }
         if (!ready) return
         // Late-start guard: the whole fade window elapsed while the standby
         // buffered, so starting the blend now would run every ride at
@@ -1512,16 +1632,23 @@ class CrossfadeController(
         } else {
             minOf(fadeMs, incomingCap).coerceAtLeast(2000L)
         }
+        // Full-audit P2: latch the span at fade start. The per-tick
+        // incoming cap may only narrow it (a late-arriving duration
+        // tightening a blend into a short track), never stretch it —
+        // stretching mid-fade rescales every ride's progress denominator
+        // and jumps gains, filters and the tempo glide audibly.
+        if (spanLatched <= 0L) spanLatched = span
+        val effSpan = minOf(spanLatched, span)
         if (!spanCapLogged && incomingCap < fadeMs && incomingCap != Long.MAX_VALUE) {
             spanCapLogged = true
             TrackLog.d(
                 TAG,
-                "span truncated: planned=${fadeMs}ms actual=${span}ms " +
+                "span truncated: planned=${fadeMs}ms actual=${span}ms latched=${spanLatched}ms " +
                     "remainingIncoming=${remainingIncoming}ms",
             )
         }
         val elapsed = (player.currentPosition - incomingCueTimeMs).coerceAtLeast(0L)
-        val progress = (elapsed.toFloat() / span).coerceIn(0f, 1f)
+        val progress = (elapsed.toFloat() / effSpan).coerceIn(0f, 1f)
 
         // Blueprint §4 volume curves. The equal-power pair holds every blend;
         // LOGARITHMIC drops the outgoing track fast while its echo tail covers
@@ -1531,16 +1658,16 @@ class CrossfadeController(
         // v2 §9b: a held outgoing track (outgoingHoldSec) stays full until its
         // hold elapses, then fades over the remaining span — the echo/reverb
         // tail is the ending, not the content's last seconds.
-        val outProgress = if (render.outgoingHoldSec > 0 && span > 1L) {
-            val holdFraction = (render.outgoingHoldSec * 1000.0 / span).toFloat().coerceIn(0f, 1f)
+        val outProgress = if (render.outgoingHoldSec > 0 && effSpan > 1L) {
+            val holdFraction = (render.outgoingHoldSec * 1000.0 / effSpan).toFloat().coerceIn(0f, 1f)
             ((progress - holdFraction) / (1f - holdFraction).coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
         } else {
             progress
         }
         // v2 §9b: a delayed incoming track is gated silent until its start
         // offset, then ramps over the remaining span.
-        val inProgress = if (render.incomingStartDelaySec > 0 && span > 1L) {
-            val delayFraction = (render.incomingStartDelaySec * 1000.0 / span).toFloat().coerceIn(0f, 1f)
+        val inProgress = if (render.incomingStartDelaySec > 0 && effSpan > 1L) {
+            val delayFraction = (render.incomingStartDelaySec * 1000.0 / effSpan).toFloat().coerceIn(0f, 1f)
             ((progress - delayFraction) / (1f - delayFraction).coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
         } else {
             progress
@@ -1556,7 +1683,7 @@ class CrossfadeController(
                 // endpoints, no timing change, but no full-scale step for the
                 // speaker when the splice guard bows out (non-PCM-16 input).
                 // Spans under 90 ms behave exactly as before.
-                val remainingMs = span - elapsed
+                val remainingMs = effSpan - elapsed
                 if (remainingMs <= INSTANT_SETTLE_MS) {
                     val s = (1f - remainingMs.toFloat() / INSTANT_SETTLE_MS).coerceIn(0f, 1f)
                     player.volume = s
@@ -1593,12 +1720,16 @@ class CrossfadeController(
         // DJ-EQ spec: per-tick 3-band targets from the type schedule. Runs
         // after the sweep ride; the emphasis pulse below touches the SVF, not
         // the EQ, so ordering between them is irrelevant.
-        rideEq(progress)
+        rideEq(progress, outProgress, inProgress)
         // The decisive cut, per style: long blends (DJ_BLEND) ring out to
         // 0.95 so the release lands — the ear needs the tail to call the
         // blend satisfying. Punchy types (DJ_FILTER/HARD/LOOP) keep the 0.80
         // kill; echo and dissolve are exempt entirely (their tails ARE the
-        // style). Player volume is downstream of the whole chain (applied at
+        // style). Full-audit P2 C3: this block is the blend's single silence
+        // authority — the schedules voice the gesture, this disposes the dry
+        // path, and the EQ kill starves the sends. Nothing else may zero a
+        // deck mid-fade, so a bleed always points here.
+        // Player volume is downstream of the whole chain (applied at
         // the sink), so zeroing it silences the dry path absolutely while
         // the EQ kill starves the sends of new feed. Placed after rideEq so
         // it wins every tick; the EQ glide (~145 ms) makes the kill a fast
@@ -1640,12 +1771,29 @@ class CrossfadeController(
         val shift = render.keyShiftSemitones
         if (stretch != 1.0 || shift != 0) {
             val glide = tempoGlideFactor(progress, stretch)
-            player.setPlaybackParameters(
-                PlaybackParameters(
-                    (AppSettings.playbackSpeed.value * (1.0 + (stretch - 1.0) * glide)).toFloat(),
-                    2.0.pow(shift / 12.0 * glide).toFloat(),
-                ),
-            )
+            // Full-audit P2: coalesce the per-tick parameter commits.
+            // ExoPlayer re-prepares its audio pipeline on every parameter
+            // change, so ~33 commits/second of inaudible deltas is 33
+            // chances/second to glitch (the tempo stutter). Commits only
+            // when the rate audibly moved (>= 0.15% since last commit) or
+            // 150 ms elapsed, and never once the glide has converged
+            // (glide ~= 0 is unity rate + unity pitch — exactly what the
+            // deck already holds, so committing it buys a pipeline
+            // re-prepare for zero audible change).
+            if (glide > 0.02) {
+                val newRate = (AppSettings.playbackSpeed.value * (1.0 + (stretch - 1.0) * glide)).toFloat()
+                val newPitch = 2.0.pow(shift / 12.0 * glide).toFloat()
+                val now = SystemClock.elapsedRealtime()
+                val last = lastCommittedRate
+                if (last == null ||
+                    abs(newRate - last) / last.coerceAtLeast(1e-6f) >= 0.0015f ||
+                    now - lastRateCommitAt >= 150L
+                ) {
+                    player.setPlaybackParameters(PlaybackParameters(newRate, newPitch))
+                    lastCommittedRate = newRate
+                    lastRateCommitAt = now
+                }
+            }
         }
 
         // Whichever comes first: the fade running its course, the old track
@@ -1733,6 +1881,10 @@ class CrossfadeController(
         // stretched blend into an audible pitch jump. finish() keeps its own
         // reset as the idempotent safety net.
         incoming?.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
+        // The restore above already happened: finish() must not re-prepare
+        // the pipeline a second time at full volume for the same restore
+        // (its guard reads lastProgress, frozen before this reset).
+        deckRateReset = true
         bailStartedAt = SystemClock.elapsedRealtime()
         phase = Phase.BAILING
     }
@@ -1777,8 +1929,10 @@ class CrossfadeController(
                 // And skipped when the glide already landed home: the deck is
                 // at its own tempo, so "resetting" would re-prepare the
                 // pipeline to arrive where it already is — the end-of-mix snap
-                // on every beatmatched blend.
-                if (rateApplied && tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02) {
+                // on every beatmatched blend. And skipped when bail() already
+                // restored the rate at partial gain (deckRateReset) — a
+                // second commit here lands at full volume.
+                if (rateApplied && !deckRateReset && tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02) {
                     it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
                 }
             }
@@ -1865,7 +2019,7 @@ class CrossfadeController(
      * table-driven types the LOW keyframes ride as written. Disabled entirely
      * for standard fades, which snapshot no grids.
      */
-    private fun rideEq(progress: Float) {
+    private fun rideEq(progress: Float, outProgress: Float, inProgress: Float) {
         if (!render.eqEnabled) return
         // Full-audit P1 M1: beds under EqSchedule.SHORT_BED_SECONDS render
         // the compressed short-bed tables — the long-bed keyframes never
@@ -1873,8 +2027,13 @@ class CrossfadeController(
         val shortBed = render.overlapSeconds in 0.01..EqSchedule.SHORT_BED_SECONDS
         // Full-audit P1 M3: the vocal choke voices duck keys with the log
         // curve even when the ARM flags read clean.
-        val duck = render.duckAMids || render.forceDuckKeys
-        val delay = render.delayBMids || render.forceDuckKeys
+        // Full-audit P2 S1: OR in the live recompute — the ARM flags only
+        // knew the planned zone, while a vocal can enter mid-blend as the
+        // window slides. Slewed (~500 ms) so a single hot frame cannot
+        // flap the mids.
+        updateLiveVocalFlags(outProgress, inProgress)
+        val duck = render.duckAMids || render.forceDuckKeys || liveDuckA > 0.5f
+        val delay = render.delayBMids || render.forceDuckKeys || liveDelayB > 0.5f
         val out = EqSchedule.outgoingGains(render.eqType, progress, duck, shortBed)
         val into = EqSchedule.incomingGains(render.eqType, progress, delay)
         val swapAt = render.eqSwapFireProgress
@@ -1887,7 +2046,13 @@ class CrossfadeController(
                 1f to 0f
             } else {
                 val overlap = render.overlapSeconds.toFloat()
-                val swapSec = (render.eqSwapBeatSec * EqSchedule.SWAP_BARS).toFloat()
+                // Full-audit P2 S2: time-denominated swap. The bar length is
+                // ARM-time outgoing-grid seconds; when the outgoing deck rides
+                // a grid rate (half-time join, post pre-fade ramp) the real
+                // seconds shrink by that rate — a bar-denominated snap would
+                // land late and smear the handover.
+                val deckRate = render.outgoingPlaybackRate.toFloat().coerceAtLeast(0.25f)
+                val swapSec = (render.eqSwapBeatSec * EqSchedule.SWAP_BARS / deckRate).toFloat()
                 val t = if (overlap > 0f && swapSec > 0f) {
                     ((progress - eqSwapStartProgress) * overlap / swapSec).coerceIn(0f, 1f)
                 } else {
@@ -1919,7 +2084,12 @@ class CrossfadeController(
                 rideMidKill(progress)
             }
             TransitionStyle.DJ_BLEND ->
-                if (render.bassSwap) {
+                // Full-audit P2 C5: a single swap event. The DJ-EQ schedule
+                // owns the low-end handover (downbeat-snapped fire + smooth
+                // 1-bar trade in rideEq); the legacy SVF bass swap below runs
+                // ONLY as fallback when no schedule swap fired for this type —
+                // both voicing the same corner is the muddy low end.
+                if (render.bassSwap && !render.eqSwapFireProgress.isFinite()) {
                     filters.setResonance(1.0f)
                     rideBassSwap(progress)
                 } else if (render.overlapSeconds > PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS) {
