@@ -1246,6 +1246,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 structuredOutroSec = structure.outroSec,
                 structuredBuildupSec = structure.buildupSec,
                 plainCutBreathSec = structure.breathSec,
+                dropConfidence = structure.dropConfidence,
+                buildupMethod = structure.buildupMethod,
+                buildupFootSec = structure.buildupFootSec,
+                buildupSpanSec = structure.buildupSpanSec,
+                buildupRise = structure.buildupRise,
             ),
         )
     }
@@ -1259,6 +1264,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val buildupSec: Double? = null,
         /** Spec finetune §7: breathing room before the cut (see TrackAnalysis). */
         val breathSec: Double? = null,
+        val dropConfidence: Double? = null,
+        val buildupMethod: String? = null,
+        val buildupFootSec: Double? = null,
+        val buildupSpanSec: Double? = null,
+        val buildupRise: Double? = null,
     )
 
     /**
@@ -1319,7 +1329,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // Exit-entry spec Fix 1: scored best-candidate drop selection replaces
         // first-match. Wrapped: any scorer throw degrades to the old first
         // DROP label (which firstDropSec's stored-wins contract still honors).
-        val dropSec = runCatching {
+        val dropPick = runCatching {
             StructureDetector.selectFirstDrop(
                 fine = fine,
                 centroid = features.spectralCentroidCurve,
@@ -1337,6 +1347,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             TrackLog.w(TAG, "selectFirstDrop failed; falling back to first DROP label", it)
         }.getOrNull()
             ?: map.firstOrNull { it.type == StructureSectionType.DROP }?.start
+                ?.let { StructureDetector.DropCandidate(it, null) }
+        val dropSec = dropPick?.startSec
         // §4 gradient anchors on the detector's DROP; without one there is no
         // peak to walk back from, and buildupStart falls back downstream.
         val buildupSec = if (dropSec != null && dropSec.isFinite()) {
@@ -1347,6 +1359,21 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         } else {
             null
         }
+        // Phase A1: persist how the foot was found so drop trust survives a
+        // restart without the transient fine curve. Only the analyzer-side
+        // gradient path is measurable here; plan-time fallbacks (monotonic /
+        // build-label / stored) re-derive live in trustedBuildupStart.
+        val buildupFoot = buildupSec?.takeIf { it.isFinite() && dropSec != null }
+        val buildupRise = if (buildupFoot != null && dropSec != null) {
+            val peak = fine.filter { it.time.isFinite() && abs(it.time - dropSec) <= 2.0 }
+                .mapNotNull { it.energy.takeIf { e -> e.isFinite() && e > 0 } }
+                .maxOrNull()
+            val climb = fine.filter { it.time.isFinite() && it.time >= buildupFoot && it.time <= dropSec }
+                .mapNotNull { it.energy.takeIf { e -> e.isFinite() } }
+            if (peak != null && peak > 0 && climb.isNotEmpty()) {
+                (climb.average() - (climb.firstOrNull() ?: 0.0)) / peak
+            } else null
+        } else null
         return DetectedStructure(
             map = map,
             dropSec = dropSec?.takeIf { it.isFinite() },
@@ -1356,6 +1383,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 ?.takeIf { it.isFinite() },
             buildupSec = buildupSec?.takeIf { it.isFinite() },
             breathSec = longestTailBreath(onsets, duration, interval),
+            dropConfidence = dropPick?.score?.takeIf { it.isFinite() },
+            buildupMethod = if (buildupFoot != null) "gradient" else null,
+            buildupFootSec = buildupFoot,
+            buildupSpanSec = if (buildupFoot != null && dropSec != null) dropSec - buildupFoot else null,
+            buildupRise = buildupRise?.takeIf { it.isFinite() },
         )
     }
 

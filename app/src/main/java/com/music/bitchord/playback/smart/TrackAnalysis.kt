@@ -126,6 +126,18 @@ data class TrackAnalysis(
     val structuredOutroSec: Double? = null,
     /** v2 §4: §4-gradient buildup foot, else null (see `buildupStart`). */
     val structuredBuildupSec: Double? = null,
+    /** Phase A1: selectFirstDrop winner score (0..~1), else null. Persisted so
+     * drop trust survives restart without the transient fine curve. */
+    val dropConfidence: Double? = null,
+    /** Phase A1: how the buildup foot was found — "gradient", "monotonic",
+     * "build_label" or "stored". Null = unknown. */
+    val buildupMethod: String? = null,
+    /** Phase A1: raw buildup foot before phrase snap, else null. */
+    val buildupFootSec: Double? = null,
+    /** Phase A1: drop − foot in seconds, else null. */
+    val buildupSpanSec: Double? = null,
+    /** Phase A1: mean climb minus foot, normalized by track peak, else null. */
+    val buildupRise: Double? = null,
     /**
      * Spec finetune §7: the track's own breathing room before the cut — the
      * start of the longest onset gap (>0.25 s) in the last 35% of the track,

@@ -1042,9 +1042,13 @@ internal fun incomingCuePoint(analysis: TrackAnalysis): Double {
 }
 
 /** Where the incoming track first makes sound, so the fade is not cued into its lead-in silence. */
-private fun incomingStartPoint(analysis: TrackAnalysis): Double =
-    listOfNotNull(analysis.audibleStartTime, analysis.pickupTime, analysis.firstBeat)
+private fun incomingStartPoint(analysis: TrackAnalysis): Double {
+    val claimed = listOfNotNull(analysis.audibleStartTime, analysis.pickupTime, analysis.firstBeat)
         .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
+    // Phase A2: the native gate can claim a late start; pull back to the
+    // first sustained sound without ever moving past the claimed onset.
+    return refinedStartPoint(analysis, claimed)
+}
 
 /**
  * Full-audit P0.4: vocal-aware cue for the cut paths (ECHO/HARD). Those cued
@@ -1097,7 +1101,10 @@ private fun capIncomingEntry(
  */
 private fun mixsetEntryCue(nextAnalysis: TrackAnalysis, nextLength: Double): Double {
     val best = mixsetEntryPoint(nextAnalysis) ?: incomingStartPoint(nextAnalysis)
-    return capIncomingEntry(best, nextAnalysis, nextLength, mixsetActive = true)
+    // Phase A4: never cue inside a spoken bed — route past its end.
+    val span = spokenInterludeSpan(nextAnalysis)
+    val routed = if (span != null && best in span) span.endInclusive else best
+    return capIncomingEntry(routed, nextAnalysis, nextLength, mixsetActive = true)
 }
 
 // ---------------------------------------------------------------------------

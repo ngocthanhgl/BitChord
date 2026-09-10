@@ -439,6 +439,45 @@ internal fun audibleStartOf(analysis: TrackAnalysis): Double {
     return candidates.minOrNull() ?: 0.0
 }
 
+/**
+ * Phase A2: first-sound search. The native sustain gate (4/6 active windows +
+ * 1.45× peak) misses a quiet cold breath before the beat, so `audible_start`
+ * can land seconds late and the overlap renders a silent bed. Scan the coarse
+ * persisted curve forward from 0 while under `claimed`: the first point at or
+ * above the audible threshold, sustained for 2 consecutive samples and at or
+ * above half the track mean, wins. Clamped to [0, claimed] — only ever moves
+ * earlier-or-equal, never past the claimed onset into music.
+ */
+internal fun refinedStartPoint(analysis: TrackAnalysis, claimed: Double): Double {
+    if (!claimed.isFinite() || claimed <= 0) return claimed.coerceAtLeast(0.0)
+    val curve = analysis.energyCurve
+    if (curve.size < 2) return claimed
+    val energies = curve.map { it.energy }.filter { it.isFinite() && it >= 0 }.sorted()
+    if (energies.isEmpty()) return claimed
+    val reference = energies[floor((energies.size - 1) * 0.85).toInt()].orZero()
+    if (reference <= 0) return claimed
+    val threshold = reference * AUDIBLE_ENERGY_FRACTION
+    val mean = energies.average().takeIf { it.isFinite() && it > 0 } ?: return claimed
+    val gate = max(threshold, 0.5 * mean)
+    var run = 0
+    for (point in curve) {
+        if (!point.time.isFinite() || point.time < 0 || point.time >= claimed) break
+        if (point.energy.isFinite() && point.energy >= gate) {
+            run++
+            if (run >= 2) {
+                // Back up to the run's first sample so the cue sits at the
+                // breath onset, not one sample into it.
+                val idx = curve.indexOf(point)
+                val first = (curve.getOrNull(idx - 1)?.time ?: point.time)
+                return first.coerceIn(0.0, claimed)
+            }
+        } else {
+            run = 0
+        }
+    }
+    return claimed
+}
+
 /** The value in [values] closest to [target] within [tolerance], or null when none qualifies. */
 internal fun nearestValue(values: List<Double>, target: Double, tolerance: Double): Double? =
     values.filter { it.isFinite() && abs(it - target) <= tolerance }
@@ -1368,6 +1407,53 @@ fun snapToPhrase16(
 }
 
 /**
+ * Phase A3: 32-bar grid = every second 16-bar start. A use-site policy, not a
+ * primitive: MIXSET_PHRASE_BARS stays 16, the 32-bar span is only justified
+ * where two choruses have already played (see chorusCountBefore).
+ */
+fun phrase32Grid(analysis: TrackAnalysis): List<Double> =
+    phrase16Grid(analysis).filterIndexed { index, _ -> index % 2 == 0 }
+
+/** Phase A3: nearest 32-bar boundary to [time] within [tolerance], else [time]. */
+fun snapToPhrase32(
+    analysis: TrackAnalysis,
+    time: Double,
+    tolerance: Double = Double.POSITIVE_INFINITY,
+    preferEarlier: Boolean = true,
+): Double {
+    if (!time.isFinite()) return time
+    val grid = phrase32Grid(analysis)
+    if (grid.isEmpty()) return time
+    val tol = if (tolerance.isFinite()) tolerance else {
+        (phrase16Seconds(analysis) ?: MIXSET_WAIT_TOLERANCE_SECONDS) * 2
+    }
+    if (preferEarlier) {
+        val snapped = grid.filter { it <= time + 1e-6 }.maxOrNull()
+        if (snapped != null && time - snapped <= tol) return max(0.0, snapped)
+    } else {
+        val nearest = grid.minByOrNull { abs(it - time) }
+        if (nearest != null && abs(nearest - time) <= tol) return max(0.0, nearest)
+    }
+    val nearest = grid.minByOrNull { abs(it - time) } ?: return time
+    return if (abs(nearest - time) <= tol) max(0.0, nearest) else time
+}
+
+/**
+ * Phase A3: how many CHORUS sections end at or before [anchor]. mergeAdjacent
+ * joins same-type neighbours, so one entry ≈ one sustained loud passage and
+ * counting ends (not starts) never double-counts the chorus being cut.
+ * Empty map = no evidence = 0; the caller keeps 16-bar behaviour.
+ */
+fun chorusCountBefore(analysis: TrackAnalysis, anchor: Double): Int {
+    if (!anchor.isFinite()) return 0
+    return analysis.structureMap.count {
+        it.type == StructureSectionType.CHORUS &&
+            it.start.isFinite() && it.end.isFinite() &&
+            it.end <= anchor + 1e-6
+    }
+}
+
+/**
  * The track's best part: its drop, else its loudest moment past the intro,
  * else the analyzed mix-in. One deterministic function both sides share, so
  * the outgoing cut point and the incoming cue agree without the controller
@@ -1490,6 +1576,54 @@ fun isDropTrusted(analysis: TrackAnalysis): Boolean {
     val drop = firstDropSec(analysis) ?: return false
     if (!drop.isFinite()) return false
     return trustedBuildupStart(analysis) != null
+}
+
+/**
+ * Phase A4: skit/interlude proxy from persisted evidence only (centroid and
+ * onset curves do not survive a restart — only RMS-adjacent energy and the
+ * vocal mask do). A spoken bed is a long (>=30 s, ~4× the cooldown window)
+ * low span (< BREAK_RMS_FRACTION of the mean) whose vocal activity stays
+ * below 0.40 (speech scores low on the band-ratio gate, singing does not),
+ * on a track with no trusted drop (guards a genuine quiet intro) or low
+ * whole-track vocal probability. Returns the longest qualifying span, else
+ * null. Callers veto mixset entry/exit inside the span and force the PLAIN
+ * path — a talking head is never a mix point.
+ */
+fun spokenInterludeSpan(analysis: TrackAnalysis): ClosedRange<Double>? {
+    val curve = analysis.energyCurve
+    if (curve.size < 4) return null
+    val energies = curve.map { it.energy }.filter { it.isFinite() && it >= 0 }
+    if (energies.isEmpty()) return null
+    val mean = energies.average().takeIf { it.isFinite() && it > 0 } ?: return null
+    if (!isDropTrusted(analysis) || analysis.vocalProbability < 0.40) {
+        var best: ClosedRange<Double>? = null
+        var runStart: Double? = null
+        var runEnd = 0.0
+        fun closeRun() {
+            val s = runStart
+            if (s != null && runEnd - s >= 30.0) {
+                val v = vocalActivityBetween(analysis, s, runEnd)
+                if (v != null && v < 0.40) {
+                    if (best == null || runEnd - s > best!!.endInclusive - best!!.start) {
+                        best = s..runEnd
+                    }
+                }
+            }
+            runStart = null
+        }
+        for (point in curve) {
+            if (!point.time.isFinite() || !point.energy.isFinite()) continue
+            if (point.energy < BREAK_RMS_FRACTION * mean) {
+                if (runStart == null) runStart = point.time
+                runEnd = point.time
+            } else {
+                closeRun()
+            }
+        }
+        closeRun()
+        return best
+    }
+    return null
 }
 
 private fun buildupStartRaw(analysis: TrackAnalysis, peakTime: Double): Double? {
@@ -1645,6 +1779,8 @@ fun alignMixsetExitToIncomingDrop(
     if (!mixset || !anchor.isFinite()) return anchor
     val dropB = firstDropSec(incoming) ?: return anchor
     if (!dropB.isFinite() || dropB >= anchor) return anchor
+    // Phase A5: a phantom drop must not drag the exit — same guard as pushPastDrop.
+    if (!isDropTrusted(incoming)) return anchor
     // Spec finetune §6.5: nudge tolerance widens from a fixed 8 s to one
     // phrase, capped at 20 s — a full phrase of drift is still a nudge.
     val tolerance = minOf(phrase16Seconds(outgoing) ?: MIXSET_WAIT_TOLERANCE_SECONDS, 20.0)
@@ -1803,13 +1939,25 @@ fun mixsetMixOutAnchor(analysis: TrackAnalysis, length: Double, playbackTime: Do
     // Tier 1: BREAK start after Drop 1.
     val tier1From = if (drop != null && drop.isFinite()) max(from, drop) else from
     var exit = cooldownLanding(analysis, tier1From, to)?.let { snapToPhrase16(analysis, it) }
+    // Phase A4: a cooldown inside a spoken bed is a skit, not a comedown.
+    val spoken = spokenInterludeSpan(analysis)
+    if (exit != null && spoken != null && exit in spoken) exit = null
     // Tier 2: Drop 1 + 2 spec phrases, snapped to the nearest 16-bar start
     // (either side — an at-or-before snap would slide under the play floor
     // whenever the raw target sits right on it).
+    // Phase A3: two choruses played earns the 32-bar — a DJ lets the second
+    // chorus finish, exiting on the "1" after it instead of cutting at
+    // drop 1 + 2 phrases.
     if (exit == null && drop != null && drop.isFinite()) {
         val phrase16 = phrase16Seconds(analysis)
         if (phrase16 != null) {
-            val tier2 = snapToPhrase16(analysis, drop + 2 * phrase16, preferEarlier = false)
+            val tier2raw = drop + 2 * phrase16
+            val twoChoruses = chorusCountBefore(analysis, tier2raw) >= 2
+            val tier2 = if (twoChoruses) {
+                snapToPhrase32(analysis, drop + 4 * phrase16, preferEarlier = false)
+            } else {
+                snapToPhrase16(analysis, tier2raw, preferEarlier = false)
+            }
             if (tier2 in from..to) exit = tier2
         }
     }

@@ -169,9 +169,14 @@ class AnalysisStore(private val context: Context) {
         val structuredDropSec: Double? = null,
         val structuredBreakSec: Double? = null,
         val structuredOutroSec: Double? = null,
-        val structuredBuildupSec: Double? = null,
-        val plainCutBreathSec: Double? = null,
-    ) {
+    val structuredBuildupSec: Double? = null,
+    val plainCutBreathSec: Double? = null,
+    val dropConfidence: Double? = null,
+    val buildupMethod: String? = null,
+    val buildupFootSec: Double? = null,
+    val buildupSpanSec: Double? = null,
+    val buildupRise: Double? = null,
+) {
         fun toAnalysis(trackId: String) = TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
             trackId = trackId,
@@ -203,9 +208,14 @@ class AnalysisStore(private val context: Context) {
             structuredDropSec = structuredDropSec,
             structuredBreakSec = structuredBreakSec,
             structuredOutroSec = structuredOutroSec,
-            structuredBuildupSec = structuredBuildupSec,
-            plainCutBreathSec = plainCutBreathSec,
-        )
+    structuredBuildupSec = structuredBuildupSec,
+    plainCutBreathSec = plainCutBreathSec,
+    dropConfidence = dropConfidence,
+    buildupMethod = buildupMethod,
+    buildupFootSec = buildupFootSec,
+    buildupSpanSec = buildupSpanSec,
+    buildupRise = buildupRise,
+)
 
         companion object {
             fun of(analysis: TrackAnalysis) = Stored(
@@ -237,10 +247,15 @@ class AnalysisStore(private val context: Context) {
                 structuredDropSec = analysis.structuredDropSec,
                 structuredBreakSec = analysis.structuredBreakSec,
                 structuredOutroSec = analysis.structuredOutroSec,
-                structuredBuildupSec = analysis.structuredBuildupSec,
-                plainCutBreathSec = analysis.plainCutBreathSec?.let(::round),
-            )
-        }
+        structuredBuildupSec = analysis.structuredBuildupSec,
+        plainCutBreathSec = analysis.plainCutBreathSec?.let(::round),
+        dropConfidence = analysis.dropConfidence,
+        buildupMethod = analysis.buildupMethod,
+        buildupFootSec = analysis.buildupFootSec?.let(::round),
+        buildupSpanSec = analysis.buildupSpanSec?.let(::round),
+        buildupRise = analysis.buildupRise,
+    )
+}
     }
 
     @Serializable
@@ -285,7 +300,7 @@ class AnalysisStore(private val context: Context) {
          * re-analysis costs seconds, and a beat grid interpreted under the wrong
          * assumptions is silently wrong for the life of the file.
          */
-        const val SCHEMA_VERSION = 4
+        const val SCHEMA_VERSION = 5
 
         /** A few thousand tracks' worth, at tens of kilobytes each. */
         const val MAX_ENTRIES = 2_000

@@ -189,7 +189,7 @@ object StructureDetector {
         structureMap: List<StructureLabel>,
         bpm: Double,
         beatConfidence: Double,
-    ): Double? {
+    ): DropCandidate? {
         if (fine.size < 8 || meanRms <= 0 || duration <= 0) return null
         if (beatConfidence < AMBIENT_BEAT_CONF) return null
         val bars = downbeats.filter { it.isFinite() }.sorted()
@@ -257,20 +257,21 @@ object StructureDetector {
             val score = rmsRatio * 0.30 + onsetRatio * 0.15 + centroidScore * 0.15 +
                 buildScore * 0.25 + sustainScore * 0.15 + positionBonus
             if (score > DROP_SCORE_ACCEPT) {
-                if (best == null || score > best.score) best = DropCandidate(w.start, score)
+                if (best == null || score > (best.score ?: 0.0)) best = DropCandidate(w.start, score)
             }
         }
-        val winner = best?.takeIf { it.score >= DROP_SCORE_BEST }
-        if (winner != null) return winner.startSec
+        val winner = best?.takeIf { (it.score ?: 0.0) >= DROP_SCORE_BEST }
+        if (winner != null) return winner
         // Fallback: max-RMS in-zone, guarded — a flat bed must not report a
-        // phantom drop (MixsetTest strict-neighbor contract).
+        // phantom drop (MixsetTest strict-neighbor contract). No score: the
+        // fallback carries no measured confidence.
         return windows
             .filter { it.start / duration in 0.20..0.65 && it.rmsMean > 1.05 * meanRms }
             .maxByOrNull { it.rmsMean }
-            ?.start
+            ?.let { DropCandidate(it.start, null) }
     }
 
-    private data class DropCandidate(val startSec: Double, val score: Double)
+    data class DropCandidate(val startSec: Double, val score: Double?)
 
     /**
      * Spec slopes are per bar but windows step one bar while spanning four —
