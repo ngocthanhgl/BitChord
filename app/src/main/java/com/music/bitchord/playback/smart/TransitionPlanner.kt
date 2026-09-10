@@ -373,7 +373,25 @@ fun selectTransitionType(
     highEnergyA: Boolean,
     highEnergyB: Boolean,
     hasDropInB: Boolean,
+    // Phase B3: best ranked mix-in/out rankScore (NEG_INF = fallback cue, no
+    // ranked evidence). Weak ends downgrade one step toward a wash; strong
+    // ends never upgrade (evidence argues caution, not daring).
+    introQuality: Double = 0.0,
+    outroQuality: Double = 0.0,
+    // Phase B4: energy direction of the pair (see energyTrajectoryFor).
+    trajectory: EnergyTrajectory = EnergyTrajectory.FLAT,
 ): TransitionType {
+    // Phase B3/B4: one-step wash downgrade for a FILTER verdict whose ends
+    // are weak (buried/vetoed rank or unranked fallback) or whose risers
+    // fight each other.
+    fun washDowngrade(): TransitionType =
+        if (introQuality < 0 || outroQuality < 0 ||
+            trajectory == EnergyTrajectory.A_UP_B_UP
+        ) {
+            TransitionType.ECHO_REVERB_OUT
+        } else {
+            TransitionType.FILTER_SWEEP
+        }
     if (tier == TransitionTier.DJ_ASSISTED) {
         return when {
             score.bpm < 0.60 -> TransitionType.ECHO_REVERB_OUT
@@ -381,13 +399,23 @@ fun selectTransitionType(
             else -> TransitionType.HARD_CUT
         }
     }
+    // Phase B2: the harmonic verdict keeps its blend; the near-harmonic band
+    // below it keeps SMOOTH for singing pairs (thresholds unchanged) and
+    // earns the filter for clean ones — a slight key rub under a sweep reads
+    // as tension, under a cut as a mistake. That cut was the perverse hole.
+    if (score.bpm >= 0.70 && score.key >= 0.85) return TransitionType.HARMONIC_BLEND
+    if (score.bpm >= 0.70 && score.key >= 0.70) {
+        return if (score.vocal >= 0.60) TransitionType.SMOOTH_CROSSFADE else washDowngrade()
+    }
     return when {
         tier == TransitionTier.HALF_TIME -> TransitionType.HALF_TIME_BLEND
         highEnergyA && highEnergyB && hasDropInB -> TransitionType.LOOP_CUT_DROP
         score.bpm < 0.50 -> TransitionType.ECHO_REVERB_OUT
-        score.key >= 0.85 && score.bpm >= 0.70 -> TransitionType.HARMONIC_BLEND
-        score.key >= 0.70 && score.bpm >= 0.70 && score.vocal >= 0.60 -> TransitionType.SMOOTH_CROSSFADE
-        score.bpm >= 0.70 && score.key < 0.70 -> TransitionType.FILTER_SWEEP
+        // Phase B1: the old dead band (0.50–0.70) fell through to HARD_CUT.
+        // A supported key earns the closing filter; an unsupported one washes.
+        score.bpm < 0.70 && score.key >= 0.70 -> washDowngrade()
+        score.bpm < 0.70 -> TransitionType.ECHO_REVERB_OUT
+        score.key < 0.70 -> TransitionType.FILTER_SWEEP
         else -> TransitionType.HARD_CUT
     }
 }
@@ -1786,10 +1814,38 @@ private fun overlapEnergyFactor(
 }
 
 /** v2 §6 table: A↓B↑ stretches, both↑ tightens, everything else holds. */
-fun overlapEnergyFactorFor(slopeA: Double, slopeB: Double): Double = when {
-    slopeA < -OVERLAP_SLOPE_EPSILON && slopeB > OVERLAP_SLOPE_EPSILON -> OVERLAP_ENERGY_STRETCH_FACTOR
-    slopeA > OVERLAP_SLOPE_EPSILON && slopeB > OVERLAP_SLOPE_EPSILON -> OVERLAP_ENERGY_TIGHTEN_FACTOR
-    else -> 1.0
+fun overlapEnergyFactorFor(slopeA: Double, slopeB: Double): Double =
+    when (energyTrajectoryFor(slopeA, slopeB)) {
+        EnergyTrajectory.A_DOWN_B_UP -> OVERLAP_ENERGY_STRETCH_FACTOR
+        EnergyTrajectory.A_UP_B_UP -> OVERLAP_ENERGY_TIGHTEN_FACTOR
+        else -> 1.0
+    }
+
+/**
+ * Phase B4: energy direction of the pair, classified from the same two
+ * slopes and dead-band as the sizing factor — zero new measurement. The
+ * selector consumes it so fighting risers wash out while comedown→buildup
+ * arcs earn the long blend.
+ */
+enum class EnergyTrajectory {
+    A_DOWN_B_UP, A_UP_B_UP, A_UP_B_DOWN, A_DOWN_B_DOWN,
+    A_FLAT_B_UP, A_FLAT_B_DOWN, A_UP_B_FLAT, A_DOWN_B_FLAT, FLAT,
+}
+
+fun energyTrajectoryFor(slopeA: Double, slopeB: Double): EnergyTrajectory {
+    val a = if (slopeA < -OVERLAP_SLOPE_EPSILON) -1 else if (slopeA > OVERLAP_SLOPE_EPSILON) 1 else 0
+    val b = if (slopeB < -OVERLAP_SLOPE_EPSILON) -1 else if (slopeB > OVERLAP_SLOPE_EPSILON) 1 else 0
+    return when {
+        a < 0 && b > 0 -> EnergyTrajectory.A_DOWN_B_UP
+        a > 0 && b > 0 -> EnergyTrajectory.A_UP_B_UP
+        a > 0 && b < 0 -> EnergyTrajectory.A_UP_B_DOWN
+        a < 0 && b < 0 -> EnergyTrajectory.A_DOWN_B_DOWN
+        a == 0 && b > 0 -> EnergyTrajectory.A_FLAT_B_UP
+        a == 0 && b < 0 -> EnergyTrajectory.A_FLAT_B_DOWN
+        a > 0 && b == 0 -> EnergyTrajectory.A_UP_B_FLAT
+        a < 0 && b == 0 -> EnergyTrajectory.A_DOWN_B_FLAT
+        else -> EnergyTrajectory.FLAT
+    }
 }
 
 private fun standardTransition(
@@ -2129,8 +2185,30 @@ private fun planTransitionInner(
     // arithmetic) read phantom drops as real and unlocked LOOP_CUT_DROP /
     // phrase-switch routing that assumes a genuine arrival.
     val realDropInB = dropInB != null && dropInB.isFinite() && isDropTrusted(nextAnalysis)
+    // Phase B3: best ranked intro/outro evidence for the selector. NEG_INF =
+    // a fallback cue with no ranked evidence (caution, not daring). The outro
+    // reuses the same end/window as the chosen anchor so the scalar describes
+    // the exit actually taken. Both rank fns are pure sorts of small analyzer
+    // lists — one extra pass each, no struct changes.
+    val bestIntroRank = rankMixInCandidates(nextAnalysis).firstOrNull()?.rankScore
+        ?: Double.NEGATIVE_INFINITY
+    val bestOutroRank = rankMixOutCandidates(analysis, finalMixAnchor, length, candidateWindow)
+        .firstOrNull()?.rankScore ?: Double.NEGATIVE_INFINITY
+    // Phase B4: trajectory from the same 64-beat slopes the overlap factor
+    // measures (see overlapEnergyFactor) — zero new measurement.
+    val intervalA = analysis.beatInterval.orZero()
+        .takeIf { it > 0 } ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
+    val intervalB = nextAnalysis.beatInterval.orZero()
+        .takeIf { it > 0 } ?: if (nextAnalysis.bpm.orZero() > 0) 60 / nextAnalysis.bpm else 0.5
+    val trajectory = energyTrajectoryFor(
+        windowSlope(analysis.energyCurve, mixAnchor - 64 * intervalA, mixAnchor),
+        windowSlope(nextAnalysis.energyCurve, proxyEntry, proxyEntry + 64 * intervalB),
+    )
     val selectedType = if (beatOrHalf || policy.tier == TransitionTier.DJ_ASSISTED) {
-        selectTransitionType(proxyScore, policy.tier, highEnergyA, highEnergyB, realDropInB)
+        selectTransitionType(
+            proxyScore, policy.tier, highEnergyA, highEnergyB, realDropInB,
+            introQuality = bestIntroRank, outroQuality = bestOutroRank, trajectory = trajectory,
+        )
     } else {
         // Unreachable today (PLAIN returns upstream), kept as the closed
         // default so a future tier degrades to a blend, never to a crash.
