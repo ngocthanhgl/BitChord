@@ -30,6 +30,8 @@ import com.music.bitchord.playback.smart.VolumeCurve
 import com.music.bitchord.playback.smart.planTransition
 import com.music.bitchord.playback.smart.vocalActivityBetween
 import com.music.bitchord.playback.smart.VOCAL_ACTIVE_THRESHOLD
+import com.music.bitchord.playback.smart.MIN_GUARANTEED_BLEND_SECONDS
+import kotlin.math.max
 import com.music.bitchord.playback.smart.plainDissolvePlan
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -367,6 +369,12 @@ class CrossfadeController(
         /** DJ-EQ spec: B enters singing — delay its mids. */
         val delayBMids: Boolean = false,
         /**
+         * Full-audit P1 M3: the vocal choke's EQ compensation — voice the
+         * duck key set even when the ARM flags read clean. ORed into the
+         * flags in rideEq.
+         */
+        val forceDuckKeys: Boolean = false,
+        /**
          * DJ-EQ spec: blend progress at which the bass swap fires, pre-snapped
          * to the next downbeat at ARM time. +Inf = no downbeat swap (the LOW
          * band comes from the schedule tables instead).
@@ -524,6 +532,14 @@ class CrossfadeController(
                 // harmless and shouldn't cost the listener the blend.
                 Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> bail()
                 Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> bail()
+                // Full-audit P3: a natural auto-advance reaching this listener
+                // means ExoPlayer moved the queue on by itself — our blend
+                // never fired (missed window, stuck ARMING across the
+                // boundary). A blended handoff is a role swap, never a media
+                // transition, so this cannot fire for a handoff we handled;
+                // bail() is a no-op in IDLE, so the only effect is unsticking
+                // the controller back to IDLE to plan the new pair.
+                Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> bail()
             }
         }
 
@@ -908,6 +924,47 @@ class CrossfadeController(
 
         if (plan.blocked) return
 
+        // Full-audit P3: passed-mix rescue. A live plan whose window slid past
+        // the playhead (evidence refined the anchor forward after the marker
+        // froze, or ARM never fired before the slide) would otherwise miss
+        // forever — every tick re-plans from a post-window playhead and
+        // returns without arming. Find a new out-point with a silence-seeking
+        // dissolve ahead of the playhead instead of hanging until ExoPlayer
+        // advances on its own. (The armed case is already covered by the
+        // driveArming overshoot path; this covers the never-armed case.)
+        val posSec = player.currentPosition / 1000.0
+        val lenSec = duration / 1000.0
+        if (plan.fadeMs > 0 && posSec >= plan.transitionEnd - 0.5 && lenSec - posSec > 6.0) {
+            logGuardOnce("smart", "passed mix window (end=${plan.transitionEnd}), rescuing dissolve")
+            clearMarkerLatch()
+            val rescue = plainDissolvePlan(
+                currentAnalysis,
+                nextAnalysis,
+                lenSec,
+                nextDuration.takeIf { it > 0L }?.div(1000.0) ?: 0.0,
+                posSec,
+                mixset,
+                plan.policyReasons + "passed-mix-rescue",
+            )
+            val rescueStart = max(posSec + 2.0, rescue.transitionStart)
+            if (rescue.transitionEnd - rescueStart >= MIN_GUARANTEED_BLEND_SECONDS) {
+                plan = rescue.copy(
+                    transitionStart = rescueStart,
+                    fadeSeconds = rescue.transitionEnd - rescueStart,
+                    handoffStartSeconds = rescueStart,
+                    handoffDuration = rescue.transitionEnd - rescueStart,
+                    overlapSeconds = rescue.transitionEnd - rescueStart,
+                    shouldStart = false,
+                    reason = "passed-mix-rescue",
+                )
+            } else {
+                // No room for a real blend: clear the promised window and
+                // await the natural advance instead of displaying a passed mix.
+                AppSettings.smartTransitionWindow.value = null
+                return
+            }
+        }
+
         val fade = plan.fadeMs
         if (fade <= 0L) {
             // The planner floor above guarantees a non-blocked plan carries a
@@ -987,6 +1044,11 @@ class CrossfadeController(
                 // cannot hold.
                 echoBeatSeconds = when {
                     plan.type == TransitionType.PLAIN_DISSOLVE -> 0.375
+                    // Full-audit P1 M4: the plan states its period; the old
+                    // outgoingBpm-only rule voiced every echo as a half-beat
+                    // dub, including echoOut's one-bar repeats.
+                    plan.echoPeriodBeats != null && plan.echoPeriodBeats > 0 && plan.outgoingBpm > 0 ->
+                        plan.echoPeriodBeats * 60.0 / plan.outgoingBpm
                     plan.outgoingBpm > 0 -> 30.0 / plan.outgoingBpm
                     else -> 0.0
                 },
@@ -1008,6 +1070,7 @@ class CrossfadeController(
                 eqEnabled = true,
                 duckAMids = duckAMids,
                 delayBMids = delayBMids,
+                forceDuckKeys = plan.forceDuckKeys,
                 eqSwapFireProgress = eqSwapFireProgress,
                 eqSwapBeatSec = currentAnalysis?.beatInterval ?: 0.0,
             ),
@@ -1804,8 +1867,16 @@ class CrossfadeController(
      */
     private fun rideEq(progress: Float) {
         if (!render.eqEnabled) return
-        val out = EqSchedule.outgoingGains(render.eqType, progress, render.duckAMids)
-        val into = EqSchedule.incomingGains(render.eqType, progress, render.delayBMids)
+        // Full-audit P1 M1: beds under EqSchedule.SHORT_BED_SECONDS render
+        // the compressed short-bed tables — the long-bed keyframes never
+        // leave unity inside a phrase-switch bed.
+        val shortBed = render.overlapSeconds in 0.01..EqSchedule.SHORT_BED_SECONDS
+        // Full-audit P1 M3: the vocal choke voices duck keys with the log
+        // curve even when the ARM flags read clean.
+        val duck = render.duckAMids || render.forceDuckKeys
+        val delay = render.delayBMids || render.forceDuckKeys
+        val out = EqSchedule.outgoingGains(render.eqType, progress, duck, shortBed)
+        val into = EqSchedule.incomingGains(render.eqType, progress, delay)
         val swapAt = render.eqSwapFireProgress
         val (lowOut, lowIn) = if (swapAt.isFinite()) {
             if (!eqSwapFired && progress >= swapAt) {

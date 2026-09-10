@@ -53,8 +53,12 @@ object EqSchedule {
     /** DJ hard swap: the LOW handover completes in 2 beats on the fired downbeat. */
     const val SWAP_BARS = 0.5
 
-    fun outgoingGains(type: TransitionType, progress: Float, duckAMids: Boolean): EqGains =
-        at(outgoingKeys(type, duckAMids), progress)
+    fun outgoingGains(
+        type: TransitionType,
+        progress: Float,
+        duckAMids: Boolean,
+        shortBed: Boolean = false,
+    ): EqGains = at(outgoingKeys(type, duckAMids, shortBed), progress)
 
     fun incomingGains(type: TransitionType, progress: Float, delayBMids: Boolean): EqGains =
         at(incomingKeys(type, delayBMids), progress)
@@ -82,7 +86,17 @@ object EqSchedule {
 
     // ---- Outgoing (Track A) -------------------------------------------------
 
-    private fun outgoingKeys(type: TransitionType, duck: Boolean): List<Key> = when (type) {
+    /**
+     * Full-audit P1 M1: beds under this length render the phrase-switch
+     * short tables (HARMONIC only — the other types' keyframes already move
+     * early). The long-bed HARMONIC taper's first mid move sits at 0.18 with
+     * the last high move at 0.88; on a 2–7 s phrase-switch bed the mids never
+     * leave unity before SILENT and the per-tick steps blow the glide budget
+     * — the filter won and the EQ schedule was effectively bypassed.
+     */
+    const val SHORT_BED_SECONDS = 12.0
+
+    private fun outgoingKeys(type: TransitionType, duck: Boolean, shortBed: Boolean = false): List<Key> = when (type) {
         TransitionType.SMOOTH_CROSSFADE -> {
             // Finetune-overlap: mids start receding at 0.15 (~3.4 s into a
             // 22.5 s bed), highs follow at 0.75 — the listener tracks each
@@ -112,7 +126,32 @@ object EqSchedule {
         TransitionType.HARMONIC_BLEND -> {
             // Finetune-overlap: perfect key match coexists long (unity to
             // 0.52 voiceless); ducked mids taper from 0.18 over a ~26 s bed.
-            if (duck) {
+            if (shortBed) {
+                // P1 M1 short bed (phrase-switch 2–7 s, clash-shrunk beds):
+                // same gestures, compressed — first mid move ≤0.08, mids
+                // resolved by 0.60 so the voicing completes inside the bed
+                // instead of arriving at SILENT still at unity.
+                if (duck) {
+                    listOf(
+                        Key(0f, EqGains.UNITY),
+                        Key(0.08f, EqGains(1f, 0.80f, 1f)),
+                        Key(0.18f, EqGains(1f, 0.55f, 1f)),
+                        Key(0.30f, EqGains(1f, 0.38f, 1f)),
+                        Key(0.42f, EqGains(1f, 0.25f, 1f)),
+                        Key(0.55f, EqGains(1f, 0.15f, 0.88f)),
+                        Key(0.70f, EqGains(1f, 0.10f, 0.65f)),
+                        Key(1f, EqGains.SILENT),
+                    )
+                } else {
+                    listOf(
+                        Key(0f, EqGains.UNITY),
+                        Key(0.30f, EqGains.UNITY),
+                        Key(0.45f, EqGains(1f, 0.80f, 1f)),
+                        Key(0.60f, EqGains(1f, 0.52f, 0.88f)),
+                        Key(1f, EqGains.SILENT),
+                    )
+                }
+            } else if (duck) {
                 listOf(
                     Key(0f, EqGains.UNITY),
                     Key(0.18f, EqGains(1f, 0.80f, 1f)),

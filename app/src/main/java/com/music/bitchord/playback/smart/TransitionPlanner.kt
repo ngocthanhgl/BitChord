@@ -327,6 +327,21 @@ data class TransitionPlan(
      * it to exempt the standard path from the ceiling map.
      */
     val standardTransitionUsed: Boolean = false,
+    /**
+     * Full-audit P1 M3: set by the vocal choke ([applyMixsetFireFloor]) when
+     * it flips S_CURVE→LOGARITHMIC on a vocal-heavy blend. The EQ tables were
+     * timed against the S-curve's slow middle; under LOG the gain drops
+     * before the mid-duck arrives unless the duck-voiced key set is selected.
+     * The renderer ORs this into duckAMids/delayBMids.
+     */
+    val forceDuckKeys: Boolean = false,
+    /**
+     * Full-audit P1 M4: echo repeat period in beats (0.5 = half-beat dub,
+     * 1.0 = one-bar repeats), null = the renderer's default rule. heavyClash
+     * and echoOut share a style but not a period; deriving it from
+     * outgoingBpm alone rendered both as half-beat dubs.
+     */
+    val echoPeriodBeats: Double? = null,
 ) {
     /** Convenience for the engine, which schedules in milliseconds. */
     val fadeMs: Long get() = (fadeSeconds * 1000).roundToLong()
@@ -655,6 +670,8 @@ private fun heavyClashPlan(
         overlapSeconds = fadeSec,
         echoAmount = HEAVY_CLASH_ECHO_AMOUNT * clashGate,
         reverbAmount = HEAVY_CLASH_REVERB_WET * clashGate,
+        // Full-audit P1 M4: the dub throw repeats every HALF beat.
+        echoPeriodBeats = 0.5,
         reverbFreezeAtSec = HEAVY_CLASH_FREEZE_OFFSET_SEC,
         incomingStartDelaySec = 4.5,
         outgoingHoldSec = 3.0,
@@ -733,7 +750,14 @@ private fun echoOutPlan(
 ): TransitionPlan {
     val bpmOut = analysis.bpm.orZero()
     val beatSeconds = if (bpmOut > 0) 60 / bpmOut else 0.5
+    // Full-audit P1: the plan complies with its own ceiling — it sized
+    // 32 beats (15 s @128) against an 11 s ceiling and won by never reading
+    // it. The renderer sizes wet ramps off the same ceiling; a plan longer
+    // than its ceiling desyncs them.
+    val typeCeiling = if (mixset) djModeCeilingFor(TransitionType.ECHO_REVERB_OUT)
+        else ceilingFor(TransitionType.ECHO_REVERB_OUT)
     val fade = min(32.0 * beatSeconds, min(mixAnchor * 0.6, ABSOLUTE_MAX_TRANSITION_SECONDS))
+        .coerceAtMost(typeCeiling)
         .coerceAtLeast(1.0)
     val targetStart = max(0.0, mixAnchor - fade)
     // The track plays its floor: never start the wash before it (normal mode).
@@ -772,6 +796,9 @@ private fun echoOutPlan(
         type = TransitionType.ECHO_REVERB_OUT,
         score = score,
         echoAmount = echoAmount,
+        // Full-audit P1 M4: one-bar repeats on the outgoing grid — not the
+        // half-beat dub the renderer's default rule would voice.
+        echoPeriodBeats = 1.0,
         incomingCueTime = cue,
         incomingHandoffTime = handoff,
         incomingPlaybackRate = 1.0,
@@ -809,7 +836,12 @@ private fun loopCutPlan(
 ): TransitionPlan {
     val bpmOut = analysis.bpm.orZero()
     val beatOut = if (bpmOut > 0) 60 / bpmOut else 0.5
+    // Full-audit P1: same ceiling compliance as echoOutPlan — 24 beats
+    // (11.25 s @128) against an 8 s ceiling.
+    val loopCeiling = if (mixset) djModeCeilingFor(TransitionType.LOOP_CUT_DROP)
+        else ceilingFor(TransitionType.LOOP_CUT_DROP)
     val windowSec = min(6 * 4 * beatOut, min(mixAnchor * 0.6, ABSOLUTE_MAX_TRANSITION_SECONDS))
+        .coerceAtMost(loopCeiling)
         .coerceAtLeast(1.0)
     val playFloorSeconds = if (mixset) 0.0 else 0.8 * length
     val rawStart = max(0.0, mixAnchor - windowSec)
@@ -1792,9 +1824,16 @@ internal fun applyMixsetFireFloor(plan: TransitionPlan, length: Double, mixset: 
     // Vocal-heavy blends ride LOGARITHMIC: on matched grids the S-curve's
     // slow middle stacks two voices at near-full level, while the log's fast
     // early drop of the outgoing track clears the band B is entering.
-    // Central choke — every smart plan passes through here.
+    // Central choke — every smart plan passes through here. Full-audit P1
+    // M3: the flip is paired with the duck-voiced EQ key set (see
+    // forceDuckKeys) and logged, so the curve and the EQ never disagree
+    // about how vocal this blend is.
     if (plan.vocalOverlap > 0.5 && plan.volumeCurve == VolumeCurve.S_CURVE) {
-        return plan.copy(volumeCurve = VolumeCurve.LOGARITHMIC)
+        return plan.copy(
+            volumeCurve = VolumeCurve.LOGARITHMIC,
+            forceDuckKeys = true,
+            policyReasons = plan.policyReasons + "vocal-choke-log",
+        )
     }
     return plan
 }
@@ -1841,6 +1880,10 @@ fun planTransition(
     if (plan.fadeSeconds >= MIN_GUARANTEED_BLEND_SECONDS) return plan
     // A deliberate silence-seeking dissolve is already a mix, even at 2 s.
     if (plan.type == TransitionType.PLAIN_DISSOLVE) return plan
+    // Full-audit P1 M5: the LOOP INSTANT-hold is deliberate tension, not a
+    // glitch — substituting a 4 s dissolve for it contradicts the loop's own
+    // author. The loop runs its window as planned.
+    if (plan.type == TransitionType.LOOP_CUT_DROP) return plan
     // The queue literally repeats one file: dissolving a track into itself
     // is a glitch, not a mix.
     if (currentTrack != null && nextTrack != null && currentTrack.id == nextTrack.id) return plan
@@ -2322,7 +2365,15 @@ private fun planTransitionInner(
         transitionBeats = transitionBeats,
         bassSwap = sameBeatBlend || hasBassContent,
         transitionStyle = if (sameBeatBlend) TransitionStyle.DJ_BLEND else TransitionStyle.DJ_FILTER,
-        type = if (sameBeatBlend) TransitionType.SMOOTH_CROSSFADE else TransitionType.FILTER_SWEEP,
+        // Full-audit P1 M2: the type follows the matrix decision, not the
+        // grid accident. Re-deriving SMOOTH-vs-FILTER from sameBeatBlend here
+        // rendered HARMONIC-matrix pairs under the FILTER EQ schedule (and
+        // vice versa) — the "EQ loses to the filter" feeling. The style above
+        // still reflects grid reality (matched grid blends open, drift hides
+        // behind the sweep); the type now selects the EQ voicing the matrix
+        // actually chose. Only SMOOTH/HARMONIC/FILTER reach here (ECHO/LOOP/
+        // HARD/HALF returned upstream), so selectedType is always one of them.
+        type = selectedType,
         score = finalScore,
         keyShiftSemitones = keyShift,
         volumeCurve = VolumeCurve.S_CURVE,
