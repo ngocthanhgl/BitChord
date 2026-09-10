@@ -1523,7 +1523,7 @@ class CrossfadeController(
         // finish() would do it at full volume (lastProgress=0 → glide 1.0 →
         // guard passes) — the end-of-mix snap on the rescue path. deckRateReset
         // tells finish() the deck is already home (rearmed in begin()).
-        if (incomingPlaybackRate != 1.0f || render.keyShiftSemitones != 0) {
+        if (incomingPlaybackRate != 1.0 || render.keyShiftSemitones != 0) {
             into.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
             deckRateReset = true
         }
