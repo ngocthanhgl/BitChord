@@ -2127,12 +2127,13 @@ class CrossfadeController(
                 } else {
                     1f
                 }
-                // DJ hard swap: the 2-beat handover rides a smoothstep, not a
-                // line — full speed mid-swap, zero slope at both ends so the
-                // 30 ms re-aims never step. Endpoints identical to the linear
-                // trade, only the gesture changes.
-                val s = t * t * (3f - 2f * t)
-                (1f - s) to s
+                // Finetune F2: constant-power crossover. The old smoothstep
+                // traded linearly (both bass at ~0.5 mid-swap = an energy
+                // hole right where the ear waits for the switch). cos/sin
+                // keeps the low-end power sum at 1.0 through the swap —
+                // endpoints identical, zero slope at both ends preserved.
+                val a = t * PI.toFloat() / 2f
+                cos(a) to sin(a)
             }
         } else {
             out.low to into.low
@@ -2146,7 +2147,13 @@ class CrossfadeController(
         // WASH_OUT gets the same early mid-cut (its wet tail still rings —
         // sends are starved, not drained). Kill-once: after the mute fires,
         // hold the kill instead of re-voicing the schedule every tick.
+        // Finetune F1: the yield runs quadratic, not linear — at mid-blend
+        // the old vocal is down to ~1/4 instead of ~1/2, so the mud never
+        // forms; and the incoming mids/highs layer in over the first ~30%
+        // instead of arriving full (DJ brings the new track in by layers).
         val incomingSings = delay || liveDelayB > 0.5f || render.forceDuckKeys
+        val entryT = (progress / 0.30f).coerceIn(0f, 1f)
+        val entryRamp = entryT * entryT * (3f - 2f * entryT)
         if (dryKilled) {
             eqFilters.outgoing(0f, 0f, 0f)
         } else {
@@ -2154,13 +2161,14 @@ class CrossfadeController(
                 (render.mixRecipe == MixRecipe.VOCAL_DUEL || render.mixRecipe == MixRecipe.WASH_OUT) &&
                 incomingSings
             ) {
-                ((0.80f - outProgress) / 0.80f).coerceIn(0f, 1f)
+                val lin = ((0.80f - outProgress) / 0.80f).coerceIn(0f, 1f)
+                lin * lin
             } else {
                 1f
             }
             eqFilters.outgoing(lowOut, out.mid * ownership, out.high * ownership)
         }
-        eqFilters.incoming(lowIn, into.mid, into.high)
+        eqFilters.incoming(lowIn, into.mid * entryRamp, into.high * entryRamp)
     }
 
     private fun rideFilters(progress: Float, inProgress: Float) {
