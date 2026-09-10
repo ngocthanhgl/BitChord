@@ -491,6 +491,7 @@ internal fun plainDissolvePlan(
     mixset: Boolean,
     reasons: List<String>,
     score: CompatibilityScore = CompatibilityScore(),
+    candidateShift: Int? = null,
 ): TransitionPlan {
     val contentEnd = analysis.contentEndTime.orZero().takeIf { it > 0 } ?: length
     val audibleStart = audibleStartOf(analysis)
@@ -510,7 +511,7 @@ internal fun plainDissolvePlan(
         nextAnalysis.keyConfidence.orZero() >= TRUSTED_PITCH_CONFIDENCE &&
         !pitchVetoesShift(nextAnalysis.vocalPitchMedianHz, nextAnalysis.key)
     ) {
-        semitonesToShift(analysis.key, nextAnalysis.key)
+        candidateShift ?: semitonesToShift(analysis.key, nextAnalysis.key)
     } else {
         0
     }
@@ -578,7 +579,7 @@ private fun halfTimeBlendPlan(
         !(nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
             pitchVetoesShift(nextAnalysis.vocalPitchMedianHz, nextAnalysis.key))
     ) {
-        semitonesToShift(analysis.key, nextAnalysis.key)
+        policy.candidateShiftSemitones
     } else {
         0
     }
@@ -2063,6 +2064,7 @@ private fun planTransitionInner(
             plainDissolvePlan(
                 analysis, nextAnalysis, length, nextLength,
                 playbackTime, mixset, policy.reasons,
+                candidateShift = policy.candidateShiftSemitones,
             ),
             length, mixset,
         )
@@ -2344,7 +2346,7 @@ private fun planTransitionInner(
         !(nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
             pitchVetoesShift(nextAnalysis.vocalPitchMedianHz, nextAnalysis.key))
     ) {
-        semitonesToShift(analysis.key, nextAnalysis.key)
+        policy.candidateShiftSemitones
     } else {
         0
     }

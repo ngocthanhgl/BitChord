@@ -755,7 +755,8 @@ fun assessTransitionTier(
         )
     }
 
-    val matchedRatio = matchHarmonicRatio(outgoingBpm, incomingBpm)
+    val candidate = findBestCandidate(analysis, nextAnalysis)
+    val matchedRatio = candidate?.ratio
     if (matchedRatio == null) reasons += "tempo-distance"
     if (outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE) {
         reasons += "beat-confidence"
@@ -776,6 +777,7 @@ fun assessTransitionTier(
         reasons = reasons,
         beatConfidence = floorConfidence,
         matchedRatio = matchedRatio ?: 1.0,
+        candidateShiftSemitones = candidate?.keyShiftSemitones ?: 0,
     )
 }
 
@@ -813,10 +815,44 @@ const val TRUSTED_PITCH_CONFIDENCE = 0.5
  */
 const val VOCAL_EXIT_BUFFER_SECONDS = 0.5
 
-/** v2 §5a: accepted harmonic tempo ratios, checked in order. 1:1, 2:1, 1:2,
+/** v2 §5a: accepted harmonic tempo ratios. 1:1, 2:1, 1:2,
  * 3:2, 2:3, 4:3, 3:4 — v1 handled only the octave pair, so a 90 BPM hip-hop
- * track against 128 BPM house fell to PLAIN despite a clean 3:2 match. */
-val SUPPORTED_BPM_RATIOS = doubleArrayOf(1.0, 2.0, 0.5, 1.5, 2.0 / 3.0, 4.0 / 3.0, 0.75)
+ * track against 128 BPM house fell to PLAIN despite a clean 3:2 match.
+ * Multi-candidate §Q1: 5:4 / 4:5 rescue genre-edge pairs (80↔100, 96↔120...).
+ * Named consts declared ONCE and shared by the array and the cap map below —
+ * Double map lookup is bit-equality, so re-expressed literals would miss. */
+private const val RATIO_1_1 = 1.0
+private const val RATIO_2_1 = 2.0
+private const val RATIO_1_2 = 0.5
+private const val RATIO_3_2 = 1.5
+private const val RATIO_2_3 = 2.0 / 3.0
+private const val RATIO_4_3 = 4.0 / 3.0
+private const val RATIO_3_4 = 0.75
+private const val RATIO_5_4 = 1.25
+private const val RATIO_4_5 = 0.8
+
+val SUPPORTED_BPM_RATIOS = doubleArrayOf(
+    RATIO_1_1, RATIO_2_1, RATIO_1_2,
+    RATIO_3_2, RATIO_2_3,
+    RATIO_4_3, RATIO_3_4,
+    RATIO_5_4, RATIO_4_5,
+)
+
+/** Multi-candidate §Q1: per-ratio deviation caps. Entries above 0.04 absorb
+ * ±1-2 BPM model error at genre edges (a perfect 4:3 reads up to ~1.4 % off);
+ * all stay at/below the ~6 % transparent-stretch threshold. Ratios absent from
+ * this map fall back to [MAX_STRETCH_DEVIATION]. */
+val RATIO_DEVIATION_CAP: Map<Double, Double> = mapOf(
+    RATIO_1_1 to 0.04,
+    RATIO_2_1 to 0.04,
+    RATIO_1_2 to 0.04,
+    RATIO_3_2 to 0.04,
+    RATIO_2_3 to 0.04,
+    RATIO_4_3 to 0.05,
+    RATIO_3_4 to 0.05,
+    RATIO_5_4 to 0.05,
+    RATIO_4_5 to 0.05,
+)
 
 /**
  * v2 §5a: first supported ratio bringing bpmA onto bpmB within
@@ -831,21 +867,22 @@ fun matchHarmonicRatio(outgoingBpm: Double, incomingBpm: Double): Double? {
     return null
 }
 
-/** Blueprint §5.1 Rule 1. Scores only ratios inside tolerance; the best wins. */
+/** Blueprint §5.1 Rule 1. Scores only ratios inside their per-ratio cap; the best wins.
+ * Formula shape kept ((1-diff*10)) so all downstream thresholds (matrix 0.50/0.60/0.70,
+ * echoAmount, overall weight) behave exactly as before inside 0.03; only the 0.03-0.05
+ * dead band changes (0 → 0.5-0.7), rescuing pairs the tier path already accepts. */
 fun bpmScore(outgoingBpm: Double, incomingBpm: Double): Double {
     if (outgoingBpm <= 0 || incomingBpm <= 0) return 0.0
     var best = 0.0
     for (ratio in SUPPORTED_BPM_RATIOS) {
+        val cap = RATIO_DEVIATION_CAP[ratio] ?: MAX_STRETCH_DEVIATION
         val diff = abs(outgoingBpm * ratio - incomingBpm) / incomingBpm
-        if (diff <= BPM_RATIO_TOLERANCE) {
+        if (diff <= cap) {
             best = max(best, (1.0 - diff * 10.0).coerceIn(0.0, 1.0))
         }
     }
     return best
 }
-
-/** Scoring tolerance stays tighter than tier matching. */
-const val BPM_RATIO_TOLERANCE = 0.03
 
 private val PITCH_CLASS_INDEX = mapOf(
     "C" to 0, "C♯" to 1, "D♭" to 1, "D" to 2, "D♯" to 3, "E♭" to 3,
@@ -967,6 +1004,108 @@ fun pitchVetoesShift(medianHz: Double, detectedKey: String): Boolean {
     val pitchClass = ((midi % 12) + 12) % 12
     val distance = min((pitchClass - root + 12) % 12, (root - pitchClass + 12) % 12)
     return distance > 3
+}
+
+// ---------------------------------------------------------------------------
+// Multi-candidate pairing §Q2: best-fit search over (ratio × key-shift).
+// Replaces first-fit matchHarmonicRatio at the tier gate: every ratio within
+// its per-ratio cap is scored with every ±2 shift of the incoming key and the
+// best composite wins. Called once per pair at planning time (45 iterations
+// max), never per tick.
+// ---------------------------------------------------------------------------
+
+/** Candidate weights: tempo dominates, key is secondary, stretch is a mild tie-break. */
+const val CANDIDATE_WEIGHT_BPM = 0.60
+const val CANDIDATE_WEIGHT_KEY = 0.30
+const val CANDIDATE_WEIGHT_STRETCH = 0.10
+const val CANDIDATE_STRETCH_PENALTY_RATE = 0.12
+
+/** One tempo×shift hypothesis for a pair. Plan-time only; never stored. */
+data class PairCandidate(
+    val ratio: Double,
+    val diff: Double,
+    val deviationCap: Double,
+    val keyShiftSemitones: Int,
+    val keyFitScore: Double,
+    val candidateScore: Double,
+)
+
+/** Canonical sharp-spelled root per pitch-class, parallel to PITCH_CLASS_INDEX
+ * (spelling only feeds re-parse by camelotOf, which accepts both). */
+private val CANONICAL_ROOTS = arrayOf(
+    "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B",
+)
+
+/**
+ * Key string resulting from pitch-shifting [key] by [semitones] half-steps.
+ * Mode is preserved, only the root moves. Null when blank/unparseable — the
+ * caller then falls back to neutral key fit. Canonicalizes ASCII accidentals
+ * ("C#") through [canonicalKeyRoot] first: raw-lowercase lookup would miss.
+ */
+fun keyAtSemitones(key: String, semitones: Int): String? {
+    if (key.isBlank()) return null
+    val parts = key.trim().split(' ')
+    val root = parts.firstOrNull() ?: return null
+    val mode = parts.getOrNull(1)?.lowercase()?.let {
+        when (it) {
+            "minor", "m" -> "minor"
+            else -> "major"
+        }
+    } ?: "major"
+    val pc = PITCH_CLASS_INDEX[canonicalKeyRoot(root)] ?: return null
+    val shiftedRoot = CANONICAL_ROOTS[((pc + semitones) % 12 + 12) % 12]
+    return "$shiftedRoot $mode"
+}
+
+fun scorePairCandidate(
+    ratio: Double,
+    diff: Double,
+    cap: Double,
+    keyFit: Double,
+): Double {
+    val bpmFit = (1.0 - diff / cap).coerceIn(0.0, 1.0)
+    val stretchPenalty = (abs(1.0 - ratio) * CANDIDATE_STRETCH_PENALTY_RATE).coerceIn(0.0, 0.15)
+    return bpmFit * CANDIDATE_WEIGHT_BPM + keyFit * CANDIDATE_WEIGHT_KEY +
+        (1.0 - stretchPenalty) * CANDIDATE_WEIGHT_STRETCH
+}
+
+/**
+ * Best (ratio × shift) hypothesis for a pair, or null when no ratio fits any
+ * per-ratio cap. The incoming key is shifted (never the outgoing); each shift
+ * is veto-checked against the incoming vocal median. Shift 0 is always
+ * eligible with the raw key score. Raw key scoring is untouched — the
+ * candidate score only picks the ratio and the applied shift.
+ */
+fun findBestCandidate(
+    analysisA: TrackAnalysis,
+    analysisB: TrackAnalysis,
+): PairCandidate? {
+    val bpmA = analysisA.bpm.orZero()
+    val bpmB = analysisB.bpm.orZero()
+    if (bpmA <= 0 || bpmB <= 0) return null
+    var best: PairCandidate? = null
+    for (ratio in SUPPORTED_BPM_RATIOS) {
+        val cap = RATIO_DEVIATION_CAP[ratio] ?: MAX_STRETCH_DEVIATION
+        val diff = abs(bpmA * ratio - bpmB) / bpmB
+        if (diff > cap) continue
+        for (shift in -MAX_KEY_SHIFT_SEMITONES..MAX_KEY_SHIFT_SEMITONES) {
+            val shiftedKeyB = if (shift == 0) analysisB.key.ifBlank { null }
+                else keyAtSemitones(analysisB.key, shift)
+            val rawKeyFit: Double = when {
+                analysisA.key.isBlank() || shiftedKeyB == null -> NEUTRAL_KEY_SCORE_BELOW_CONF
+                else -> keyScore(analysisA.key, shiftedKeyB)
+            }
+            if (shift != 0 && shiftedKeyB != null &&
+                analysisB.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
+                pitchVetoesShift(analysisB.vocalPitchMedianHz, shiftedKeyB)
+            ) continue
+            val score = scorePairCandidate(ratio, diff, cap, rawKeyFit)
+            if (best == null || score > best.candidateScore) {
+                best = PairCandidate(ratio, diff, cap, shift, rawKeyFit, score)
+            }
+        }
+    }
+    return best
 }
 
 /** Nearest energy-curve sample to [time], or null with no usable curve. */

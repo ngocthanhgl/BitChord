@@ -207,6 +207,9 @@ data class TransitionPolicyVerdict(
     val beatConfidence: Double,
     /** v2 §5a: harmonic tempo ratio locking bpmA onto bpmB (1.0 = unison). 1.0 by default. */
     val matchedRatio: Double = 1.0,
+    /** Multi-candidate §Q2: semitone shift of the incoming key chosen by best-fit
+     * search (0 = none). In-memory only; render sites apply it behind their own gates. */
+    val candidateShiftSemitones: Int = 0,
 )
 
 /**
