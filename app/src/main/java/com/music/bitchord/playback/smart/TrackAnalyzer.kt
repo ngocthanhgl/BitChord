@@ -181,6 +181,17 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     private val badRenditions = ConcurrentHashMap.newKeySet<String>()
 
     /**
+     * How many times each rendition has been refused for a duration skew, so a
+     * legitimately skewed copy is accepted provisionally instead of starving
+     * the track forever. Keyed by rendition like [badRenditions], because the
+     * point is per-copy patience, not per-track. Cleared on a clean duration
+     * pass and on discard-refetch (different bytes start level); kept while
+     * its copy stays suspect, so re-analysis of the same skewed bytes stays
+     * flagged instead of flapping.
+     */
+    private val renditionRejects = ConcurrentHashMap<String, Int>()
+
+    /**
      * Cache keys already put through the whole-track pass, whatever came of it.
      *
      * What reopens a track that was written off: a copy of it nobody has read
@@ -727,6 +738,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // will not parse yet is not held against the rendition — more bytes may
         // well fix it — but a length that genuinely disagrees is.
         val expected = durationSeconds.takeIf { it.isFinite() && it > 0 }
+        // Set when the duration gate below gives up rejecting and lets the
+        // copy through marked: ORed into [TrackAnalysis.provisionalHead] at
+        // construction so the planner treats the result as suspect, never
+        // as a confident full read.
+        var provisionalRendition = false
         if (expected != null && rendition.key != cache.cacheKeyOf(uri)) {
             val length = openSource()?.use(AudioDecoder::containerDurationSeconds)
             if (length == null || length <= 0) {
@@ -738,13 +754,29 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 return null
             }
             if (abs(length - expected) > RENDITION_DURATION_TOLERANCE) {
+                val rejects = (renditionRejects[rendition.key] ?: 0) + 1
+                renditionRejects[rendition.key] = rejects
+                if (rejects < PROVISIONAL_ACCEPT_ROUNDS) {
+                    TrackLog.d(
+                        TAG,
+                        "Head rendition ${rendition.key} rejected for $trackId: " +
+                            "${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected",
+                    )
+                    return null
+                }
+                // Same copy refused on every tick and nothing else to try: the
+                // skew is the container's, not a wrong cut. Let it through
+                // flagged — notably WITHOUT [badRenditions], which would hide
+                // it from every later tick and re-create the starvation.
                 TrackLog.d(
                     TAG,
-                    "Head rendition ${rendition.key} rejected for $trackId: " +
-                        "${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected",
+                    "Head rendition ${rendition.key} for $trackId accepted provisionally " +
+                        "after $rejects rejects " +
+                        "(${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected)",
                 )
-                badRenditions.add(rendition.key)
-                return null
+                provisionalRendition = true
+            } else {
+                renditionRejects.remove(rendition.key)
             }
         }
 
@@ -792,6 +824,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val headMask = head.vocalMask?.toList().orEmpty()
         val headCurve = entry?.energyCurve.orEmpty()
         val shipHeadEvidence = headMask.isNotEmpty() && headMask.size == headCurve.size
+        if (shipHeadEvidence) renditionRejects.remove(rendition.key)
         return TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
             trackId = trackId,
@@ -810,7 +843,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             mixInCandidates = entry?.mixInCandidates.orEmpty(),
             energyCurve = if (shipHeadEvidence) headCurve else emptyList(),
             vocalActivityMask = if (shipHeadEvidence) headMask else emptyList(),
-            provisionalHead = shipHeadEvidence,
+            provisionalHead = shipHeadEvidence || provisionalRendition,
         )
     }
 
@@ -876,13 +909,28 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 .use(AudioDecoder::containerDurationSeconds) ?: continue
             if (length <= 0) continue
             if (abs(length - expected) > RENDITION_DURATION_TOLERANCE) {
+                val rejects = (renditionRejects[candidate.key] ?: 0) + 1
+                renditionRejects[candidate.key] = rejects
+                if (rejects < PROVISIONAL_ACCEPT_ROUNDS) {
+                    TrackLog.d(
+                        TAG,
+                        "Rendition ${candidate.key} rejected for $trackId: " +
+                            "${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected",
+                    )
+                    continue
+                }
+                // Refused on every tick and still the only copy in play: same
+                // escape hatch as the head gate — let it through flagged, so
+                // the whole-track result it produces carries low trust.
                 TrackLog.d(
                     TAG,
-                    "Rendition ${candidate.key} rejected for $trackId: " +
-                        "${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected",
+                    "Rendition ${candidate.key} for $trackId accepted provisionally " +
+                        "after $rejects rejects " +
+                        "(${"%.1f".format(Locale.ROOT, length)}s against ${"%.1f".format(Locale.ROOT, expected)}s expected)",
                 )
-                continue
+                return candidate
             }
+            renditionRejects.remove(candidate.key)
             if (candidate.key != cache.cacheKeyOf(uri)) {
                 TrackLog.d(
                     TAG,
@@ -1078,6 +1126,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     discarded.merge(rendition.key, 1, Int::plus)
                     badRenditions.remove(rendition.key)
                     triedRenditions.remove(rendition.key)
+                    renditionRejects.remove(rendition.key)
                     shortDecodes.remove(trackId)
                 }
             }
@@ -1204,6 +1253,13 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val structure = detectStructure(features, mergedDownbeats, effectiveDuration)
 
         triedRenditions.add(copy.key)
+        // Null-safe: local files have no rendition copy. The count is kept
+        // (not reset) while its copy stays suspect, so re-analysis of the
+        // same skewed bytes stays flagged instead of flapping.
+        val suspectKey = copy.rendition?.key
+        val provisionalCopy = suspectKey != null &&
+            (renditionRejects[suspectKey] ?: 0) >= PROVISIONAL_ACCEPT_ROUNDS
+        if (!provisionalCopy && suspectKey != null) renditionRejects.remove(suspectKey)
         return WholeTrack(
                 TrackAnalysis(
                     status = TrackAnalysis.STATUS_READY,
@@ -1251,6 +1307,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 buildupFootSec = structure.buildupFootSec,
                 buildupSpanSec = structure.buildupSpanSec,
                 buildupRise = structure.buildupRise,
+                // Duration-skewed copy accepted on patience: the evidence is
+                // real but the cut is unverified — downstream gates (vocal
+                // mask, both-sides) already treat provisional as suspect.
+                provisionalHead = provisionalCopy,
             ),
         )
     }
@@ -1728,6 +1788,18 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
          * borrowed beat grid would be useless — is rejected.
          */
         const val RENDITION_DURATION_TOLERANCE = 1.0
+
+        /**
+         * Duration-skew rejects before a rendition is accepted provisionally.
+         * Three counter hits: the head gate and the chooser share the count,
+         * so the first tick still prefers a different copy everywhere and the
+         * trip lands a tick or two later — concluding the skew is the
+         * container's, not a wrong cut. An extraction-fallback stream
+         * reporting ~1s off, rejected forever, is the starvation this bounds.
+         * Provisional results carry the low-trust flag, so downstream gates
+         * stay cautious with them.
+         */
+        const val PROVISIONAL_ACCEPT_ROUNDS = 3
 
         /**
          * Stand-in bitrate for a rendition whose real length isn't recorded yet,
