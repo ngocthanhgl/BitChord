@@ -845,6 +845,75 @@ private fun echoOutPlan(
 }
 
 /**
+ * FIX 3: HALF_TIME harmonic pairs route to FILTER_SWEEP instead of echo.
+ * Rate stays 1.0 (no chipmunk); frequency handoff carries the transition.
+ * Uses the existing FILTER_SWEEP EQ keyframe table from EqSchedule.kt.
+ * [keyShiftSemitones] is pre-computed via [semitonesToShift] (clamped ±2).
+ */
+private fun filterSweepPlan(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    length: Double,
+    nextLength: Double,
+    playbackTime: Double,
+    mixAnchor: Double,
+    proxyEntry: Double,
+    score: CompatibilityScore,
+    policyReasons: List<String>,
+    mixset: Boolean = false,
+    keyShiftSemitones: Int = 0,
+): TransitionPlan {
+    val fade = min(32.0 * 60.0 / analysis.bpm.coerceAtLeast(1.0), mixAnchor * 0.6)
+        .coerceAtMost(
+            if (mixset) djModeCeilingFor(TransitionType.FILTER_SWEEP)
+            else ceilingFor(TransitionType.FILTER_SWEEP)
+        )
+        .coerceAtLeast(1.0)
+    val targetStart = max(0.0, mixAnchor - fade)
+    val transitionStart = alignedTransitionStart(
+        analysis, targetStart, mixAnchor - 0.05,
+        preferEarlier = true, minimum = targetStart,
+    )
+    // C2 FIX: mixAnchor - transitionStart (was negative → always coerceIn to 1)
+    val transitionBeats = ((mixAnchor - transitionStart) / (60.0 / analysis.bpm.coerceAtLeast(1.0)))
+        .roundToInt().coerceIn(1, 32)
+    val fadeSeconds = mixAnchor - transitionStart
+    val started = playbackTime >= transitionStart
+    return applyMixsetFireFloor(
+        TransitionPlan(
+            shouldStart = started,
+            markerVisible = true,
+            transitionStart = transitionStart,
+            transitionEnd = mixAnchor,       // C3 FIX: was mixEnd (undefined in scope)
+            fadeSeconds = fadeSeconds.coerceAtLeast(0.1),
+            handoffStartSeconds = 0.0,
+            handoffDuration = fadeSeconds,
+            incomingCueTime = proxyEntry,
+            incomingHandoffTime = proxyEntry,
+            incomingPlaybackRate = 1.0,
+            pickupSeconds = 0.0,
+            transitionBeats = transitionBeats,
+            bassSwap = true,
+            transitionStyle = TransitionStyle.DJ_FILTER,
+            type = TransitionType.FILTER_SWEEP,
+            score = score,
+            keyShiftSemitones = keyShiftSemitones,
+            volumeCurve = VolumeCurve.LINEAR,
+            eqCurve = EQCurve.EQ_SWAP,
+            filterSweep = FILTER_SWEEP,  // Double const = 1.0; field is Double (M3 reverted)
+            vocalOverlap = plannedVocalOverlap(
+                analysis = analysis, nextAnalysis = nextAnalysis,
+                transitionStart = transitionStart, transitionEnd = mixAnchor,
+                incomingCueTime = proxyEntry, incomingPlaybackRate = 1.0,
+            ),
+            policyReasons = policyReasons,
+            reason = if (started) "half-time-filter" else "before-half-time-filter",
+        ),
+        length, mixset,
+    )
+}
+
+/**
  * Blueprint §5.7 LOOP_CUT_DROP: the outgoing track loops its last 4 bars,
  * freezes for 2, then cuts; the incoming track starts early enough to ARRIVE
  * at its drop exactly at the cut and takes over at full volume. Volumes stay
@@ -2158,14 +2227,23 @@ private fun planTransitionInner(
         // would sustain +12–41 % deck speeds — clearly audible speedup with
         // pitch coupled. They fall back to an echo wash at rate 1.0 instead;
         // the grid lock is surrendered, the tempo is not touched.
+        // FIX 3: HALF_TIME → FILTER_SWEEP at rate 1.0.
+        // C1 FIX: keyShiftSemitones via semitonesToShift (clamped ±2),
+        // NOT formula ((1-key)*12) which produces 4-7 st violating MAX=2.
         if (policy.tier == TransitionTier.HALF_TIME) {
-            return applyMixsetFireFloor(
-                echoOutPlan(
-                    analysis, nextAnalysis, length, nextLength,
-                    playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
-                ),
-                length, mixset,
+            // FIX 3: HALF_TIME → FILTER_SWEEP at rate 1.0.
+            // C1 FIX: keyShiftSemitones via semitonesToShift (clamped ±2),
+            // NOT formula ((1-key)*12) which produces 4-7 st violating MAX=2.
+            val keyShiftSemitones = if (proxyScore.key in 0.45..0.75 &&
+                    analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank())
+                semitonesToShift(analysis.key, nextAnalysis.key)
+            else 0
+            return filterSweepPlan(
+                analysis, nextAnalysis, length, nextLength,
+                playbackTime, mixAnchor, proxyEntry, proxyScore, policy.reasons,
+                mixset, keyShiftSemitones,
             )
+            // NOTE: applyMixsetFireFloor is called INSIDE filterSweepPlan — do NOT wrap again
         }
         return applyMixsetFireFloor(
             heavyClashPlan(
@@ -2278,15 +2356,19 @@ private fun planTransitionInner(
         )
     }
     if (selectedType == TransitionType.HALF_TIME_BLEND) {
-        // Tempo-transparency fix (see weak-pair site above): no sustained
-        // off-1.0 deck speeds — the harmonic pair gets an echo wash at 1.0.
-        return applyMixsetFireFloor(
-            echoOutPlan(
-                analysis, nextAnalysis, length, nextLength,
-                playbackTime, mixAnchor, proxyScore, policy.reasons, mixset,
-            ),
-            length, mixset,
+        // FIX 3: HALF_TIME → FILTER_SWEEP wash at rate 1.0.
+        // C4 FIX: proxyScore used consistently for both keyShiftSemitones
+        // and plan score (was: score.key for keyShift, proxyScore for plan).
+        val keyShiftSemitones = if (proxyScore.key in 0.45..0.75 &&
+                analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank())
+            semitonesToShift(analysis.key, nextAnalysis.key)
+        else 0
+        return filterSweepPlan(
+            analysis, nextAnalysis, length, nextLength,
+            playbackTime, mixAnchor, proxyEntry, proxyScore, policy.reasons,
+            mixset, keyShiftSemitones,
         )
+        // NOTE: applyMixsetFireFloor is called INSIDE filterSweepPlan — do NOT wrap again
     }
 
     phraseSwitch(analysis, nextAnalysis, length, nextLength, mixset, mixAnchor)

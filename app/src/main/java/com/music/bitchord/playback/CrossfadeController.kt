@@ -388,7 +388,9 @@ class CrossfadeController(
          * band comes from the schedule tables instead).
          */
         val eqSwapFireProgress: Float = Float.POSITIVE_INFINITY,
-        /** DJ-EQ spec: one outgoing beat in seconds; the swap runs 2 bars. */
+        /** DJ-EQ spec: one outgoing beat in seconds (60/bpm).
+         * The swap runs N bars where N = EqSchedule.SWAP_BARS;
+         * total beats = N × 4. */
         val eqSwapBeatSec: Double = 0.0,
         /**
          * Full-audit P2 S1: live vocal recompute. ARM-time snapshots of the
@@ -2126,7 +2128,7 @@ class CrossfadeController(
                 // seconds shrink by that rate — a bar-denominated snap would
                 // land late and smear the handover.
                 val deckRate = render.outgoingPlaybackRate.toFloat().coerceAtLeast(0.25f)
-                val swapSec = (render.eqSwapBeatSec * EqSchedule.SWAP_BARS / deckRate).toFloat()
+                val swapSec = (render.eqSwapBeatSec * EqSchedule.SWAP_BARS * 4 / deckRate).toFloat()
                 val t = if (overlap > 0f && swapSec > 0f) {
                     ((progress - eqSwapStartProgress) * overlap / swapSec).coerceIn(0f, 1f)
                 } else {

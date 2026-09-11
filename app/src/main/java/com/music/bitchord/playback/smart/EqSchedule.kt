@@ -33,25 +33,23 @@ object EqSchedule {
     /**
      * Bass-swap arm progress per transition type (spec §Bass swap timing).
      * Null = no downbeat swap; the LOW band comes from the tables instead.
+     * Satisfaction round: swap fires early so bass arrives BEFORE B is dominant.
      */
     val BASS_SWAP_PROGRESS: Map<TransitionType, Float> = mapOf(
-        // Satisfaction round §2: long beds swap late. On a ~20 s SMOOTH/HARM
-        // bed the old 0.35 arm fired the swap ~7 s in and stranded the rest
-        // of the blend bass-less. 0.65 fires ~13 s in — the swap stays the
-        // midpoint event. FILTER keeps 0.30: its B-mid keys (0.32-0.46) are
-        // ordered after the swap, and the sweep itself is the announcement.
-        TransitionType.SMOOTH_CROSSFADE to 0.65f,
-        TransitionType.HARMONIC_BLEND to 0.65f,
-        TransitionType.FILTER_SWEEP to 0.30f,
-        TransitionType.HALF_TIME_BLEND to 0.20f,
+        TransitionType.SMOOTH_CROSSFADE to 0.42f,
+        TransitionType.HARMONIC_BLEND    to 0.40f,
+        TransitionType.FILTER_SWEEP      to 0.30f,
+        TransitionType.HALF_TIME_BLEND   to 0.20f,
     )
 
     /**
      * Swap duration in bars. The spec voices 2 bars for every downbeat swap;
      * the table-driven types don't swap at all.
      */
-    /** DJ hard swap: the LOW handover completes in 2 beats on the fired downbeat. */
-    const val SWAP_BARS = 0.5
+    /** DJ hard swap: the LOW handover completes in 2 beats on the fired downbeat.
+     *  Value is bars; actual seconds = eqSwapBeatSec * SWAP_BARS * 4 / deckRate.
+     */
+    const val SWAP_BARS = 1.0
 
     fun outgoingGains(
         type: TransitionType,
