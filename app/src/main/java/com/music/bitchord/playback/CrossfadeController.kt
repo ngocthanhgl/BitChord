@@ -427,6 +427,12 @@ class CrossfadeController(
     // Progress of the last driveFade tick: finish() uses it to decide whether
     // the completion guard may fire (mid-fade) or must stand down (done).
     private var lastProgress = 0f
+    // DJ end-click fix: mute ramp state. The old code snapped out.volume 1->0
+    // in one tick at the cutoff (full-scale chop under level-ride). Now the
+    // first cutoff tick captures the live gain and ramps it over BAIL_MS via
+    // fallGain (zero-slope landing), mirroring driveBail(). Rearmed in begin().
+    private var muteRampStartMs = -1L
+    private var muteFromGain = 1f
     // Full-audit P2: rate-commit coalescing state (see driveFade). Rearmed
     // in begin() with every other per-transition flag.
     private var lastCommittedRate: Float? = null
@@ -1364,6 +1370,8 @@ class CrossfadeController(
         handedOff = false
         cutFired = false
         dryKilled = false
+        muteRampStartMs = -1L
+        muteFromGain = 1f
         lastProgress = 0f
         lastCommittedRate = null
         lastRateCommitAt = 0L
@@ -1798,10 +1806,11 @@ class CrossfadeController(
         // path, and the EQ kill starves the sends. Nothing else may zero a
         // deck mid-fade, so a bleed always points here.
         // Player volume is downstream of the whole chain (applied at
-        // the sink), so zeroing it silences the dry path absolutely while
+        // the sink), so ramping it silences the dry path absolutely while
         // the EQ kill starves the sends of new feed. Placed after rideEq so
-        // it wins every tick; the EQ glide (~145 ms) makes the kill a fast
-        // smooth ramp, not a step.
+        // it wins every tick. DJ end-click fix: muteRampGain() ramps over
+        // BAIL_MS via fallGain (zero-slope landing) instead of the old
+        // one-tick 1->0 snap, which chopped full-scale under level-ride.
         val muteCutoff = when (render.style) {
             TransitionStyle.DJ_BLEND -> 0.95f
             TransitionStyle.ECHO_REVERB_OUT,
@@ -1817,11 +1826,11 @@ class CrossfadeController(
             else -> 0.80f
         }
         if (smartFadeActive && outProgress >= muteCutoff) {
-            out.volume = 0f
+            out.volume = muteRampGain(out.volume)
             eqFilters.outgoing(0f, 0f, 0f)
             dryKilled = true
         } else if (!smartFadeActive && progress >= 0.80f) {
-            out.volume = 0f
+            out.volume = muteRampGain(out.volume)
         }
         // v2 §7d/§11.2: no shelf on the processor, so the "low-shelf +3dB"
         // accent is a one-tick dip of the incoming high-pass to 80 Hz at
@@ -1851,23 +1860,25 @@ class CrossfadeController(
             // ExoPlayer re-prepares its audio pipeline on every parameter
             // change, so ~33 commits/second of inaudible deltas is 33
             // chances/second to glitch (the tempo stutter). Commits only
-            // when the rate audibly moved (>= 0.15% since last commit) or
-            // 150 ms elapsed, and never once the glide has converged
-            // (glide ~= 0 is unity rate + unity pitch — exactly what the
-            // deck already holds, so committing it buys a pipeline
-            // re-prepare for zero audible change).
+            // when the rate audibly moved (>= 0.15% since last commit), and
+            // never once the glide has converged (glide ~= 0 is unity rate +
+            // unity pitch — exactly what the deck already holds, so
+            // committing it buys a pipeline re-prepare for zero audible
+            // change). DJ end-click fix: the old 150 ms forced commit is
+            // gone — it fired ~7 re-prepares/s of growing-then-shrinking
+            // deltas (periodic micro-interruptions = judder). Same rate
+            // trajectory, fewer pipeline churns; sub-threshold residuals are
+            // inaudible, and finish() still catches glide > 0.02.
             if (glide > 0.02) {
                 val newRate = (AppSettings.playbackSpeed.value * (1.0 + (stretch - 1.0) * glide)).toFloat()
                 val newPitch = 2.0.pow(shift / 12.0 * glide).toFloat()
-                val now = SystemClock.elapsedRealtime()
                 val last = lastCommittedRate
                 if (last == null ||
-                    abs(newRate - last) / last.coerceAtLeast(1e-6f) >= 0.0015f ||
-                    now - lastRateCommitAt >= 150L
+                    abs(newRate - last) / last.coerceAtLeast(1e-6f) >= 0.0015f
                 ) {
                     player.setPlaybackParameters(PlaybackParameters(newRate, newPitch))
                     lastCommittedRate = newRate
-                    lastRateCommitAt = now
+                    lastRateCommitAt = SystemClock.elapsedRealtime()
                 }
             }
         }
@@ -1900,6 +1911,23 @@ class CrossfadeController(
     }
 
     /** Ramps the outgoing track away rather than cutting it, so an interruption has no click in it. */
+    /**
+     * DJ end-click fix: ramps the outgoing dry gain to zero over BAIL_MS from
+     * whatever it holds when the mute cutoff first trips (unity under
+     * level-ride), instead of the old one-tick 1->0 snap. fallGain lands with
+     * zero slope, same as the bail ramp. Called after the rides every tick so
+     * it wins; idempotent per transition via [muteRampStartMs].
+     */
+    private fun muteRampGain(current: Float): Float {
+        val now = SystemClock.elapsedRealtime()
+        if (muteRampStartMs < 0L) {
+            muteRampStartMs = now
+            muteFromGain = current
+        }
+        val t = ((now - muteRampStartMs).toFloat() / BAIL_MS).coerceIn(0f, 1f)
+        return muteFromGain * fallGain(t)
+    }
+
     private fun driveBail() {
         val out = outgoing
         if (out == null) {
@@ -1983,11 +2011,17 @@ class CrossfadeController(
         // pipeline at full volume — the end-of-mix snap on every plain blend.
         val rateApplied = incomingPlaybackRate != 1.0 || render.keyShiftSemitones != 0
         // Unconditional and idempotent, like the speed reset below: correct
-        // whether or not this transition ever filtered anything.
-        filters.open()
-        echoFilters.open()
-        reverbFilters.open()
-        eqFilters.open()
+        // whether or not this transition ever filtered anything. Skipped on a
+        // normal completion (lastProgress ~= 1): the outgoing deck is disposed
+        // and re-parking 4 processors at full incoming volume only pumps the
+        // join (DJ end-click fix). begin() re-parks everything while silent,
+        // so no hygiene is lost. Kept on early-done for reuse safety.
+        if (lastProgress < 0.98f) {
+            filters.open()
+            echoFilters.open()
+            reverbFilters.open()
+            eqFilters.open()
+        }
         render = Render()
 
         if (handedOff) {
