@@ -861,6 +861,10 @@ object AppSettings {
     fun setMixsetModeEnabled(value: Boolean) {
         mixsetModeEnabled.value = value
         prefs.edit().putBoolean(KEY_MIXSET_MODE, value).apply()
+        // Enabling DJ forces 16-bit PCM (flows through the existing reconfigure path).
+        if (value && outputPcmMode.value == OutputPcmMode.FLOAT_32) {
+            setOutputPcmMode(OutputPcmMode.PCM_16)
+        }
     }
 
     fun setAutomixPerformanceMode(value: AutomixPerformanceMode) {
@@ -1097,6 +1101,8 @@ object AppSettings {
     }
 
     fun setOutputPcmMode(value: OutputPcmMode) {
+        // DJ Mode DSP runs on 16-bit PCM only — refuse float while DJ is on.
+        if (value == OutputPcmMode.FLOAT_32 && mixsetModeEnabled.value) return
         outputPcmMode.value = value
         prefs.edit().putString(KEY_OUTPUT_PCM_MODE, value.name).apply()
     }

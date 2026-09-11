@@ -206,6 +206,8 @@
     <string name="automix">Automix [BETA]</string>
     <string name="mixset">DJ Mode [BETA]</string>
     <string name="mixset_subtitle">Freeform mixing unconstrained by Automix rules — a non-stop experience with no low-energy gaps. High-BPM music recommended.</string>
+    <string name="dj_mode_pcm_locked">DJ mode not working with PCM-32</string>
+    <string name="dj_mode_pcm_locked_note">DJ Mode runs on 16-bit PCM</string>
     <string name="automix_performance">Automix performance</string>
     <string name="automix_performance_subtitle">Sets how much CPU background analysis may use</string>
     <string name="automix_performance_warning">Higher performance analyses tracks faster, but can use more battery and make the phone warmer.</string>

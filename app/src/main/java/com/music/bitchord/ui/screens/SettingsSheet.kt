@@ -438,17 +438,35 @@ fun SettingsScreen(
         }
 
         SettingsGroup(header = stringResource(R.string.playback)) {
+            // DJ Mode DSP runs on 16-bit PCM only — lock the float pill while DJ is on.
+            val djLocksPcm = smartFade && mixset
             SettingsRow(
                 icon = Icons.Rounded.GraphicEq,
                 title = "Output precision",
-                subtitle = buildString {
-                    append(outputStatus.sink)
-                    append(" · ")
-                    append(outputStatus.deviceName)
-                    (outputStatus.actualSampleRateHz ?: outputStatus.sampleRatesHz.firstOrNull())
-                        ?.let { append(" · ${it / 1000.0} kHz") }
-                    append(" · ")
-                    append(AudioOutputStatus.encodingLabel(outputStatus))
+                subtitle = if (djLocksPcm) {
+                    stringResource(R.string.dj_mode_pcm_locked_note)
+                } else {
+                    buildString {
+                        append(outputStatus.sink)
+                        append(" · ")
+                        append(outputStatus.deviceName)
+                        (outputStatus.actualSampleRateHz ?: outputStatus.sampleRatesHz.firstOrNull())
+                            ?.let { append(" · ${it / 1000.0} kHz") }
+                        append(" · ")
+                        append(AudioOutputStatus.encodingLabel(outputStatus))
+                    }
+                },
+                // Row stays enabled so the tap explains why; pills go inert via enabled below.
+                onClick = if (djLocksPcm) {
+                    {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.dj_mode_pcm_locked),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                } else {
+                    null
                 },
             )
             SegmentedControl(
@@ -456,6 +474,7 @@ fun SettingsScreen(
                 selectedIndex = OutputPcmMode.entries.indexOf(outputPcmMode),
                 onSelect = { AppSettings.setOutputPcmMode(OutputPcmMode.entries[it]) },
                 modifier = Modifier.padding(start = TEXT_INSET, end = ROW_INSET, bottom = 14.dp),
+                enabled = !djLocksPcm,
             )
             RowDivider()
             SettingsSubRow(
@@ -2051,6 +2070,7 @@ private fun SegmentedControl(
     selectedIndex: Int,
     onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val haptics = LocalHapticFeedback.current
     Row(
@@ -2058,6 +2078,7 @@ private fun SegmentedControl(
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.outline)
+            .alpha(if (enabled) 1f else 0.45f)
             .padding(2.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
@@ -2086,7 +2107,7 @@ private fun SegmentedControl(
                     .weight(1f)
                     .clip(RoundedCornerShape(8.dp))
                     .background(pill)
-                    .clickable {
+                    .clickable(enabled = enabled) {
                         if (!chosen) {
                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             onSelect(index)
