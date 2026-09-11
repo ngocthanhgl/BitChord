@@ -841,14 +841,10 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
-        // Even a manual catalogue match is still video-origin. AutoMix's
-        // analysis and cueing are deliberately never applied to either side
-        // of a transition involving a video row.
-        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) {
-            AppSettings.smartTransitionWindow.value = null
-            AppSettings.smartMixInProgress.value = false
-            return
-        }
+        // Video-origin rows play through the same audio-only players — no video
+        // surface exists anywhere in the app, so a "video" row is just audio
+        // with provenance. Analysis resolves its bytes via the canonical entry,
+        // and the mix below treats it like any other track.
         val nextDuration = nextItemDurationMs(nextIndex, nextItem)
 
         requestAnalysisAround(player, duration)
@@ -1227,7 +1223,8 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
-        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return
+        // Video rows are measured like any other: both players are audio-only,
+        // and analysis resolves a video row to its canonical bytes.
         requestAnalysis(currentItem, duration, false)
         requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem), true)
     }

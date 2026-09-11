@@ -1799,20 +1799,18 @@ fun NowPlayingScreen(
                                     // agree, so the line reads the same way every
                                     // time and the eye can find the half it wants
                                     // without re-parsing the sentence.
-                                    text = if (song.isVideoOrigin) {
-                                        stringResource(R.string.automix_not_supported_video)
-                                    } else {
-                                        (stringResource(
-                                            R.string.automix_analysis_status,
-                                            smartAnalysis.current.localizedLabel(),
-                                            smartAnalysis.next.localizedLabel(),
-                                            // v2 §7d: half-time blends play neither
-                                            // track's own tempo — say which grid won.
-                                        ) + (sharedHalfTimeBpm
-                                            ?.takeIf { it > 0 }
-                                            ?.let { " · shared ${"%.0f".format(it)} BPM" } ?: "")
-                                        )
-                                    },
+                                    // Video-origin rows mix like any other: the players
+                                    // are audio-only, so provenance doesn't matter.
+                                    text = (stringResource(
+                                        R.string.automix_analysis_status,
+                                        smartAnalysis.current.localizedLabel(),
+                                        smartAnalysis.next.localizedLabel(),
+                                        // v2 §7d: half-time blends play neither
+                                        // track's own tempo — say which grid won.
+                                    ) + (sharedHalfTimeBpm
+                                        ?.takeIf { it > 0 }
+                                        ?.let { " · shared ${"%.0f".format(it)} BPM" } ?: "")
+                                    ),
                                     style = nerdStyle,
                                     // Dimmer than the measured line above it: that
                                     // one describes the audio, this one describes
