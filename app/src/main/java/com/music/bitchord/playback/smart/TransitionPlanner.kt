@@ -825,6 +825,10 @@ private fun echoOutPlan(
         type = TransitionType.ECHO_REVERB_OUT,
         score = score,
         echoAmount = echoAmount,
+        // Automix reverb: the echo-out wash carries reverb at the DSP max so
+        // weak pairs blend instead of swapping dry. DJ Mode keeps its own
+        // (zero here — its washes are voiced by the clash path).
+        reverbAmount = if (mixset) 0.0 else ECHO_OUT_REVERB_WET,
         // Full-audit P1 M4: one-bar repeats on the outgoing grid — not the
         // half-beat dub the renderer's default rule would voice.
         echoPeriodBeats = 1.0,
@@ -908,6 +912,8 @@ private fun filterSweepPlan(
             ),
             policyReasons = policyReasons,
             reason = if (started) "half-time-filter" else "before-half-time-filter",
+            // Automix reverb: wash bed under the sweep. DJ Mode untouched.
+            reverbAmount = if (mixset) 0.0 else BLEND_REVERB_WET,
         ),
         length, mixset,
     )
@@ -1112,15 +1118,25 @@ private fun alignedTransitionStart(
  * Where the incoming track's arrangement arrives: the point the outgoing
  * track should be gone by.
  */
-internal fun incomingCuePoint(analysis: TrackAnalysis): Double {
-    rankMixInCandidates(analysis).firstOrNull()?.let { return it.time }
+internal fun incomingCuePoint(analysis: TrackAnalysis, introOnly: Boolean = false): Double {
+    val introEnd = introEndSeconds(analysis)
+    if (introOnly) {
+        // Automix-intro mode: the entry is the intro. Ranked candidates inside
+        // the intro win; the analyzed mix-in counts only when it sits inside;
+        // otherwise fall through to the intro-bounded pickup below.
+        rankMixInCandidates(analysis).firstOrNull { it.time <= introEnd }?.let { return it.time }
+    } else {
+        rankMixInCandidates(analysis).firstOrNull()?.let { return it.time }
+    }
 
     val interval = analysis.beatInterval.orZero().takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.0
     val downbeats = analysis.downbeats
 
     val analyzedMixIn = analysis.mixInTime
-    if (analyzedMixIn.isFinite() && analyzedMixIn > 0) {
+    if (analyzedMixIn.isFinite() && analyzedMixIn > 0 &&
+        (!introOnly || analyzedMixIn <= introEnd)
+    ) {
         return nearestTimedValue(downbeats, analyzedMixIn, max(0.5, interval * 2)) ?: analyzedMixIn
     }
 
@@ -1132,12 +1148,20 @@ internal fun incomingCuePoint(analysis: TrackAnalysis): Double {
     )
     val duration = analysis.duration.orZero().takeIf { it != 0.0 } ?: 300.0
     if (pickup > 0 && pickup < duration - 10) {
-        downbeats.firstOrNull { it >= pickup }?.let { return it }
+        downbeats.firstOrNull { it >= pickup }?.let {
+            return if (introOnly) min(it, introEnd) else it
+        }
     }
     val phrases = analysis.phraseBoundaries
-    if (phrases.size > 1 && phrases[1] > 4) return phrases[1]
-    if (downbeats.size >= 8) return downbeats[min(8, downbeats.size - 1)].orZero()
-    return pickup
+    if (phrases.size > 1 && phrases[1] > 4) {
+        val phrase = phrases[1]
+        return if (introOnly) min(phrase, introEnd) else phrase
+    }
+    if (downbeats.size >= 8) {
+        val eighth = downbeats[min(8, downbeats.size - 1)].orZero()
+        return if (introOnly) min(eighth, introEnd) else eighth
+    }
+    return if (introOnly) min(pickup, introEnd) else pickup
 }
 
 /** Where the incoming track first makes sound, so the fade is not cued into its lead-in silence. */
@@ -1158,7 +1182,7 @@ private fun incomingStartPoint(analysis: TrackAnalysis): Double {
  * vocal-heavy), offset past the opening phrase. Bounded by the entry cap.
  */
 private fun vocalAwareCutCue(nextAnalysis: TrackAnalysis, nextLength: Double): Double {
-    val cue = incomingCuePoint(nextAnalysis)
+    val cue = incomingCuePoint(nextAnalysis, introOnly = true)
     val beat = nextAnalysis.beatInterval.takeIf { it > 0 } ?: 0.5
     val windowVocal = vocalActivityBetween(nextAnalysis, cue, cue + beat * 16)
     val sings = windowVocal?.let { it >= VOCAL_ACTIVE_THRESHOLD }
@@ -1187,9 +1211,13 @@ private fun capIncomingEntry(
     val audible = listOfNotNull(nextAnalysis.audibleStartTime, nextAnalysis.pickupTime)
         .firstOrNull { it.isFinite() && it >= 0 } ?: 0.0
     if (mixsetActive) return max(cue, audible + 2.0)
+    // Automix-intro mode: entries stay inside the intro — the 28% length cap
+    // could land past the first chorus. The audible floor still holds so a
+    // long intro is never cued into silence.
     // Finetune v1 §3.4: 30% at 5 min = 90 s, past the first chorus — 28%
     // still clears a 64-bar intro at 120 BPM.
-    return min(cue, max(0.28 * nextLength, audible + 2.0)).coerceAtLeast(0.0)
+    val introEnd = introEndSeconds(nextAnalysis)
+    return min(cue, max(introEnd, audible + 2.0)).coerceAtLeast(0.0)
 }
 
 /**
@@ -1446,11 +1474,20 @@ sealed interface WsolaPlanResult {
 }
 
 /** Where the incoming track takes over: the best-ranked mix-in candidate, snapped to a downbeat. */
-fun incomingMixInPoint(analysis: TrackAnalysis): Double? {
+fun incomingMixInPoint(analysis: TrackAnalysis, introOnly: Boolean = false): Double? {
     val beatSeconds = analysis.beatInterval.orZero().takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.0
     val tolerance = max(0.5, beatSeconds * 2)
-    val target = listOfNotNull(rankMixInCandidates(analysis).firstOrNull()?.time, analysis.mixInTime)
+    // Automix-intro mode: rank inside the intro only; the analyzed mix-in
+    // counts only when it sits inside it.
+    val introEnd = introEndSeconds(analysis)
+    val ranked = if (introOnly) {
+        rankMixInCandidates(analysis).firstOrNull { it.time <= introEnd }?.time
+    } else {
+        rankMixInCandidates(analysis).firstOrNull()?.time
+    }
+    val analyzed = analysis.mixInTime.takeIf { it.isFinite() && it > 0 && (!introOnly || it <= introEnd) }
+    val target = listOfNotNull(ranked, analyzed)
         .firstOrNull { it.isFinite() && it > 0 }
         ?: return null
     return nearestValue(analysis.downbeats, target, tolerance) ?: target
@@ -1487,7 +1524,8 @@ fun planWsolaTransition(
     val rawDropTime = if (mixset) {
         mixsetEntryPoint(nextAnalysis) ?: incomingMixInPoint(nextAnalysis)
     } else {
-        incomingMixInPoint(nextAnalysis)
+        // Automix-intro mode: the beat-matched entry is the intro.
+        incomingMixInPoint(nextAnalysis, introOnly = true)
     }
     val incomingDropTime = rawDropTime
         ?.takeIf { it.isFinite() && it >= 0 }
@@ -1503,7 +1541,11 @@ fun planWsolaTransition(
     // cementing a stale override is what dragged exits onto peaks. The
     // override still wins whenever it is the earlier point, so designed early
     // cuts are preserved.
-    val resolvedAnchor = resolveMixOutAnchor(analysis, contentEnd = contentEnd, duration = outgoingLength)
+    val resolvedAnchor = resolveMixOutAnchor(
+        analysis, contentEnd = contentEnd, duration = outgoingLength,
+        // Automix-outro mode: the exit is the outro or the content end.
+        outroOnly = !mixset,
+    )
     val mixOutAnchor = if (mixset && mixAnchorOverride != null && mixAnchorOverride.isFinite()) {
         val coerced = mixAnchorOverride.coerceIn(0.0, outgoingLength)
         if (resolvedAnchor.time < coerced) resolvedAnchor else MixOutAnchor(
@@ -1704,6 +1746,9 @@ private fun phraseSwitch(
         outgoingBpm = planned.outgoingBpm,
         incomingBpm = planned.incomingBpm,
         transitionStyle = TransitionStyle.DJ_BLEND,
+        // Automix reverb: a bed of reverb under the EQ swap glues the two
+        // grids. DJ Mode keeps its dry handoff.
+        reverbAmount = if (mixset) 0.0 else BLEND_REVERB_WET,
     )
 }
 
@@ -2116,7 +2161,10 @@ private fun planTransitionInner(
             contentEnd = finalMixAnchor,
             duration = length,
             allowedWindow = candidateWindow,
-            fallbackTime = max(length - 45.0, playFloorSeconds).takeIf { length >= 60.0 },
+            // Automix-outro mode: no length-45 early fallback — without an
+            // outro the transition ends where the content does.
+            fallbackTime = null,
+            outroOnly = true,
         )
     }
     val hasInteriorMixOut = mixOutAnchor.time < finalMixAnchor - 1
@@ -2211,7 +2259,11 @@ private fun planTransitionInner(
     // archetype's implementation. phraseSwitch below is the HARMONIC_BLEND
     // engine and the adaptive tail is SMOOTH_CROSSFADE/FILTER_SWEEP; the other
     // three archetypes branch to their own planners here and never reach them.
-    val proxyEntry = capIncomingEntry(incomingCuePoint(nextAnalysis), nextAnalysis, nextLength, mixset)
+    val proxyEntry = capIncomingEntry(
+        // Automix-intro mode: score the pair on its intro entry.
+        incomingCuePoint(nextAnalysis, introOnly = !mixset),
+        nextAnalysis, nextLength, mixset,
+    )
     val proxyScore = scoreCompatibility(analysis, nextAnalysis, mixAnchor, proxyEntry)
     if (proxyScore.overall < SCORE_ACCEPTABLE) {
         // v2 §9: a weak pair never blends — the heavy clash gets a forced
@@ -2446,7 +2498,7 @@ private fun planTransitionInner(
             nextAnalysis, nextLength, mixsetActive = true,
         )
     } else {
-        capIncomingEntry(incomingCuePoint(nextAnalysis), nextAnalysis, nextLength, mixsetActive = false)
+        capIncomingEntry(incomingCuePoint(nextAnalysis, introOnly = true), nextAnalysis, nextLength, mixsetActive = false)
     }
     val alignedIncomingBpm = alignTempoOctave(currentBpm, nextBpm)
     val requestedIncomingHandoff =
@@ -2510,12 +2562,13 @@ private fun planTransitionInner(
     }
 
     var alignedOverlap = mixEnd - transitionStart
-    // Late-peak pull-back (kiểu 1): if the outgoing tail spikes inside the
-    // last quarter of a long same-grid blend while the incoming side carries
-    // no vocal, pull the handoff earlier into the pre-peak valley
-    // (downbeat-snapped), preserving the overlap length. A DJ mixes out
-    // before the last-shot fill; the overlap never covers it.
-    if (sameBeatBlend && beatSeconds > 0 && alignedOverlap >= 8.0) {
+    // Late-peak pull-back (kiểu 1, DJ Mode only): if the outgoing tail spikes
+    // inside the last quarter of a long same-grid blend while the incoming
+    // side carries no vocal, pull the handoff earlier into the pre-peak
+    // valley (downbeat-snapped), preserving the overlap length. A DJ mixes
+    // out before the last-shot fill; the overlap never covers it. Automix
+    // exits at the outro, so there is no interior peak to dodge.
+    if (sameBeatBlend && beatSeconds > 0 && alignedOverlap >= 8.0 && mixset) {
         val window = analysis.energyCurve.filter {
             it.time.isFinite() && it.energy.isFinite() &&
                 it.time >= transitionStart && it.time <= mixEnd
@@ -2623,6 +2676,8 @@ private fun planTransitionInner(
         ),
         policyReasons = policy.reasons,
         reason = if (started) "smart-duration" else "before-smart-duration",
+        // Automix reverb: same bed as the phrase-switch blend. DJ Mode dry.
+        reverbAmount = if (mixset) 0.0 else BLEND_REVERB_WET,
         ),
         length, mixset,
     )

@@ -254,6 +254,10 @@ const val HEAVY_CLASH_REVERB_WET = 0.45
 const val HEAVY_CLASH_ECHO_AMOUNT = 0.50
 /** v2 §9b: reverb freeze point after transition start. */
 const val HEAVY_CLASH_FREEZE_OFFSET_SEC = 3.5
+/** Automix reverb: echo-out wash voices the DSP max (ReverbProcessor MAX_WET = 0.34). */
+const val ECHO_OUT_REVERB_WET = 0.34
+/** Automix reverb: beat-matched blends carry a bed of reverb under the EQ swap. */
+const val BLEND_REVERB_WET = 0.25
 
 /** Non-finite guards, matching the desktop planner's coercion of `NaN`/`Infinity` to zero. */
 internal fun Double.orZero(): Double = if (isFinite()) this else 0.0
@@ -588,6 +592,7 @@ fun rankMixOutCandidates(
     contentEnd: Double = 0.0,
     duration: Double = 0.0,
     allowedWindow: ClosedRange<Double>? = null,
+    outroOnly: Boolean = false,
 ): List<RankedMixCandidate> {
     val end = resolveContentEnd(analysis, contentEnd, duration)
     if (end <= 0) return emptyList()
@@ -595,14 +600,27 @@ fun rankMixOutCandidates(
         .takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
     val base = mixOutCandidatesOf(analysis, end)
-    // Blueprint §7 steps 3–4: low-energy points and vocal-phrase exits inside
-    // the window join the analyzer's structural candidates; step 6 dedupes.
-    val augmented = if (allowedWindow != null) {
-        base + augmentMixOutCandidates(analysis, base, allowedWindow, beatSeconds)
+    // Automix-outro mode: the exit is the outro (or the content end), never a
+    // mid-track dip. Energy cliffs inside the outro still count — the outro
+    // starting loud then falling off is exactly an outro exit.
+    val outroStart = analysis.outroStartTime.orZero()
+    val scoped = if (outroOnly) {
+        base.filter {
+            it.type == "content_end" || it.type == "outro_start" ||
+                (it.type == "energy_cliff" && outroStart > 0 && it.time >= outroStart)
+        }
     } else {
         base
     }
-    val budget = if (allowedWindow != null) BLUEPRINT_WINDOW_DISCARD_BUDGET else MAX_DISCARDED_MUSIC_SECONDS
+    // Blueprint §7 steps 3–4: low-energy points and vocal-phrase exits inside
+    // the window join the analyzer's structural candidates; step 6 dedupes.
+    val augmented = if (allowedWindow != null && !outroOnly) {
+        scoped + augmentMixOutCandidates(analysis, scoped, allowedWindow, beatSeconds)
+    } else {
+        scoped
+    }
+    val budget = if (outroOnly) MAX_DISCARDED_MUSIC_SECONDS
+    else if (allowedWindow != null) BLUEPRINT_WINDOW_DISCARD_BUDGET else MAX_DISCARDED_MUSIC_SECONDS
     return augmented
         // A window is a hard constraint, not a suggestion: analyzer
         // candidates outside it (mid-track cliffs) must not hijack an
@@ -733,9 +751,10 @@ fun resolveMixOutAnchor(
     duration: Double = 0.0,
     allowedWindow: ClosedRange<Double>? = null,
     fallbackTime: Double? = null,
+    outroOnly: Boolean = false,
 ): MixOutAnchor {
     val end = resolveContentEnd(analysis, contentEnd, duration)
-    val best = rankMixOutCandidates(analysis, end, duration, allowedWindow).firstOrNull()
+    val best = rankMixOutCandidates(analysis, end, duration, allowedWindow, outroOnly).firstOrNull()
     if (best != null) {
         return MixOutAnchor(
             time = best.time,
@@ -1202,6 +1221,16 @@ private fun structureRoleOf(analysis: TrackAnalysis, time: Double, isOutgoing: B
         if (introEnd <= 0 && time <= 32.0) return StructureRole.INTRO
     }
     return StructureRole.OTHER
+}
+
+/**
+ * Automix-intro mode: where the incoming track's intro ends. Native
+ * introEndTime when present, else the same 32 s opening the section-role
+ * table treats as intro. Every normal-mode entry clamps to this.
+ */
+fun introEndSeconds(analysis: TrackAnalysis): Double {
+    val introEnd = analysis.introEndTime.orZero()
+    return if (introEnd > 0) introEnd else 32.0
 }
 
 /** Blueprint §5.4 section-pair table. */
