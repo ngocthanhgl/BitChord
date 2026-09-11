@@ -84,6 +84,14 @@ data class TrackAnalysis(
     /** Low-band energy, present only when the analyzer ran a band split. Drives the bass swap. */
     val lowEnergyCurve: List<EnergySample> = emptyList(),
     /**
+     * Finetune §6.1: the transient fine energy curve, kept in memory only
+     * (never persisted — see [AnalysisStore], which drops it on write). Lets
+     * [buildupStart] re-derive the §4 gradient for analyses whose stored
+     * buildup is absent. Empty for cached, head-only, or failed analyses,
+     * where callers fall through to the next fallback.
+     */
+    val energyCurveFine: List<EnergySample> = emptyList(),
+    /**
      * Per-sample vocal activity, indexed against [energyCurve] sample times.
      * Empty, or any length other than the energy curve's, means "no
      * evidence", which never blocks a transition.
@@ -91,6 +99,61 @@ data class TrackAnalysis(
     val vocalActivityMask: List<Double> = emptyList(),
     /** Whole-track vocal likelihood, distinct from the per-sample [vocalActivityMask]. */
     val vocalProbability: Double = 0.0,
+    /**
+     * Median fundamental over the head window's voiced frames, in Hz — the
+     * only measurement that can contradict [key] before a pitch shift is
+     * committed. 0 means "unmeasured", which vetoes nothing.
+     *
+     * A scalar rather than the full curve: the planner only ever asks "does
+     * this track sing near its detected key", and a 10 ms curve would cost
+     * kilobytes per stored entry for a question one number answers.
+     */
+    val vocalPitchMedianHz: Double = 0.0,
+    /** Mean confidence over the same voiced frames, 0..1. Trusted at 0.5. */
+    val pitchConfidence: Double = 0.0,
+    /**
+     * v2 §2b: structural section labels over the full track, ascending.
+     * Computed once by [StructureDetector] from the transient fine curves and
+     * persisted — the fine curves themselves are never stored. Empty until a
+     * whole-track analysis has run; callers fall back to energy heuristics.
+     */
+    val structureMap: List<StructureLabel> = emptyList(),
+    /** v2 §2b: first DROP label start, else null (see `firstDropSec`). */
+    val structuredDropSec: Double? = null,
+    /** v2 §2b: first BREAK label start, else null. */
+    val structuredBreakSec: Double? = null,
+    /** v2 §2b: first OUTRO label start, else null. */
+    val structuredOutroSec: Double? = null,
+    /** v2 §4: §4-gradient buildup foot, else null (see `buildupStart`). */
+    val structuredBuildupSec: Double? = null,
+    /** Phase A1: selectFirstDrop winner score (0..~1), else null. Persisted so
+     * drop trust survives restart without the transient fine curve. */
+    val dropConfidence: Double? = null,
+    /** Phase A1: how the buildup foot was found — "gradient", "monotonic",
+     * "build_label" or "stored". Null = unknown. */
+    val buildupMethod: String? = null,
+    /** Phase A1: raw buildup foot before phrase snap, else null. */
+    val buildupFootSec: Double? = null,
+    /** Phase A1: drop − foot in seconds, else null. */
+    val buildupSpanSec: Double? = null,
+    /** Phase A1: mean climb minus foot, normalized by track peak, else null. */
+    val buildupRise: Double? = null,
+    /**
+     * Spec finetune §7: the track's own breathing room before the cut — the
+     * start of the longest onset gap (>0.25 s) in the last 35% of the track,
+     * plus one beat of lookahead. Null when the tail never breathes.
+     * Persisted; computed once in [TrackAnalyzer.detectStructure].
+     */
+    val plainCutBreathSec: Double? = null,
+    /**
+     * Full-audit P0.2: true when this result came from the head-only pass —
+     * the curve/mask below cover the opening window only, not the track.
+     * The outgoing side needs tail evidence (mix-out, clash windows), so a
+     * provisional result never satisfies the both-sides gate for it; the
+     * incoming side only ever reads its entry window, so a provisional mask
+     * is exactly the evidence it needs. Never persisted (see AnalysisStore).
+     */
+    val provisionalHead: Boolean = false,
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing
@@ -112,6 +175,12 @@ data class TrackAnalysis(
 
 /** One point on an energy curve. [energy] is in whatever scale the analyzer chose. */
 data class EnergySample(val time: Double, val energy: Double)
+
+/** v2 §2b: one structural section label. Times are track-timeline seconds. */
+data class StructureLabel(val start: Double, val end: Double, val type: StructureSectionType)
+
+/** v2 §2b: the eight section kinds the detector emits, first-match-wins. */
+enum class StructureSectionType { DROP, BUILD, BREAK, VERSE, CHORUS, INTRO, OUTRO, AMBIENT }
 
 /**
  * A candidate point for a transition to enter or leave on. [score] is the
@@ -148,6 +217,11 @@ data class TransitionPolicyVerdict(
     /** Ordered most-disqualifying first, so `reasons.first()` is the routing verdict. */
     val reasons: List<String>,
     val beatConfidence: Double,
+    /** v2 §5a: harmonic tempo ratio locking bpmA onto bpmB (1.0 = unison). 1.0 by default. */
+    val matchedRatio: Double = 1.0,
+    /** Multi-candidate §Q2: semitone shift of the incoming key chosen by best-fit
+     * search (0 = none). In-memory only; render sites apply it behind their own gates. */
+    val candidateShiftSemitones: Int = 0,
 )
 
 /**
@@ -157,6 +231,11 @@ data class TransitionPolicyVerdict(
 enum class TransitionTier {
     /** Both grids trusted and the tempi sit within the transparent stretch window. */
     BEATMATCHED,
+
+    /** v2 §1: tempi lock through a harmonic ratio (3:2, 4:3, half/double...),
+     * not unison — both decks stretch to a shared BPM. Sits between
+     * BEATMATCHED and DJ_ASSISTED: beat math is allowed, unison math is not. */
+    HALF_TIME,
 
     /** Beat-quantized anchors and EQ handoffs are allowed; time-stretching is not. */
     DJ_ASSISTED,

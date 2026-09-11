@@ -102,6 +102,11 @@ object TrackFeatures {
         val lowEnergyCurve: List<EnergySample>,
         val mixInCandidates: List<MixCandidate>,
         val mixOutCandidates: List<MixCandidate>,
+        // v2 §2b: structural detector inputs. Transient — parsed for the
+        // detector, never written to the store (see StructureDetector).
+        val onsetTimes: List<Double> = emptyList(),
+        val spectralCentroidCurve: List<EnergySample> = emptyList(),
+        val energyCurveFine: List<EnergySample> = emptyList(),
     )
 
     fun parse(root: JSONObject): Features = Features(
@@ -127,6 +132,9 @@ object TrackFeatures {
         lowEnergyCurve = root.energyCurve("lowEnergyCurve"),
         mixInCandidates = root.cuePoints("mixInCandidates"),
         mixOutCandidates = root.cuePoints("mixOutCandidates"),
+        onsetTimes = root.doubles("onsetTimes"),
+        spectralCentroidCurve = root.energyCurve("spectralCentroidCurve"),
+        energyCurveFine = root.energyCurve("energyCurveFine"),
     )
 
     private fun JSONObject.doubles(name: String): List<Double> {

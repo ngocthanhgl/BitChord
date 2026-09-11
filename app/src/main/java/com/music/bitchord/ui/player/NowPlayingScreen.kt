@@ -1447,6 +1447,7 @@ fun NowPlayingScreen(
             // header icon.
             val mixing by AppSettings.smartMixInProgress.collectAsStateWithLifecycle()
             val smartAnalysis by AppSettings.smartAnalysis.collectAsStateWithLifecycle()
+            val sharedHalfTimeBpm by AppSettings.sharedHalfTimeBpm.collectAsStateWithLifecycle()
             // Height the artwork block below turns out not to need, spent by the
             // controls at the foot of the screen. Filled in from inside the box,
             // where the sleeve's real size is known; see [lastControlSpread].
@@ -1801,10 +1802,15 @@ fun NowPlayingScreen(
                                     text = if (song.isVideoOrigin) {
                                         stringResource(R.string.automix_not_supported_video)
                                     } else {
-                                        stringResource(
+                                        (stringResource(
                                             R.string.automix_analysis_status,
                                             smartAnalysis.current.localizedLabel(),
                                             smartAnalysis.next.localizedLabel(),
+                                            // v2 §7d: half-time blends play neither
+                                            // track's own tempo — say which grid won.
+                                        ) + (sharedHalfTimeBpm
+                                            ?.takeIf { it > 0 }
+                                            ?.let { " · shared ${"%.0f".format(it)} BPM" } ?: "")
                                         )
                                     },
                                     style = nerdStyle,

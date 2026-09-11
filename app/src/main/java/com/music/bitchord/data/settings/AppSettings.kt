@@ -244,6 +244,7 @@ object AppSettings {
      * See [com.music.bitchord.playback.smart.TransitionPlanner].
      */
     val smartFadeEnabled = MutableStateFlow(false)
+    val mixsetModeEnabled = MutableStateFlow(false)
 
     /** The CPU budget used by Beat This! and vocal analysis for Automix. */
     val automixPerformanceMode = MutableStateFlow(AutomixPerformanceMode.BALANCED)
@@ -549,6 +550,14 @@ object AppSettings {
     val smartMixInProgress = MutableStateFlow(false)
 
     /**
+     * v2 §7d: the shared BPM a HALF_TIME transition is actually playing at,
+     * for stats for nerds. Set at the handoff, cleared when the blend ends —
+     * null the rest of the time, so the line below stays dark outside a
+     * half-time blend.
+     */
+    val sharedHalfTimeBpm = MutableStateFlow<Double?>(null)
+
+    /**
      * How much of the *upcoming* transition has been analysed, for stats for
      * nerds. Published by the crossfade controller, which is the only thing
      * that knows which two tracks the next transition is between.
@@ -617,6 +626,7 @@ object AppSettings {
         exportDownloads.value = prefs.getBoolean(KEY_EXPORT_DOWNLOADS, false)
         crossfadeSeconds.value = prefs.getInt(KEY_CROSSFADE, 0)
         smartFadeEnabled.value = prefs.getBoolean(KEY_SMART_FADE, false)
+        mixsetModeEnabled.value = prefs.getBoolean(KEY_MIXSET_MODE, false)
         automixPerformanceMode.value = runCatching {
             AutomixPerformanceMode.valueOf(
                 prefs.getString(KEY_AUTOMIX_PERFORMANCE_MODE, null) ?: AutomixPerformanceMode.BALANCED.name,
@@ -850,6 +860,11 @@ object AppSettings {
     fun setSmartFadeEnabled(value: Boolean) {
         smartFadeEnabled.value = value
         prefs.edit().putBoolean(KEY_SMART_FADE, value).apply()
+    }
+
+    fun setMixsetModeEnabled(value: Boolean) {
+        mixsetModeEnabled.value = value
+        prefs.edit().putBoolean(KEY_MIXSET_MODE, value).apply()
     }
 
     fun setAutomixPerformanceMode(value: AutomixPerformanceMode) {
@@ -1401,6 +1416,7 @@ object AppSettings {
     private const val KEY_LOSSLESS = "lossless_audio"
     private const val KEY_CROSSFADE = "crossfade_seconds"
     private const val KEY_SMART_FADE = "smart_fade_enabled"
+    private const val KEY_MIXSET_MODE = "mixset_mode_enabled"
     private const val KEY_AUTOMIX_PERFORMANCE_MODE = "automix_performance_mode"
     private const val KEY_SKIP_SILENCE = "skip_silence"
     private const val KEY_OUTPUT_PCM_MODE = "output_pcm_mode"
