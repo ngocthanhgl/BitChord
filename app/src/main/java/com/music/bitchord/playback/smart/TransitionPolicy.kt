@@ -85,6 +85,9 @@ const val MAX_BPM = 220.0
  * Tempo-transparency fix: ±2 % (≈1/3 semitone) stays under the audibility band;
  * anything wider falls back to a wash at rate 1.0 instead of a stretched beatmatch. */
 const val MAX_STRETCH_DEVIATION = 0.02
+// Stock upstream (7039430) stretch bound, used on the normal Automix path.
+// DJ Mode keeps the tighter ±2 % bound above.
+const val STOCK_MAX_STRETCH_DEVIATION = 0.04
 
 /**
  * A vocal-activity mask value at or above this counts as singing. A fallback
@@ -120,6 +123,14 @@ private val MIX_IN_TYPE_WEIGHT = mapOf(
     "pickup" to 0.22,
     "phrase" to 0.12,
 )
+// Stock upstream (7039430) entry weights, used on the normal Automix path.
+// DJ Mode keeps the retuned map above.
+private val STOCK_MIX_IN_TYPE_WEIGHT = mapOf(
+    "main_drop" to 0.5,
+    "intro_drop" to 0.4,
+    "pickup" to 0.15,
+    "phrase" to 0.1,
+)
 
 /**
  * Mirrors the analyzer's own scoring of mix-out candidates, used when an
@@ -133,6 +144,14 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
     "vocal_exit" to 0.65,
     "low_energy" to 0.55,
     "blueprint_fallback" to 0.35,
+)
+// Stock upstream (7039430) exit scores, used on the normal Automix path.
+// DJ Mode keeps the retuned map above.
+private val STOCK_MIX_OUT_TYPE_SCORE = mapOf(
+    "energy_cliff" to 0.95,
+    "interior_mix_out" to 0.95,
+    "outro_start" to 0.9,
+    "content_end" to 0.75,
 )
 
 /** Finetune v1 §2.3: low-energy candidate inside a BREAK scores near the top. */
@@ -498,13 +517,38 @@ internal fun nearestValue(values: List<Double>, target: Double, tolerance: Doubl
  * before the point to bed under the outgoing track, and how vocal that intro
  * is all move a candidate up or down.
  */
-fun rankMixInCandidates(analysis: TrackAnalysis): List<RankedMixCandidate> {
+fun rankMixInCandidates(analysis: TrackAnalysis, mixset: Boolean = false): List<RankedMixCandidate> {
     val candidates = analysis.mixInCandidates.filter { it.time.isFinite() && it.time >= 0 }
     if (candidates.isEmpty()) return emptyList()
     val beatSeconds = analysis.beatInterval.orZero()
         .takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
     val audibleStart = audibleStartOf(analysis)
+    // Stock upstream scoring on normal Automix. DJ Mode keeps the retuned
+    // scoring below (cold-open bonus, tighter downbeat, vocal discard).
+    if (!mixset) {
+        return candidates.map { candidate ->
+            var rankScore = candidate.score.orZero() + (STOCK_MIX_IN_TYPE_WEIGHT[candidate.type] ?: 0.0)
+            if (nearestValue(analysis.downbeats, candidate.time, beatSeconds / 2) != null) rankScore += 0.1
+            // A cold open: nothing before the point to play underneath the outgoing track, so entering
+            // here means starting the blend on the arrangement.
+            if (candidate.time - audibleStart < beatSeconds * 4) rankScore -= 0.2
+            // Prefer entries whose run-up is instrumental; an intro that already sings will sing over
+            // the outgoing track for the whole pre-roll.
+            val vocal = vocalActivityBetween(
+                analysis,
+                max(audibleStart, candidate.time - beatSeconds * 16),
+                candidate.time,
+            )
+            if (vocal != null) rankScore += (0.5 - vocal) * 0.4
+            RankedMixCandidate(
+                time = candidate.time,
+                score = candidate.score.orZero(),
+                type = candidate.type,
+                rankScore = rankScore,
+            )
+        }.sortedByDescending { it.rankScore }
+    }
     // Finetune v1 §1.5/§3.3: a cold-open track is designed to start at full
     // energy — penalising that pushes the entry into the middle of the track.
     val coldOpen = isColdOpen(analysis, audibleStart)
@@ -596,6 +640,24 @@ fun rankMixOutCandidates(
 ): List<RankedMixCandidate> {
     val end = resolveContentEnd(analysis, contentEnd, duration)
     if (end <= 0) return emptyList()
+    // Stock upstream path (normal Automix): any-type rank, flat 12 s budget,
+    // no vocal/drop shaping. DJ paths always pass outroOnly or a window.
+    if (!outroOnly && allowedWindow == null) {
+        return mixOutCandidatesOf(analysis, end)
+            .map { candidate ->
+                val measured = audibleSecondsBetween(analysis, candidate.time, end)
+                RankedMixCandidate(
+                    time = candidate.time,
+                    score = candidate.score,
+                    type = candidate.type,
+                    rankScore = candidate.score + (STOCK_MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0),
+                    discardedMusicSeconds = measured ?: max(0.0, end - candidate.time),
+                    measured = measured != null,
+                )
+            }
+            .filter { it.discardedMusicSeconds <= MAX_DISCARDED_MUSIC_SECONDS }
+            .sortedWith(compareByDescending<RankedMixCandidate> { it.rankScore }.thenByDescending { it.time })
+    }
     val beatSeconds = analysis.beatInterval.orZero()
         .takeIf { it > 0 }
         ?: if (analysis.bpm.orZero() > 0) 60 / analysis.bpm else 0.5
@@ -793,6 +855,7 @@ fun isHighEnergyAt(analysis: TrackAnalysis, time: Double): Boolean {
 fun assessTransitionTier(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
+    mixset: Boolean = false,
 ): TransitionPolicyVerdict {
     val outgoingBpm = analysis.bpm.orZero()
     val incomingBpm = nextAnalysis.bpm.orZero()
@@ -812,6 +875,21 @@ fun assessTransitionTier(
             TransitionTier.PLAIN_CROSSFADE,
             listOf("beat-confidence"),
             floorConfidence,
+        )
+    }
+
+    // Stock upstream (normal Automix): single stretch ratio, no HALF_TIME
+    // tier. DJ Mode keeps the multi-candidate search below.
+    if (!mixset) {
+        val stretchRatio = outgoingBpm / alignTempoOctave(outgoingBpm, incomingBpm)
+        if (abs(stretchRatio - 1) > STOCK_MAX_STRETCH_DEVIATION) reasons += "tempo-distance"
+        if (outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE) {
+            reasons += "beat-confidence"
+        }
+        return TransitionPolicyVerdict(
+            tier = if (reasons.isEmpty()) TransitionTier.BEATMATCHED else TransitionTier.DJ_ASSISTED,
+            reasons = reasons,
+            beatConfidence = floorConfidence,
         )
     }
 
