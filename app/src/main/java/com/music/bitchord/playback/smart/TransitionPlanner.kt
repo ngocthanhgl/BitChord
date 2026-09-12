@@ -274,6 +274,18 @@ data class TransitionPlan(
     val score: CompatibilityScore = CompatibilityScore(),
     /** Blueprint §5.7 ECHO_REVERB_OUT: peak echo/reverb wet 0..1 on the outgoing track. */
     val echoAmount: Double = 0.0,
+    /**
+     * DJ echo throw (F1): fire a beat-synced vocal echo on the outgoing tail
+     * of a DJ_BLEND/DJ_FILTER instead of rendering it dry. The renderer voices
+     * it through the echo send with [echoAmount] as peak wet. DJ-only, false
+     * everywhere else (normal Automix renders stock dry).
+     */
+    val echoThrow: Boolean = false,
+    /**
+     * DJ brake (F2): dive the outgoing deck rate toward a stop over the last
+     * quarter of the blend instead of gliding it home. DJ-only.
+     */
+    val brake: Boolean = false,
     /** Blueprint §5.7 LOOP_CUT_DROP: how many bars of the outgoing tail loop before the freeze. */
     val loopBars: Int = 0,
     /** Blueprint §5.7 LOOP_CUT_DROP: where the incoming track lands, on its own timeline. */
@@ -1430,6 +1442,74 @@ private fun bassSwapFractionFor(
  * Answers zero for a degenerate span and for any track without a mask, so every
  * caller can set this unconditionally.
  */
+/** Peak echo-send wet for a DJ vocal throw (F1): a send, not an instrument. */
+private const val ECHO_THROW_WET = 0.45
+
+/**
+ * DJ send-effect selector (F1 throw / F3 wash, DJ-only): which, if any, send
+ * effect voices the outgoing tail of a DJ_BLEND/DJ_FILTER. Returns
+ * echoThrow + wash reverb wet. Evidence-gated: unknown masks answer none,
+ * keeping blends that cannot prove a vocal tail exactly as dry as before.
+ */
+private fun djSendEffectFor(
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    transitionStart: Double,
+    transitionEnd: Double,
+    incomingCueTime: Double,
+    incomingPlaybackRate: Double,
+    mixset: Boolean,
+): Pair<Boolean, Double> {
+    if (!mixset) return false to 0.0
+    val overlap = transitionEnd - transitionStart
+    if (!overlap.isFinite() || overlap < 6.0) return false to 0.0
+    val tailStart = transitionEnd - minOf(8.0, overlap * 0.4)
+    val tailMid = (tailStart + transitionEnd) / 2.0
+    // Throw: a vocal phrase ending inside the tail while the incoming entry
+    // stays clean — the "im here" moment. A 1-beat delay with ~4 feedback
+    // tails rings ~2 s under the incoming track.
+    val early = vocalActivityBetween(analysis, tailStart, tailMid)
+    val late = vocalActivityBetween(analysis, tailMid, transitionEnd)
+    if (early != null && late != null && early >= 0.55 && late <= 0.35) {
+        val inRate = incomingPlaybackRate.takeIf { it.isFinite() && it > 0.0 } ?: 1.0
+        val inBeat = nextAnalysis.beatInterval.takeIf { it.isFinite() && it > 0.0 } ?: 0.5
+        val entry = vocalActivityBetween(nextAnalysis, incomingCueTime, incomingCueTime + 4.0 * inBeat / inRate)
+        if (entry != null && entry <= 0.40) return true to 0.0
+    }
+    // Wash: the outgoing tail expiring into a breakdown (tail energy under
+    // half the track mean) — a bed of reverb under the handoff instead of
+    // dry air. Revives BLEND_REVERB_WET as a voiced bed.
+    var tailSum = 0.0
+    var tailCount = 0
+    var trackSum = 0.0
+    var trackCount = 0
+    for (sample in analysis.energyCurve) {
+        if (!sample.time.isFinite() || !sample.energy.isFinite()) continue
+        trackSum += sample.energy
+        trackCount++
+        if (sample.time >= tailStart && sample.time <= transitionEnd) {
+            tailSum += sample.energy
+            tailCount++
+        }
+    }
+    if (trackCount > 0 && tailCount > 0 && tailSum / tailCount < 0.5 * trackSum / trackCount) {
+        return false to BLEND_REVERB_WET
+    }
+    return false to 0.0
+}
+
+/**
+ * DJ brake selector (F2, DJ-only): a pair that would need a >6% tempo ride
+ * gets punctuation instead — brake the outgoing out, drop the incoming on
+ * the one. Literature reserves the brake for large gaps, not blends a pitch
+ * ride could hold.
+ */
+private fun brakeFor(mixset: Boolean, incomingPlaybackRate: Double, overlapSeconds: Double): Boolean {
+    if (!mixset || !overlapSeconds.isFinite() || overlapSeconds < 8.0) return false
+    val rate = incomingPlaybackRate.takeIf { it.isFinite() && it > 0.0 } ?: 1.0
+    return rate > 1.06 || rate < 0.94
+}
+
 private fun plannedVocalOverlap(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
@@ -1722,6 +1802,18 @@ private fun phraseSwitch(
     ) as? WsolaPlanResult.Planned ?: return null
 
     val overlap = planned.transitionEnd - planned.transitionStart
+    // DJ effects (F1/F2/F3): a vocal tail earns an echo throw, a breakdown
+    // exit earns a reverb wash, a >6% tempo gap earns a brake. Evidence-gated;
+    // anything unproven renders exactly as dry as before.
+    val (throwFire, washWet) = djSendEffectFor(
+        analysis = analysis,
+        nextAnalysis = nextAnalysis,
+        transitionStart = planned.transitionStart,
+        transitionEnd = planned.transitionEnd,
+        incomingCueTime = planned.incomingCueTime,
+        incomingPlaybackRate = planned.stretchRatio,
+        mixset = mixset,
+    )
     return TransitionPlan(
         markerVisible = true,
         transitionStart = planned.transitionStart,
@@ -1762,9 +1854,20 @@ private fun phraseSwitch(
         outgoingBpm = planned.outgoingBpm,
         incomingBpm = planned.incomingBpm,
         transitionStyle = TransitionStyle.DJ_BLEND,
+        // DJ echo throw (F1): the tail effect above, voiced through the echo
+        // send with a 1-beat period (~2 s of tails). Zero when unproven.
+        echoAmount = if (throwFire && mixset) ECHO_THROW_WET else 0.0,
+        echoThrow = throwFire && mixset,
+        echoPeriodBeats = if (throwFire && mixset) 1.0 else null,
+        brake = brakeFor(
+            mixset = mixset,
+            incomingPlaybackRate = planned.stretchRatio,
+            overlapSeconds = overlap,
+        ),
         // Automix reverb: a bed of reverb under the EQ swap glues the two
-        // grids. DJ Mode keeps its dry handoff.
-        reverbAmount = 0.0, // Stock: dry. (DJ path was already dry here.)
+        // grids. DJ Mode keeps its dry handoff, plus the wash bed (F3) when
+        // the outgoing tail expires into a breakdown.
+        reverbAmount = if (mixset) washWet else 0.0,
     )
 }
 
@@ -2694,6 +2797,17 @@ private fun planTransitionInner(
         0
     }
     val started = playbackTime >= transitionStart
+    // DJ effects (F1/F2/F3), same selector as phraseSwitch: vocal tail earns
+    // a throw, breakdown exit a wash, >6% tempo gap a brake. Unproven = dry.
+    val (throwFireAdaptive, washWetAdaptive) = djSendEffectFor(
+        analysis = analysis,
+        nextAnalysis = nextAnalysis,
+        transitionStart = transitionStart,
+        transitionEnd = mixEnd,
+        incomingCueTime = finalIncomingCueTime,
+        incomingPlaybackRate = incomingPlaybackRate,
+        mixset = mixset,
+    )
     return applyMixsetFireFloor(
         TransitionPlan(
             shouldStart = started,
@@ -2739,8 +2853,19 @@ private fun planTransitionInner(
         ),
         policyReasons = policy.reasons,
         reason = if (started) "smart-duration" else "before-smart-duration",
-        // Automix reverb: same bed as the phrase-switch blend. DJ Mode dry.
-        reverbAmount = 0.0, // Stock: dry. (DJ path was already dry here.)
+        // DJ echo throw (F1) + brake (F2): voiced through the echo send /
+        // the outgoing deck rate. Zero when unproven.
+        echoAmount = if (throwFireAdaptive && mixset) ECHO_THROW_WET else 0.0,
+        echoThrow = throwFireAdaptive && mixset,
+        echoPeriodBeats = if (throwFireAdaptive && mixset) 1.0 else null,
+        brake = brakeFor(
+            mixset = mixset,
+            incomingPlaybackRate = incomingPlaybackRate,
+            overlapSeconds = alignedOverlap,
+        ),
+        // Automix reverb: same bed as the phrase-switch blend. DJ Mode keeps
+        // its dry handoff, plus the wash bed (F3) on breakdown exits.
+        reverbAmount = if (mixset) washWetAdaptive else 0.0,
         ),
         length, mixset,
     )
