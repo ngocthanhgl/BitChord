@@ -2463,8 +2463,9 @@ class CrossfadeController(
                 if (render.bassSwap && !render.eqSwapFireProgress.isFinite()) {
                     filters.setResonance(1.0f)
                     rideBassSwap(progress)
-                } else if (render.overlapSeconds > PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS) {
-                    // Review v2.1 C2 (see rideProactiveMidCut).
+                } else if (render.mixset && render.overlapSeconds > PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS) {
+                    // Review v2.1 C2 (see rideProactiveMidCut). DJ-only: stock
+                    // upstream falls through to rideVocalSeparation below.
                     filters.setResonance(1.0f)
                     rideProactiveMidCut(progress)
                 } else {
