@@ -544,7 +544,9 @@ internal fun plainDissolvePlan(
     // the buildup point, which for an unsyncable pair is the same thing:
     // wherever this track first makes sound.
     val entry = if (mixset) {
-        mixsetEntryPoint(nextAnalysis) ?: incomingAudibleStart(nextAnalysis)
+        // A1 audibility-first: a dissolve entry must be real sound, not an
+        // arithmetic peak proxy — refine to first audible, keep peak as claim.
+        refinedStartPoint(nextAnalysis, mixsetEntryPoint(nextAnalysis) ?: incomingAudibleStart(nextAnalysis))
     } else {
         incomingAudibleStart(nextAnalysis)
     }
@@ -2583,8 +2585,12 @@ private fun planTransitionInner(
             return applyMixsetFireFloor(
                 plan.copy(
                     shouldStart = started,
-                    type = TransitionType.HARMONIC_BLEND,
-                    score = scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime),
+                    // A2: the HARMONIC relabel is DJ-only. On normal Automix the
+                    // phrase plan keeps its native type (no forced revoice).
+                    type = if (mixset) TransitionType.HARMONIC_BLEND else plan.type,
+                    // B3: the recompute at the actual start/cue can only
+                    // downgrade — a weak bed must never outscore its plan.
+                    score = min(plan.score, scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime)),
                     eqCurve = EQCurve.BASS_SWAP,
                     policyReasons = policy.reasons,
                     reason = if (started) "smart-phrase-switch" else "before-phrase-switch",
@@ -2784,7 +2790,10 @@ private fun planTransitionInner(
     // the outgoing key when a small shift suffices, mask with the sweep when
     // it does not (semitonesToShift answers 0 in both the done and the
     // hopeless cases, which is exactly when no shift applies).
-    val keyShift = if (!sameBeatBlend &&
+    // A2: the FILTER-path micro-retune is DJ-only. Normal Automix never
+    // retunes (stock upstream), so gate on mixset — keyScore range alone
+    // would voice normal blends too.
+    val keyShift = if (mixset && !sameBeatBlend &&
         analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
         keyScore(analysis.key, nextAnalysis.key) in 0.45..0.75 &&
         // A trusted F0 that contradicts the incoming key cancels the shift:
