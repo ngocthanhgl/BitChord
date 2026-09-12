@@ -340,6 +340,15 @@ class PlaybackService : MediaLibraryService() {
     private var activeSplice: SpliceGuardProcessor = spliceGuardA
     private var spareSplice: SpliceGuardProcessor = spliceGuardB
 
+    // Full-plan loudness: one gain stage per player, LAST in the custom
+    // chain (after the splice guard) so fades, EQ, echo and reverb all
+    // voice before the correction. Same role-swap contract as the rest.
+    private val loudnessA = LoudnessGainProcessor()
+    private val loudnessB = LoudnessGainProcessor()
+
+    private var activeLoudness: LoudnessGainProcessor = loudnessA
+    private var spareLoudness: LoudnessGainProcessor = loudnessB
+
     // DJ-EQ spec: one 3-band EQ per player at the head of the chain, so every
     // downstream stage (widening, sweep, echo, reverb, guard) works on the
     // already-EQ'd signal. Same role-swap contract as the other processors.
@@ -1145,8 +1154,8 @@ class PlaybackService : MediaLibraryService() {
             .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
 
         configuredFloatOutput = shouldEnableFloatOutput()
-        val exoPlayer = buildPlayer(djEqA, spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
-        val sparePlayer = buildPlayer(djEqB, spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
+        val exoPlayer = buildPlayer(djEqA, spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, loudnessA, ownsSession = true)
+        val sparePlayer = buildPlayer(djEqB, spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, loudnessB, ownsSession = false)
         player = exoPlayer
         spare = sparePlayer
         // Both sinks feed the same session id, so the system equalizer and any
@@ -1270,6 +1279,15 @@ class PlaybackService : MediaLibraryService() {
 
                 override fun outgoing(low: Float, mid: Float, high: Float) =
                     spareEq.setGains(low, mid, high)
+            },
+            // Full-plan loudness: same role wiring — after the handoff the
+            // incoming track sits on the session player, outgoing on spare.
+            loudnessGains = object : LoudnessGains {
+                override fun incoming(gainDb: Float) =
+                    activeLoudness.setGainDb(gainDb)
+
+                override fun outgoing(gainDb: Float) =
+                    spareLoudness.setGainDb(gainDb)
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
@@ -1481,9 +1499,10 @@ class PlaybackService : MediaLibraryService() {
         echo: EchoSendProcessor,
         reverb: ReverbProcessor,
         splice: SpliceGuardProcessor,
+        loudness: LoudnessGainProcessor,
         ownsSession: Boolean,
     ): ExoPlayer = ExoPlayer.Builder(this)
-        .setRenderersFactory(silenceSkippingRenderers(eq, spatial, filter, echo, reverb, splice))
+        .setRenderersFactory(silenceSkippingRenderers(eq, spatial, filter, echo, reverb, splice, loudness))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
         .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
@@ -1527,6 +1546,9 @@ class PlaybackService : MediaLibraryService() {
         val heldEq = activeEq
         activeEq = spareEq
         spareEq = heldEq
+        val heldLoudness = activeLoudness
+        activeLoudness = spareLoudness
+        spareLoudness = heldLoudness
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
@@ -3768,6 +3790,7 @@ class PlaybackService : MediaLibraryService() {
         echo: EchoSendProcessor,
         reverb: ReverbProcessor,
         splice: SpliceGuardProcessor,
+        loudness: LoudnessGainProcessor,
     ) = object : DefaultRenderersFactory(this) {
         init {
             // Do not force PCM_FLOAT onto an OEM speaker mixer merely because
@@ -3822,7 +3845,10 @@ class PlaybackService : MediaLibraryService() {
                     // DJ-EQ spec §EQ-vs-volume: the EQ shapes the spectrum first
                     // at the head of the chain; widening, sweep, echo, reverb
                     // and the splice guard all work on the already-EQ'd signal.
-                    arrayOf(eq, spatial, transition, echo, reverb, splice),
+                    // Full-plan loudness: the gain stage rides after the splice
+                    // guard — fades, EQ, echo and reverb all voice before the
+                    // correction, and the guard's micro-fades are preserved.
+                    arrayOf(eq, spatial, transition, echo, reverb, splice, loudness),
                     SilenceSkippingAudioProcessor(
                         MIN_SILENCE_US,
                         SilenceSkippingAudioProcessor.DEFAULT_SILENCE_RETENTION_RATIO,
@@ -3920,14 +3946,18 @@ class PlaybackService : MediaLibraryService() {
         spareSplice = spliceGuardB
         activeEq = djEqA
         spareEq = djEqB
+        activeLoudness = loudnessA
+        spareLoudness = loudnessB
         echoSendA.open()
         echoSendB.open()
         reverbSendA.open()
         reverbSendB.open()
         djEqA.open()
         djEqB.open()
-        val newActive = buildPlayer(djEqA, spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, ownsSession = true)
-        val newSpare = buildPlayer(djEqB, spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, ownsSession = false)
+        loudnessA.open()
+        loudnessB.open()
+        val newActive = buildPlayer(djEqA, spatialAudioProcessorA, transitionFilterA, echoSendA, reverbSendA, spliceGuardA, loudnessA, ownsSession = true)
+        val newSpare = buildPlayer(djEqB, spatialAudioProcessorB, transitionFilterB, echoSendB, reverbSendB, spliceGuardB, loudnessB, ownsSession = false)
         player = newActive
         spare = newSpare
         newSpare.audioSessionId = newActive.audioSessionId

@@ -209,6 +209,12 @@ class CrossfadeController(
      */
     private val eqFilters: EqFilters = EqFilters.None,
     /**
+     * The per-deck loudness gain stage. Aimed once per arm in [begin] from
+     * each deck's analyzed LUFS — not per tick, loudness doesn't move during
+     * a blend. Defaults to [LoudnessGains.None] (unity, correction off).
+     */
+    private val loudnessGains: LoudnessGains = LoudnessGains.None,
+    /**
      * Whether a decode and inference for a media item is running right now.
      * Only feeds the stats line — nothing about a transition waits on it.
      */
@@ -434,6 +440,12 @@ class CrossfadeController(
     private var pendingEchoCloseFromWet = 0f
     private var pendingEchoCloseDelaySec = 0f
     private var pendingEchoCloseStartMs = -1L
+    // Full-plan P5: same late-retire for reverb tails — the Schroeder tail
+    // (~2.5 s) never rings past the handoff otherwise. Mirrors the echo
+    // throw path above (armed in finish(), stepped in tick(), flushed in
+    // begin()); reverb close needs no delay param (wet only).
+    private var pendingReverbCloseFromWet = 0f
+    private var pendingReverbCloseStartMs = -1L
     // DJ brake (F2): last committed brake rate, for coalesced per-tick ramps.
     private var lastBrakeRate: Float = 1f
     private val EFFECT_COOLDOWN_BLENDS = 2
@@ -825,6 +837,17 @@ class CrossfadeController(
                 pendingEchoCloseStartMs = -1L
             } else {
                 echoFilters.outgoing(pendingEchoCloseFromWet * (1f - t), pendingEchoCloseDelaySec)
+            }
+        }
+        // Full-plan P5: stepped reverb close armed in finish() — same
+        // 200 ms linear drain so the tail rings instead of chopping.
+        if (pendingReverbCloseStartMs >= 0L) {
+            val t = (SystemClock.elapsedRealtime() - pendingReverbCloseStartMs).toFloat() / THROW_CLOSE_MS
+            if (t >= 1f) {
+                reverbFilters.outgoing(0f, false)
+                pendingReverbCloseStartMs = -1L
+            } else {
+                reverbFilters.outgoing(pendingReverbCloseFromWet * (1f - t), false)
             }
         }
 
@@ -1464,6 +1487,24 @@ class CrossfadeController(
      * is applied before a note has been rendered rather than being switched on
      * underneath one already playing.
      */
+    /**
+     * Full-plan loudness: correction gain in dB for one deck, from its
+     * analyzed integrated LUFS. Target minus integrated, clamped ±6 dB,
+     * then peak-headroomed so peak + gain never exceeds −1 dBTP.
+     * Unmeasured (−70) or toggled off reads unity — never stage on nothing.
+     */
+    private fun loudnessGainDbFor(item: MediaItem?): Float {
+        if (item == null || !AppSettings.loudnessNormalizationEnabled.value) return 0f
+        val analysis = analysisFor(item)
+        val lufs = analysis.loudnessLufs
+        if (!lufs.isFinite() || lufs <= -69.0) return 0f
+        val target = AppSettings.loudnessTargetLufs.value.toDouble()
+        var gain = (target - lufs).coerceIn(-6.0, 6.0)
+        val peak = analysis.peakDbfs
+        if (peak.isFinite() && peak + gain > -1.0) gain = -1.0 - peak
+        return gain.toFloat()
+    }
+
     private fun begin(
         fade: Long,
         endMs: Long,
@@ -1517,6 +1558,11 @@ class CrossfadeController(
         if (pendingEchoCloseStartMs >= 0L) {
             echoFilters.outgoing(0f, pendingEchoCloseDelaySec)
             pendingEchoCloseStartMs = -1L
+        }
+        // Full-plan P5: flush a stepped reverb close in flight too.
+        if (pendingReverbCloseStartMs >= 0L) {
+            reverbFilters.outgoing(0f, false)
+            pendingReverbCloseStartMs = -1L
         }
         // Missed-window fix F4: an accepted arm ends the storm.
         consecutiveBailCount = 0
@@ -1577,6 +1623,11 @@ class CrossfadeController(
         // rearms here with every other per-transition flag.
         eqFilters.outgoing(1f, 1f, 1f)
         eqFilters.incoming(1f, 1f, 1f)
+        // Full-plan loudness: aim the gain stages once per arm from each
+        // deck's analyzed integrated LUFS. Not per tick — loudness doesn't
+        // move during a blend; the processor glides to the new target.
+        loudnessGains.outgoing(loudnessGainDbFor(out.currentMediaItem))
+        items.getOrNull(nextIndex)?.let { loudnessGains.incoming(loudnessGainDbFor(it)) }
         eqSwapFired = false
         eqSwapStartProgress = 0f
         into.setMediaItems(items, nextIndex, incomingCueTimeMs)
@@ -1633,13 +1684,13 @@ class CrossfadeController(
                 val ramp = ((out.currentPosition - leadStart).toFloat() / leadMs).coerceIn(0f, 1f)
                 if (ramp > 0f) {
                     val eased = ramp * ramp * (3f - 2f * ramp) // smoothstep
-                    // Tempo-transparency fix: the pre-fade slew never exceeds
-                    // ±2 % — with HALF_TIME retired this branch is nearly dead,
-                    // but any residual stays under the audibility band.
-                    val cappedDelta = ((render.outgoingPlaybackRate - 1.0) * eased)
-                        .toFloat().coerceIn(-0.02f, 0.02f)
+                    // Full-plan P2: ease the FULL delta over the lead instead
+                    // of capping at ±2% — the cap left HALF_TIME stepping
+                    // 2%->41% in one tick at startFade. The smoothstep keeps
+                    // the slope inaudible; coalescing below bounds the commits.
+                    val fullDelta = ((render.outgoingPlaybackRate - 1.0) * eased).toFloat()
                     val rate = (AppSettings.playbackSpeed.value *
-                        (1.0 + cappedDelta)).toFloat()
+                        (1.0 + fullDelta)).toFloat()
                     val now = SystemClock.uptimeMillis()
                     val last = lastCommittedRate
                     if (last == null || abs(rate - last) / max(abs(last), 1e-6f) >= 0.0015f ||
@@ -1963,6 +2014,10 @@ class CrossfadeController(
         // one-tick 1->0 snap, which chopped full-scale under level-ride.
         val muteCutoff = when (render.style) {
             TransitionStyle.DJ_BLEND -> 0.95f
+            // Full-plan P3: DJ_FILTER matches the blend release — sweep bed
+            // + EQ empty the band by 0.80 anyway, so the 0.80 mute disposed
+            // a nearly-empty path 15% early.
+            TransitionStyle.DJ_FILTER -> 0.95f
             TransitionStyle.ECHO_REVERB_OUT,
             TransitionStyle.PLAIN_DISSOLVE,
             -> Float.MAX_VALUE // exempt: never mutes
@@ -2168,7 +2223,11 @@ class CrossfadeController(
         // the click this ramp exists to avoid.
         filters.open()
         echoFilters.open()
-        reverbFilters.open()
+        // Full-plan P5: stepped reverb close instead of the open() snap —
+        // heavy-clash bails chopped the tail at BAIL_MS=120. tick() drains
+        // the armed wet over 200 ms while the deck is still at partial gain.
+        pendingReverbCloseFromWet = render.reverbAmount.toFloat().coerceIn(0f, 0.5f)
+        pendingReverbCloseStartMs = SystemClock.elapsedRealtime()
         eqFilters.open()
         bailFromGain = outgoing?.volume ?: 0f
         bailFromGainIn = incoming?.volume ?: 0f
@@ -2241,9 +2300,12 @@ class CrossfadeController(
                 // untouched decks hold exactly (speed├ù1.0, pitch 2^0).
                 val live = it.playbackParameters
                 val rateActuallyOff = live.speed != AppSettings.playbackSpeed.value || live.pitch != 1f
-                // early-done leaves the deck rate as-is: resetting mid-glide
-                // re-prepares the pipeline at full volume (end-of-mix snap).
-                if (rateApplied && !deckRateReset && lastProgress >= 0.98f &&
+                // Full-plan P2: rateActuallyOff alone authorizes the reset even
+                // when early — the exact compare proves the deck is off-home,
+                // and leaving a shifted deck for the whole next track is worse
+                // than a guarded reset. deckRateReset still prevents doubles.
+                if (rateApplied && !deckRateReset &&
+                    (lastProgress >= 0.98f || rateActuallyOff) &&
                     (tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02 || rateActuallyOff)
                 ) {
                     it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
@@ -2266,6 +2328,14 @@ class CrossfadeController(
                 // silent or ending, and begin() flushes an overlapping arm.
                 pendingRetirePlayer = outgoing
                 pendingRetireAtMs = pendingEchoCloseStartMs + 2500L
+            } else if (render.reverbAmount > 0.0) {
+                // Full-plan P5: reverb tails get the same late-retire the echo
+                // throw gets — retire()->stop() at finish() truncates the
+                // ~2.5 s Schroeder tail otherwise. Stepped close + 2.5 s ring.
+                pendingReverbCloseFromWet = render.reverbAmount.toFloat().coerceIn(0f, 0.5f)
+                pendingReverbCloseStartMs = SystemClock.elapsedRealtime()
+                pendingRetirePlayer = outgoing
+                pendingRetireAtMs = pendingReverbCloseStartMs + 2500L
             } else {
                 outgoing?.let(::retire)
             }
@@ -2423,8 +2493,12 @@ class CrossfadeController(
         if (dryKilled) {
             eqFilters.outgoing(0f, 0f, 0f)
         } else {
+            // Full-plan P3: INSTRUMENTAL_BED joins when the bed actually
+            // sings (duck||delay) — a sung instrumental bed double-mids
+            // through the swap otherwise. Truly voiceless beds stay flat.
             val ownership = if (
-                (render.mixRecipe == MixRecipe.VOCAL_DUEL || render.mixRecipe == MixRecipe.WASH_OUT) &&
+                (render.mixRecipe == MixRecipe.VOCAL_DUEL || render.mixRecipe == MixRecipe.WASH_OUT ||
+                    (render.mixRecipe == MixRecipe.INSTRUMENTAL_BED && (duck || delay))) &&
                 incomingSings
             ) {
                 val lin = ((0.80f - outProgress) / 0.80f).coerceIn(0f, 1f)
@@ -2492,7 +2566,12 @@ class CrossfadeController(
                 if (render.bassSwap && !render.eqSwapFireProgress.isFinite()) {
                     filters.setResonance(1.0f)
                     rideBassSwap(progress)
-                } else if (render.mixset && render.overlapSeconds > PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS) {
+                } else if (render.mixset && render.overlapSeconds > PROACTIVE_MID_CUT_MIN_OVERLAP_SECONDS &&
+                    // Full-plan P3: never triple-stack mids — when EQ duck or
+                    // ownership already voices this bed, the proactive cut
+                    // stands down (ARM flags; live slew only deepens the cut).
+                    !render.duckAMids && !render.delayBMids
+                ) {
                     // Review v2.1 C2 (see rideProactiveMidCut). DJ-only: stock
                     // upstream falls through to rideVocalSeparation below.
                     filters.setResonance(1.0f)
@@ -2559,7 +2638,12 @@ class CrossfadeController(
                     val headroom = if (wetSum > SERIES_WET_CAP) SERIES_WET_CAP / wetSum else 1f
                     echoFilters.outgoing(echoW * headroom, render.echoBeatSeconds.toFloat())
                     echoFilters.incoming(0f, 0f)
-                    reverbFilters.outgoing(verbW * headroom, false)
+                    // Full-plan P5: voice the plan's freeze point — past
+                    // freezeAt the tail smears (feedback pinned) instead of
+                    // tracking the dry. reverbFreezeAtSec is plan metadata no
+                    // longer: seconds into the window, same clock as bElapsed.
+                    val frozen = progress * spanSec >= freezeAt.toFloat()
+                    reverbFilters.outgoing(verbW * headroom, frozen)
                     reverbFilters.incoming(0f, false)
                 } else {
                     val wash = (render.echoAmount * progress).toFloat().coerceIn(0f, 1f)

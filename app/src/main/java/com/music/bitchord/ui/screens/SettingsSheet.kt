@@ -175,6 +175,7 @@ fun SettingsScreen(
     val smartFade by AppSettings.smartFadeEnabled.collectAsStateWithLifecycle()
     val mixset by AppSettings.mixsetModeEnabled.collectAsStateWithLifecycle()
     val automixPerformance by AppSettings.automixPerformanceMode.collectAsStateWithLifecycle()
+    val loudnessNormalization by AppSettings.loudnessNormalizationEnabled.collectAsStateWithLifecycle()
     val skipSilence by AppSettings.skipSilence.collectAsStateWithLifecycle()
     val dolbyAtmos by AppSettings.dolbyAtmos.collectAsStateWithLifecycle()
     // A property of the hardware, so it is read once rather than remembered
@@ -551,6 +552,25 @@ fun SettingsScreen(
                 subtitle = stringResource(R.string.automix_performance_subtitle),
                 value = automixPerformance.localizedLabel(),
                 onClick = { pickingAutomixPerformance = true },
+            )
+            RowDivider()
+            // Full-plan loudness: the off switch. On by default (−14 LUFS,
+            // ±6 dB, peak-headroomed) — purists who want raw masters flip it.
+            SettingsRow(
+                icon = Icons.Rounded.GraphicEq,
+                title = stringResource(R.string.loudness_normalization),
+                subtitle = stringResource(R.string.loudness_normalization_subtitle),
+                trailing = {
+                    Switch(
+                        checked = loudnessNormalization,
+                        onCheckedChange = AppSettings::setLoudnessNormalizationEnabled,
+                        colors = SwitchDefaults.colors(
+                            checkedTrackColor = MaterialTheme.colorScheme.primary,
+                            checkedBorderColor = MaterialTheme.colorScheme.primary,
+                        ),
+                    )
+                },
+                onClick = { AppSettings.setLoudnessNormalizationEnabled(!loudnessNormalization) },
             )
             RowDivider()
             SettingsRow(

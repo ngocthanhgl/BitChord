@@ -99,6 +99,15 @@ data class TrackAnalysis(
     val vocalActivityMask: List<Double> = emptyList(),
     /** Whole-track vocal likelihood, distinct from the per-sample [vocalActivityMask]. */
     val vocalProbability: Double = 0.0,
+    // Full-plan P4: master descriptors, re-emitted by the JNI bridge for
+    // wash gain-staging (hot crushed masters need less wash) and the
+    // loudness normalizer. -70/0 = "unmeasured", which stages nothing.
+    /** Integrated loudness in LUFS as computed natively (RMS-0.691, no gating). */
+    val loudnessLufs: Double = -70.0,
+    /** Peak level in dBFS. */
+    val peakDbfs: Double = -70.0,
+    /** P95-P20 dynamic range in dB. Small = crushed master. */
+    val dynamicRangeDb: Double = 0.0,
     /**
      * Median fundamental over the head window's voiced frames, in Hz — the
      * only measurement that can contradict [key] before a pitch shift is

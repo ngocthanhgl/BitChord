@@ -43,10 +43,12 @@ object EqSchedule {
     )
 
     /**
-     * Swap duration in bars. The spec voices 2 bars for every downbeat swap;
-     * the table-driven types don't swap at all.
+     * Swap duration in bars. 1 bar (4 beats at eqSwapBeatSec): the LOW
+     * handover fires on the downbeat and completes one bar later. Actual
+     * seconds = eqSwapBeatSec * SWAP_BARS * 4 / deckRate. The table-driven
+     * types don't swap at all.
      */
-    /** DJ hard swap: the LOW handover completes in 2 beats on the fired downbeat.
+    /** DJ hard swap: the LOW handover completes in 1 bar on the fired downbeat.
      *  Value is bars; actual seconds = eqSwapBeatSec * SWAP_BARS * 4 / deckRate.
      */
     const val SWAP_BARS = 1.0
@@ -273,7 +275,9 @@ object EqSchedule {
             Key(0f, EqGains(1f, 0f, 0.40f)),
             Key(0.12f, EqGains(1f, 0f, 0.80f)),
             Key(0.22f, EqGains(1f, 0f, 1f)),
-            Key(0.32f, EqGains(1f, 0.35f, 1f)),
+            // Full-plan P3: 0.35 left a mid hole against entryRamp (B mids
+            // ~0.07 at 0.32 while A exits at 0.72) — raise to 0.50.
+            Key(0.32f, EqGains(1f, 0.50f, 1f)),
             Key(0.40f, EqGains(1f, 0.52f, 1f)),
             Key(0.60f, EqGains(1f, 0.78f, 1f)),
             Key(0.70f, EqGains.UNITY),

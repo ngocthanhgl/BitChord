@@ -1294,6 +1294,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 vocalActivityMask = mergeMasks(features.energyCurve.size, head?.vocalMask, tail?.vocalMask)
                     ?: features.vocalActivityMask,
                 vocalProbability = features.vocalProbability,
+                // Full-plan P4: master descriptors ride the whole-track pass.
+                loudnessLufs = features.loudnessLufs,
+                peakDbfs = features.peakDbfs,
+                dynamicRangeDb = features.dynamicRangeDb,
                 vocalPitchMedianHz = head?.pitch?.voicedMedianHz() ?: 0.0,
                 pitchConfidence = head?.pitch?.voicedMeanConfidence() ?: 0.0,
                 structureMap = structure.map,

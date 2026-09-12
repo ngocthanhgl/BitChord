@@ -28,6 +28,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import com.music.bitchord.data.TrackLog
+import com.music.bitchord.data.settings.AppSettings
 
 /**
  * The confidence-aware transition policy.
@@ -267,9 +268,12 @@ const val MIXSET_COOLDOWN_SLOPE_THRESHOLD = -0.002
 const val SILENCE_RMS_THRESHOLD = 0.08
 const val SILENCE_MIN_DURATION_SECONDS = 0.6
 /** v2 §9a: PLAIN_DISSOLVE reverb wet on the outgoing track. Voiced under the DSP cap. */
-const val PLAIN_DISSOLVE_REVERB_WET = 0.40
+// Full-plan P5: authored 0.40 exceeded DSP MAX_WET=0.34 and clipped ~1 dB
+// silently every dissolve — plan at or under the clamp from now on.
+const val PLAIN_DISSOLVE_REVERB_WET = 0.30
 /** v2 §9b: heavy-clash forced echo/reverb amounts (voiced under the DSP caps). */
-const val HEAVY_CLASH_REVERB_WET = 0.45
+// Full-plan P5: authored 0.45 clipped against MAX_WET=0.34 — cap it here.
+const val HEAVY_CLASH_REVERB_WET = 0.34
 const val HEAVY_CLASH_ECHO_AMOUNT = 0.50
 /** v2 §9b: reverb freeze point after transition start. */
 const val HEAVY_CLASH_FREEZE_OFFSET_SEC = 3.5
@@ -905,9 +909,14 @@ fun assessTransitionTier(
     // harmonic-ratio lock with trusted grids on both sides. beatConfidence
     // answers for the pair (floor), matchedRatio travels on the verdict for
     // the planner and executor.
+    // Full-plan P2 HALF_TEMPO lock: a user-facing boolean gate. On, the
+    // ±41% shared-grid effect routes to DJ_ASSISTED wash/cut instead —
+    // matchedRatio stays on the verdict for tests. Off = current behavior.
+    // (Never "clamp HALF to ±2%": that destroys the shared-grid invariant.)
+    val halfLocked = mixset && AppSettings.automixHalfTempoLock.value
     val tier = when {
         reasons.isEmpty() -> TransitionTier.BEATMATCHED
-        reasons.size == 1 && reasons[0] == "harmonic-ratio" -> TransitionTier.HALF_TIME
+        reasons.size == 1 && reasons[0] == "harmonic-ratio" && !halfLocked -> TransitionTier.HALF_TIME
         else -> TransitionTier.DJ_ASSISTED
     }
     return TransitionPolicyVerdict(
@@ -1837,8 +1846,11 @@ fun adjustedMixsetEntry(buildupStartSec: Double, analysis: TrackAnalysis, drop: 
     )
     var cursor = buildupStartSec + beat * 4
     while (cursor < maxAdvance) {
-        if (vocalAt(cursor) < MIXSET_ENTRY_VOCAL_ACCEPT) return cursor
-        cursor += beat
+        // Full-plan P0: search clean air bar by bar, then re-snap — a
+        // beat-stepped dodge that lands mid-phrase sings clean but mixes
+        // rhythmically wrong.
+        if (vocalAt(cursor) < MIXSET_ENTRY_VOCAL_ACCEPT) return snapToPhrase16(analysis, cursor)
+        cursor += beat * 4
     }
     return buildupStartSec
 }
@@ -2191,12 +2203,15 @@ fun fallbackMixsetAnchor(analysis: TrackAnalysis, from: Double, to: Double, base
     // short, but a calm point well before it beats riding far into vocals.
     val early = grid.filter { it <= base }.minByOrNull(::scored)
     val late = grid.filter { it > base }.minByOrNull(::scored)
-    return when {
+    val picked = when {
         late == null -> early
         early == null -> late
         scored(late) <= scored(early) + MIXSET_WAIT_TOLERANCE_SECONDS -> late
         else -> early
     } ?: base.coerceIn(from, to)
+    // Full-plan P0: Tier3 exits sit on the 16-bar grid like Tier1/2 —
+    // a mid-16 exit breaks the phrase symmetry every entry keeps.
+    return snapToPhrase16(analysis, picked).coerceIn(from, to)
 }
 
 /**

@@ -23,6 +23,7 @@
 package com.music.bitchord.playback.smart
 
 import com.music.bitchord.data.TrackLog
+import com.music.bitchord.data.settings.AppSettings
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -620,7 +621,11 @@ private fun halfTimeBlendPlan(
     val halfCeiling = if (mixset) djModeCeilingFor(TransitionType.HALF_TIME_BLEND) else ceilingFor(TransitionType.HALF_TIME_BLEND)
     val fadeSec = minOf(bars * 4 * sharedBeat, halfCeiling)
         .coerceAtLeast(MIN_TRANSITION_OVERLAP_SECONDS)
-    val transitionStart = max(0.0, mixAnchor - fadeSec)
+    // Full-plan P0: the longest blend starts on-grid, not raw.
+    val transitionStart = alignedTransitionStart(
+        analysis, max(0.0, mixAnchor - fadeSec), mixAnchor - 0.05,
+        preferEarlier = true, minimum = max(0.0, mixAnchor - halfCeiling), mixset = mixset,
+    )
     val keyShift = if (analysis.key.isNotBlank() && nextAnalysis.key.isNotBlank() &&
         keyScore(analysis.key, nextAnalysis.key) in 0.45..0.75 &&
         !(nextAnalysis.pitchConfidence >= TRUSTED_PITCH_CONFIDENCE &&
@@ -994,7 +999,11 @@ private fun loopCutPlan(
     val buildInSec = (mixAnchor - transitionStart) * rate
     // Capping only ever moves the start earlier (a longer quiet build into the
     // same drop), never later, so the drop arrival this plan promises holds.
-    val cue = capIncomingEntry(max(0.0, dropSnap - buildInSec), nextAnalysis, nextLength, mixset)
+    // Full-plan P0: snap the arithmetic cue back to grid before capping.
+    val rawCue = max(0.0, dropSnap - buildInSec)
+    val cue = capIncomingEntry(
+        snapToPhrase16(nextAnalysis, rawCue), nextAnalysis, nextLength, mixset,
+    )
     val started = playbackTime >= transitionStart
     return TransitionPlan(
         shouldStart = started,
@@ -1214,7 +1223,10 @@ private fun vocalAwareCutCue(nextAnalysis: TrackAnalysis, nextLength: Double): D
     val sings = windowVocal?.let { it >= VOCAL_ACTIVE_THRESHOLD }
         ?: (nextAnalysis.vocalProbability >= 0.62)
     val offset = if (sings) beat * 16 else 0.0
-    return capIncomingEntry(cue + offset, nextAnalysis, nextLength, mixsetActive = false)
+    // Full-plan P0: re-snap after the vocal offset — the dodge must not
+    // leave the cue mid-phrase. The entry cap stays last.
+    val snapped = snapToPhrase16(nextAnalysis, cue + offset)
+    return capIncomingEntry(snapped, nextAnalysis, nextLength, mixsetActive = false)
 }
 
 /**
@@ -1495,7 +1507,12 @@ private fun djSendEffectFor(
         }
     }
     if (trackCount > 0 && tailCount > 0 && tailSum / tailCount < 0.5 * trackSum / trackCount) {
-        return false to BLEND_REVERB_WET
+        // Full-plan P4: gain-stage the wash per master. A crushed hot master
+        // (small dynamic range, peak near 0) needs less wash — two wets on a
+        // hot master clip the DSP short clamp. 0.0 range = unmeasured: no-op.
+        val crushed = analysis.dynamicRangeDb in 0.01..5.0 && analysis.peakDbfs > -3.0
+        val crushScale = if (crushed) 0.6 else 1.0
+        return false to BLEND_REVERB_WET * crushScale
     }
     return false to 0.0
 }
@@ -1669,8 +1686,12 @@ fun planWsolaTransition(
     // phrase-switch ceiling when the pair asked for mixset — the intro length
     // still bounds it via availableFadeBeats below, and the clash shrink loop
     // keeps vocals safe.
-    val overlapCeilingSeconds = if (mixset) 32.0 else MAX_OVERLAP_SECONDS
-    val maxFadeBeats = if (mixset) 48 else MAX_FADE_BEATS
+    // Full-plan P0: 16-bar beds need headroom the old 48-beat/32 s pair
+    // could not give (adaptive already allows 64 beats). Beats follow
+    // djModeMaxBeats(HARMONIC_BLEND)=64; seconds follow the user setting
+    // (default 32.0) so long beds fit without touching stock caps.
+    val overlapCeilingSeconds = if (mixset) AppSettings.mixsetOverlapCeilingSeconds.value.toDouble() else MAX_OVERLAP_SECONDS
+    val maxFadeBeats = if (mixset) 64 else MAX_FADE_BEATS
     val cappedByOverlap = floor(floor(overlapCeilingSeconds / incomingBeatSeconds) / 4).toInt() * 4
     if (cappedByOverlap < MIN_FADE_BEATS) return WsolaPlanResult.Refused("overlap-too-long")
     var fadeBeats = minOf(
@@ -1735,7 +1756,12 @@ fun planWsolaTransition(
     if (incomingCueTime < audibleStart - 0.05) return WsolaPlanResult.Refused("incoming-no-runway")
 
     val startTarget = overlapEndTarget - outgoingOverlapSeconds
-    val transitionStart = nearestAtOrBefore(analysis.downbeats, startTarget) ?: startTarget
+    // Full-plan P0: the flagship path starts on phrase 1, not mid-phrase.
+    // alignedTransitionStart runs the 16-bar -> 8-bar -> downbeat chain.
+    val transitionStart = alignedTransitionStart(
+        analysis, startTarget, overlapEndTarget,
+        preferEarlier = true, minimum = MIN_CLEARANCE_SECONDS, mixset = mixset,
+    )
     if (transitionStart < MIN_CLEARANCE_SECONDS) return WsolaPlanResult.Refused("outgoing-too-short")
     val transitionEnd = transitionStart + outgoingOverlapSeconds
     if (transitionEnd > outgoingLength + 0.05) return WsolaPlanResult.Refused("outgoing-overlap-overruns")
@@ -1977,8 +2003,9 @@ private fun adaptiveOverlap(
                 AUTO_TRANSITION_MAX_SECONDS,
             ),
             transitionBeats = stockBeats,
-            incomingPlaybackRate = if (ratio in 0.9..1.1) {
-                (clamp(1 / ratio, 0.9, 1.1) * 10000).roundToInt() / 10000.0
+            // Full-plan P2: ±8% DJ rule, not ±10%.
+            incomingPlaybackRate = if (ratio in 0.92..1.08) {
+                (clamp(1 / ratio, 0.92, 1.08) * 10000).roundToInt() / 10000.0
             } else {
                 1.0
             },
@@ -2023,8 +2050,9 @@ private fun adaptiveOverlap(
             if (mixset) djModeCeilingFor(type) else ceilingFor(type),
         ),
         transitionBeats = transitionBeats,
-        incomingPlaybackRate = if (ratio in 0.9..1.1) {
-            (clamp(1 / ratio, 0.9, 1.1) * 10000).roundToInt() / 10000.0
+        // Full-plan P2: ±8% DJ rule, not ±10%.
+        incomingPlaybackRate = if (ratio in 0.92..1.08) {
+            (clamp(1 / ratio, 0.92, 1.08) * 10000).roundToInt() / 10000.0
         } else {
             1.0
         },
@@ -2760,7 +2788,11 @@ private fun planTransitionInner(
                 val valley = window.filter { it.time < peak.time - beat * 0.5 }
                     .minByOrNull { it.energy }?.time
                 if (valley != null) {
+                    // Full-plan P0: dodge onto phrase 1, not just a downbeat —
+                    // mixing out before the last fill belongs ON the phrase.
                     val snapped = timedValueNearOrBefore(
+                        phrase16Grid(analysis), valley, max(1.5, beat * 8), transitionStart,
+                    ) ?: timedValueNearOrBefore(
                         analysis.downbeats, valley, max(0.75, beat * 2), transitionStart,
                     ) ?: valley
                     if (snapped > transitionStart + MIN_TRANSITION_OVERLAP_SECONDS &&
