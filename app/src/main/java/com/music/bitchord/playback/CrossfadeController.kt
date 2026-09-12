@@ -372,6 +372,12 @@ class CrossfadeController(
         val mixRecipe: MixRecipe = MixRecipe.INSTRUMENTAL_BED,
         /** DJ-EQ spec: false = leave both decks at unity (standard fades). */
         val eqEnabled: Boolean = false,
+        /**
+         * Automix-restore: true when this render was armed by DJ Mode. Normal
+         * Automix renders stock (flat gains, no mute disposal, no vocal
+         * filter rides); all DJ voicing below keys off this flag.
+         */
+        val mixset: Boolean = false,
         /** DJ-EQ spec: A sings in the transition zone — duck its mids. */
         val duckAMids: Boolean = false,
         /** DJ-EQ spec: B enters singing — delay its mids. */
@@ -1176,7 +1182,9 @@ class CrossfadeController(
         // the next downbeat after it. Pre-snapped here (grids are ARM-time
         // data); the fade only compares progress against it.
         val swapProgress = EqSchedule.BASS_SWAP_PROGRESS[plan.type]
-        val eqSwapFireProgress = if (swapProgress != null && plan.fadeSeconds > 0) {
+        // Stock upstream on normal Automix: no schedule snap (+Inf), so the
+        // legacy SVF bass swap below runs. DJ Mode keeps the downbeat snap.
+        val eqSwapFireProgress = if (mixset && swapProgress != null && plan.fadeSeconds > 0) {
             val beatSec = currentAnalysis?.beatInterval?.takeIf { it > 0 } ?: 0.0
             val ideal = plan.transitionStart + swapProgress * plan.fadeSeconds
             val snap = currentAnalysis?.downbeats?.firstOrNull { it > ideal }
@@ -1239,7 +1247,10 @@ class CrossfadeController(
                 keyScore = plan.score.key,
                 overlapSeconds = plan.fadeSeconds,
                 eqType = plan.type,
-                eqEnabled = true,
+                // Stock upstream on normal Automix: flat unity, no EQ voicing.
+                // DJ Mode keeps the schedule ride.
+                eqEnabled = mixset,
+                mixset = mixset,
                 mixRecipe = mixRecipe,
                 duckAMids = duckAMids,
                 delayBMids = delayBMids,
@@ -1475,11 +1486,11 @@ class CrossfadeController(
         // Blueprint §5.2: the key shift rides as pitch, independent of the
         // tempo stretch — Sonic (already in the chain) renders both at once,
         // and shifting pitch leaves the beat grid exactly where the stretch
-        // put it.
+        // put it. Stock upstream on normal Automix: speed only, no pitch.
         into.setPlaybackParameters(
             PlaybackParameters(
                 (AppSettings.playbackSpeed.value * incomingPlaybackRate).toFloat(),
-                2.0.pow(render.keyShiftSemitones / 12.0).toFloat(),
+                if (render.mixset) 2.0.pow(render.keyShiftSemitones / 12.0).toFloat() else 1f,
             ),
         )
         into.volume = 0f
@@ -1898,11 +1909,13 @@ class CrossfadeController(
             -> Float.MAX_VALUE // exempt: flip owns the handoff
             else -> 0.80f
         }
-        if (smartFadeActive && outProgress >= muteCutoff) {
+        // Stock upstream on normal Automix and on manual fades: gains run
+        // to 1, no disposal. The mute below stays DJ-only.
+        if (render.mixset && smartFadeActive && outProgress >= muteCutoff) {
             out.volume = muteRampGain(out.volume)
             eqFilters.outgoing(0f, 0f, 0f)
             dryKilled = true
-        } else if (!smartFadeActive && progress >= 0.80f) {
+        } else if (render.mixset && !smartFadeActive && progress >= 0.80f) {
             out.volume = muteRampGain(out.volume)
         }
         // v2 §7d/§11.2: no shelf on the processor, so the "low-shelf +3dB"
@@ -2310,13 +2323,19 @@ class CrossfadeController(
     private fun rideFilters(progress: Float, inProgress: Float) {
         // Resonance belongs to the sweep gesture only; every other style
         // re-parks it so a previous DJ_FILTER transition never leaks Q.
-        if (render.style != TransitionStyle.DJ_FILTER) filters.setResonance(1.0f)
+        // Stock upstream on normal Automix: no Q voicing at all (the ARM-time
+        // park in begin() already covers cross-blend leaks, silently).
+        if (render.mixset && render.style != TransitionStyle.DJ_FILTER) filters.setResonance(1.0f)
         when (render.style) {
             TransitionStyle.DJ_FILTER -> {
                 // Review v2.1 C1: resonant sweep on the outgoing low-pass.
-                filters.setResonance(TransitionFilterProcessor.FILTER_SWEEP_Q_FACTOR)
-                rideFilterSweep(progress)
-                rideMidKill(progress)
+                if (render.mixset) {
+                    filters.setResonance(TransitionFilterProcessor.FILTER_SWEEP_Q_FACTOR)
+                    rideFilterSweep(progress)
+                    rideMidKill(progress)
+                } else {
+                    rideFilterSweep(progress)
+                }
             }
             TransitionStyle.DJ_BLEND ->
                 // Full-audit P2 C5: a single swap event. The DJ-EQ schedule
@@ -2609,7 +2628,9 @@ class CrossfadeController(
         // Both endpoints scaled by the collision, so a marginal clash is nudged
         // and a full one is properly separated, rather than everything getting
         // the same treatment at different speeds.
-        val floor = glide(open, VOCAL_SEPARATION_FLOOR_HZ, amount)
+        // Stock upstream on normal Automix: 1.6 kHz floor. DJ Mode keeps
+        // the warmer 300 Hz floor.
+        val floor = glide(open, if (render.mixset) VOCAL_SEPARATION_FLOOR_HZ else STOCK_VOCAL_SEPARATION_FLOOR_HZ, amount)
         filters.outgoing(
             glide(open, floor, progress.toDouble().pow(FILTER_SWEEP_SHAPE)).toFloat(),
             TransitionFilterProcessor.OFF_HZ,
@@ -2672,10 +2693,14 @@ class CrossfadeController(
         // masking corner and relaxes to the normal entry over the first 25 %
         // of the overlap; otherwise the bass-only entry applies throughout.
         val clashMask = render.keyScore < 0.50
-        val entryTop = if (clashMask && progress < 0.25f) {
+        // Stock upstream on normal Automix: flat 1.2 kHz entry, no clash
+        // exception. DJ Mode keeps the masking corner below.
+        val entryTop = if (render.mixset && clashMask && progress < 0.25f) {
             glide(ENTRY_CLASH_HIGH_PASS_HZ, ENTRY_HIGH_PASS_HZ, (progress / 0.25f).toDouble())
-        } else {
+        } else if (render.mixset) {
             ENTRY_HIGH_PASS_HZ
+        } else {
+            STOCK_ENTRY_HIGH_PASS_HZ
         }
         filters.incoming(
             TransitionFilterProcessor.OPEN_HZ,
@@ -2741,7 +2766,9 @@ class CrossfadeController(
         val swapAt = render.bassSwapFraction.coerceIn(0.05, 0.95)
         // 0 before the swap window, 1 after it: how much of the low end has
         // changed hands.
-        val handover = ((progress - swapAt) / BASS_SWAP_WIDTH * 0.5 + 0.5).coerceIn(0.0, 1.0)
+        // Stock upstream on normal Automix: 0.10 width. DJ Mode keeps V2.
+        val width = if (render.mixset) BASS_SWAP_WIDTH else STOCK_BASS_SWAP_WIDTH
+        val handover = ((progress - swapAt) / width * 0.5 + 0.5).coerceIn(0.0, 1.0)
         // The incoming track's own low end is already being held out by the
         // swap, so whichever corner sits higher is the one doing the work.
         // Scaled up by however much the two are actually singing over each other.
@@ -2979,6 +3006,8 @@ class CrossfadeController(
 
         /** How much of the fade the low end takes to change hands. */
         const val BASS_SWAP_WIDTH = BASS_SWAP_WIDTH_V2
+        /** Stock upstream (7039430) swap width, used on normal Automix. */
+        const val STOCK_BASS_SWAP_WIDTH = 0.10
 
         /**
          * Shape of the outgoing low-pass against fade progress, between
@@ -3014,7 +3043,9 @@ class CrossfadeController(
          * key-clash case, where ENTRY_CLASH_HIGH_PASS_HZ temporarily restores
          * the masking.)
          */
-        const val ENTRY_HIGH_PASS_HZ = 220.0
+         const val ENTRY_HIGH_PASS_HZ = 220.0
+        /** Stock upstream (7039430) entry corner, used on normal Automix. */
+        const val STOCK_ENTRY_HIGH_PASS_HZ = 1200.0
 
         /**
          * Review v2.1 A4 exception: when the pair clashes in key
@@ -3078,7 +3109,9 @@ class CrossfadeController(
          * only the bass still avoids the double-bass the separation exists
          * for, and leaves mids, snare body and warmth alone.
          */
-        const val VOCAL_SEPARATION_FLOOR_HZ = 300.0
+         const val VOCAL_SEPARATION_FLOOR_HZ = 300.0
+        /** Stock upstream (7039430) separation floor, used on normal Automix. */
+        const val STOCK_VOCAL_SEPARATION_FLOOR_HZ = 1600.0
 
         /**
          * Where the incoming track's high-pass starts in [rideVocalSeparation].
