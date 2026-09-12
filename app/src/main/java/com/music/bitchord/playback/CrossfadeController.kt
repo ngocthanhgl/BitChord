@@ -428,6 +428,12 @@ class CrossfadeController(
     // the handoff. Armed in finish(), fired in tick(), flushed in begin().
     private var pendingRetirePlayer: ExoPlayer? = null
     private var pendingRetireAtMs: Long = 0L
+    // dj echo throw (F1): stepped wet close so the send glides to 0 over
+    // THROW_CLOSE_MS instead of snapping one-tick. Armed in finish(),
+    // stepped in tick(), flushed in begin().
+    private var pendingEchoCloseFromWet = 0f
+    private var pendingEchoCloseDelaySec = 0f
+    private var pendingEchoCloseStartMs = -1L
     // DJ brake (F2): last committed brake rate, for coalesced per-tick ramps.
     private var lastBrakeRate: Float = 1f
     private val EFFECT_COOLDOWN_BLENDS = 2
@@ -808,6 +814,18 @@ class CrossfadeController(
         if (pendingRetirePlayer != null && SystemClock.elapsedRealtime() >= pendingRetireAtMs) {
             pendingRetirePlayer?.let(::retire)
             pendingRetirePlayer = null
+        }
+        // dj echo throw (F1): stepped wet close armed in finish() — linear
+        // to 0 over THROW_CLOSE_MS through the existing outgoing() target,
+        // each step smoothed further by the processor's own per-block glide.
+        if (pendingEchoCloseStartMs >= 0L) {
+            val t = (SystemClock.elapsedRealtime() - pendingEchoCloseStartMs).toFloat() / THROW_CLOSE_MS
+            if (t >= 1f) {
+                echoFilters.outgoing(0f, pendingEchoCloseDelaySec)
+                pendingEchoCloseStartMs = -1L
+            } else {
+                echoFilters.outgoing(pendingEchoCloseFromWet * (1f - t), pendingEchoCloseDelaySec)
+            }
         }
 
         // Every tick, not only when a transition can be planned. This used to
@@ -1494,6 +1512,12 @@ class CrossfadeController(
         // over a player that is still (silently) playing.
         pendingRetirePlayer?.let(::retire)
         pendingRetirePlayer = null
+        // flush a stepped close still in flight too: park the send shut, or
+        // its leftover wet would voice on the fresh decks.
+        if (pendingEchoCloseStartMs >= 0L) {
+            echoFilters.outgoing(0f, pendingEchoCloseDelaySec)
+            pendingEchoCloseStartMs = -1L
+        }
         // Missed-window fix F4: an accepted arm ends the storm.
         consecutiveBailCount = 0
         bailCooldownUntilMs = 0L
@@ -2047,7 +2071,14 @@ class CrossfadeController(
             out.playbackState == Player.STATE_ENDED ||
             out.playbackState == Player.STATE_IDLE ||
             settingSwitchedOff
-        if (done) {
+        // span-narrow clamp: an incoming cap tightening effSpan mid-fade must
+        // not fire done inside the 120 ms mute ramp — the ramp always lands
+        // before finish(). untripped (start < 0) reads settled, so only a
+        // live ramp ever holds the gate.
+        val muteSettled = muteRampStartMs < 0L ||
+            SystemClock.elapsedRealtime() - muteRampStartMs >= BAIL_MS
+        val gatedDone = done && muteSettled
+        if (gatedDone) {
             // Early done (natural end, cap clamp, toggled off) lands finish()
             // at progress < 1, where its volume/tempo snaps are audible. A
             // micro-fade here covers the settle; a completed fade skips it —
@@ -2171,25 +2202,17 @@ class CrossfadeController(
         // unconditional setPlaybackParameters re-prepares ExoPlayer's audio
         // pipeline at full volume — the end-of-mix snap on every plain blend.
         val rateApplied = incomingPlaybackRate != 1.0 || render.keyShiftSemitones != 0
-        // Unconditional and idempotent, like the speed reset below: correct
-        // whether or not this transition ever filtered anything. Skipped on a
-        // normal completion (lastProgress ~= 1): the outgoing deck is disposed
-        // and re-parking 4 processors at full incoming volume only pumps the
-        // join (DJ end-click fix). begin() re-parks everything while silent,
-        // so no hygiene is lost. Kept on early-done for reuse safety.
-        if (lastProgress < 0.98f) {
-            filters.open()
-            echoFilters.open()
-            reverbFilters.open()
-            eqFilters.open()
-        }
+        // early-done leaves dsp as-is: no re-park here. begin() re-parks
+        // everything while silent before next audible use, and re-parking at
+        // full incoming volume only pumps the join.
         // DJ effects (F1/F3) bookkeeping, captured before Render() is parked
         // below: whether this blend carried a throw/brake, and the throw's
-        // delay for closing the send at the handoff.
+        // delay + amount for closing the send at the handoff.
         val hadEffect = render.mixset && (render.echoThrow || render.brake)
         val wasDj = render.mixset
         val throwBlend = render.mixset && render.echoThrow
         val throwDelaySec = render.echoBeatSeconds
+        val throwAmount = render.echoAmount
         render = Render()
 
         if (handedOff) {
@@ -2218,25 +2241,31 @@ class CrossfadeController(
                 // untouched decks hold exactly (speed├ù1.0, pitch 2^0).
                 val live = it.playbackParameters
                 val rateActuallyOff = live.speed != AppSettings.playbackSpeed.value || live.pitch != 1f
-                if (rateApplied && !deckRateReset &&
+                // early-done leaves the deck rate as-is: resetting mid-glide
+                // re-prepares the pipeline at full volume (end-of-mix snap).
+                if (rateApplied && !deckRateReset && lastProgress >= 0.98f &&
                     (tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02 || rateActuallyOff)
                 ) {
                     it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
                 }
             }
-            // DJ echo throw (F1): close the send so the line stops taking new
-            // feed and rings its residual ~2 s, then retire the deck late
-            // (see tick()) so the tail survives the handoff. Guarded by
-            // remaining audio: a track ending under 3 s has no tail to ring.
+            // DJ echo throw (F1): step the send shut so the line stops taking
+            // new feed and rings its residual ~2 s, then retire the deck late
+            // (see tick()) so the tail survives the handoff — short tails
+            // included, the deck is silent or ending anyway.
             if (throwBlend) {
-                echoFilters.outgoing(0f, throwDelaySec.toFloat())
-                val tailRoom = (outgoing?.duration ?: 0L) - (outgoing?.currentPosition ?: 0L)
-                if (tailRoom > 3000L) {
-                    pendingRetirePlayer = outgoing
-                    pendingRetireAtMs = SystemClock.elapsedRealtime() + 2500L
-                } else {
-                    outgoing?.let(::retire)
-                }
+                // stepped close, not one-tick: tick() glides the send to 0
+                // over THROW_CLOSE_MS. from-wet mirrors rideDjSend's attack
+                // at the finish tick, so the first step continues the voice.
+                // capped at MAX_WET (0.5, private to the processor).
+                val attack = ((lastProgress - 0.55f) / 0.15f).coerceIn(0f, 1f)
+                pendingEchoCloseFromWet = (throwAmount * attack).toFloat().coerceIn(0f, 0.5f)
+                pendingEchoCloseDelaySec = throwDelaySec.toFloat()
+                pendingEchoCloseStartMs = SystemClock.elapsedRealtime()
+                // late retire either way, short tails included: the deck is
+                // silent or ending, and begin() flushes an overlapping arm.
+                pendingRetirePlayer = outgoing
+                pendingRetireAtMs = pendingEchoCloseStartMs + 2500L
             } else {
                 outgoing?.let(::retire)
             }
@@ -3013,6 +3042,13 @@ class CrossfadeController(
 
         /** Ramp used when a fade is interrupted. */
         const val BAIL_MS = 120L
+
+        /**
+         * The throw send closes over this long, stepped in tick() through
+         * the existing outgoing() target — same wall-clock order as the
+         * bail/mute ramps, inaudible as a move.
+         */
+        const val THROW_CLOSE_MS = 200L
 
         /**
          * The INSTANT flip settles over this long instead of stepping: the
