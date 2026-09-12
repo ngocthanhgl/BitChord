@@ -1288,6 +1288,8 @@ class PlaybackService : MediaLibraryService() {
 
                 override fun outgoing(gainDb: Float) =
                     spareLoudness.setGainDb(gainDb)
+
+                override fun open() = Unit
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
