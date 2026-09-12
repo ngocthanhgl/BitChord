@@ -1490,6 +1490,11 @@ class CrossfadeController(
         // first FADING tick, and a wet start on a zeroed delay line renders dry
         // silence building up, not a burst.
         filters.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        // Tempo/pitch-leak fix G2: park the sweep resonance while silent.
+        // open() parks Q, but begin() only aims cutoffs ΓÇö a DJ_FILTER arm's
+        // Q=1.8 would otherwise meet the next transition's first sweep
+        // target mid-glide. Neutral Q is unity-adjacent, inaudible.
+        filters.setResonance(TransitionFilterProcessor.NEUTRAL_Q)
         // DJ-EQ spec: park both decks at unity while still silent. Same
         // outgoing-route reasoning as the filter above — and the swap machine
         // rearms here with every other per-transition flag.
@@ -2122,7 +2127,17 @@ class CrossfadeController(
                 // on every beatmatched blend. And skipped when bail() already
                 // restored the rate at partial gain (deckRateReset) — a
                 // second commit here lands at full volume.
-                if (rateApplied && !deckRateReset && tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02) {
+                // Tempo/pitch-leak fix G1: the glide gate above measures the
+                // glide at the END (Γëê0 on every completed blend), not the rate
+                // actually on the deck ΓÇö a blend that rode 1.08x home reads
+                // "converged" and keeps 1.08x for the whole next track. Compare
+                // live against desired instead: exact compare is safe because
+                // untouched decks hold exactly (speed├ù1.0, pitch 2^0).
+                val live = it.playbackParameters
+                val rateActuallyOff = live.speed != AppSettings.playbackSpeed.value || live.pitch != 1f
+                if (rateApplied && !deckRateReset &&
+                    (tempoGlideFactor(lastProgress, incomingPlaybackRate) > 0.02 || rateActuallyOff)
+                ) {
                     it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
                 }
             }
