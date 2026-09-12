@@ -370,6 +370,18 @@ class CrossfadeController(
          * actors perform it without re-deciding. Default is the neutral bed.
          */
         val mixRecipe: MixRecipe = MixRecipe.INSTRUMENTAL_BED,
+        /**
+         * DJ echo throw (F1): the outgoing tail earned a beat-synced vocal
+         * echo (see TransitionPlan.echoThrow). rideFilters voices it through
+         * the echo send; finish() closes the send and retires the deck late
+         * so the tail rings past the handoff. DJ-only.
+         */
+        val echoThrow: Boolean = false,
+        /**
+         * DJ brake (F2): dive the outgoing deck rate toward a stop over the
+         * last quarter of the blend. driveFade voices it per tick. DJ-only.
+         */
+        val brake: Boolean = false,
         /** DJ-EQ spec: false = leave both decks at unity (standard fades). */
         val eqEnabled: Boolean = false,
         /**
@@ -412,6 +424,17 @@ class CrossfadeController(
     )
 
     private var fadeStartedAt = 0L
+    // DJ echo throw (F1): a deck retired late so its echo tail rings past
+    // the handoff. Armed in finish(), fired in tick(), flushed in begin().
+    private var pendingRetirePlayer: ExoPlayer? = null
+    private var pendingRetireAtMs: Long = 0L
+    // DJ brake (F2): last committed brake rate, for coalesced per-tick ramps.
+    private var lastBrakeRate: Float = 1f
+    private val EFFECT_COOLDOWN_BLENDS = 2
+    // F3 rotation: smart blends since the last effected one. The planner is
+    // pure and cannot count, so this counter enforces the cooldown at Render
+    // mapping (at most one effected blend per EFFECT_COOLDOWN_BLENDS).
+    private var blendsSinceEffect: Int = EFFECT_COOLDOWN_BLENDS
     // v2 §7d/§11.2: downbeat-emphasis cursor into render.halfTimeEmphasis.
     // A pulse fires once per offset even across pause-parked ticks; the pulse
     // itself is applied after rideFilters so it wins for exactly one tick
@@ -779,6 +802,12 @@ class CrossfadeController(
         // after it the outgoing tail does.
         if (phase == Phase.FADING || phase == Phase.BAILING) {
             outgoing?.playWhenReady = incoming?.playWhenReady ?: true
+        }
+        // DJ echo throw (F1): fire the late retire armed in finish(), so the
+        // echo tail gets ~2.5 s to ring past the handoff before the deck stops.
+        if (pendingRetirePlayer != null && SystemClock.elapsedRealtime() >= pendingRetireAtMs) {
+            pendingRetirePlayer?.let(::retire)
+            pendingRetirePlayer = null
         }
 
         // Every tick, not only when a transition can be planned. This used to
@@ -1205,6 +1234,11 @@ class CrossfadeController(
             vocalOverlap = plan.vocalOverlap,
             dropConfidence = nextAnalysis?.dropConfidence,
         )
+        // F3 rotation: at most one effected blend per cooldown window
+        // (EFFECT_COOLDOWN_BLENDS). The planner is pure and cannot count
+        // past blends, so the controller strips throw/brake here when the
+        // last effect was too recent. Normal Automix never carries effects.
+        val effectAllowed = !mixset || blendsSinceEffect >= EFFECT_COOLDOWN_BLENDS
         if (!begin(
             fade,
             endMs = (plan.transitionEnd * 1000).roundToLong(),
@@ -1219,6 +1253,7 @@ class CrossfadeController(
                 vocalOverlap = plan.vocalOverlap,
                 volumeCurve = plan.volumeCurve,
                 echoAmount = plan.echoAmount,
+                echoThrow = plan.echoThrow && effectAllowed,
                 // v2 §7b: the dub throw repeats every HALF beat; a sync-less
                 // PLAIN pair gets a fixed 375 ms slapback instead of a grid it
                 // cannot hold.
@@ -1251,6 +1286,7 @@ class CrossfadeController(
                 // DJ Mode keeps the schedule ride.
                 eqEnabled = mixset,
                 mixset = mixset,
+                brake = plan.brake && effectAllowed,
                 mixRecipe = mixRecipe,
                 duckAMids = duckAMids,
                 delayBMids = delayBMids,
@@ -1452,6 +1488,12 @@ class CrossfadeController(
         lastCommittedRate = null
         lastRateCommitAt = 0L
         deckRateReset = false
+        lastBrakeRate = 1f
+        // DJ echo throw (F1): a new arm takes the decks now — flush any tail
+        // still waiting out its late retire, or the new standby would prepare
+        // over a player that is still (silently) playing.
+        pendingRetirePlayer?.let(::retire)
+        pendingRetirePlayer = null
         // Missed-window fix F4: an accepted arm ends the storm.
         consecutiveBailCount = 0
         bailCooldownUntilMs = 0L
@@ -1969,6 +2011,27 @@ class CrossfadeController(
             }
         }
 
+        // DJ brake (F2): dive the outgoing deck toward a stop over the last
+        // quarter of the blend. Varispeed feel: pitch slaved to rate, so the
+        // music falls in pitch as it slows — a turntable power-off, not a
+        // pitch-held slowdown. Quadratic dive, floored at 0.1 (Sonic rejects
+        // non-positive speeds; the handoff/retire takes the deck from there).
+        // Coalesced at 0.5%: ~15 commits over the dive, not 33. Entry may
+        // step down up to 6% when the pair needed a stretch — the stretch is
+        // exactly what the brake replaces, and the step lands deep in the
+        // blend under a falling dry path. Incoming deck untouched.
+        if (render.mixset && render.brake && outProgress >= 0.75f) {
+            val brakeT = ((outProgress - 0.75f) / 0.25f).coerceIn(0f, 1f)
+            val speed = AppSettings.playbackSpeed.value
+            val brakeRate = (speed * (1f - brakeT * brakeT * 0.97f)).coerceAtLeast(0.1f * speed)
+            val brakePitch = (brakeRate / speed.coerceAtLeast(1e-6f)).coerceIn(0.1f, 1f)
+            val last = lastBrakeRate
+            if (abs(brakeRate - last) / last.coerceAtLeast(1e-6f) >= 0.005f) {
+                out.setPlaybackParameters(PlaybackParameters(brakeRate, brakePitch))
+                lastBrakeRate = brakeRate
+            }
+        }
+
         // Whichever comes first: the fade running its course, the old track
         // genuinely ending, the tail failing outright, or whichever setting
         // armed this fade being switched off mid-blend. Checked against the
@@ -2120,6 +2183,13 @@ class CrossfadeController(
             reverbFilters.open()
             eqFilters.open()
         }
+        // DJ effects (F1/F3) bookkeeping, captured before Render() is parked
+        // below: whether this blend carried a throw/brake, and the throw's
+        // delay for closing the send at the handoff.
+        val hadEffect = render.mixset && (render.echoThrow || render.brake)
+        val wasDj = render.mixset
+        val throwBlend = render.mixset && render.echoThrow
+        val throwDelaySec = render.echoBeatSeconds
         render = Render()
 
         if (handedOff) {
@@ -2154,7 +2224,22 @@ class CrossfadeController(
                     it.setPlaybackParameters(PlaybackParameters(AppSettings.playbackSpeed.value, 1f))
                 }
             }
-            outgoing?.let(::retire)
+            // DJ echo throw (F1): close the send so the line stops taking new
+            // feed and rings its residual ~2 s, then retire the deck late
+            // (see tick()) so the tail survives the handoff. Guarded by
+            // remaining audio: a track ending under 3 s has no tail to ring.
+            if (throwBlend) {
+                echoFilters.outgoing(0f, throwDelaySec.toFloat())
+                val tailRoom = (outgoing?.duration ?: 0L) - (outgoing?.currentPosition ?: 0L)
+                if (tailRoom > 3000L) {
+                    pendingRetirePlayer = outgoing
+                    pendingRetireAtMs = SystemClock.elapsedRealtime() + 2500L
+                } else {
+                    outgoing?.let(::retire)
+                }
+            } else {
+                outgoing?.let(::retire)
+            }
         } else {
             // The transition never became audible, so the session player never
             // moved and the standby is the one to throw away. The session
@@ -2166,6 +2251,9 @@ class CrossfadeController(
             incoming?.let(::retire)
         }
 
+        // F3 rotation: only DJ blends advance the cooldown (manual fades and
+        // normal Automix leave it alone).
+        if (wasDj) blendsSinceEffect = if (hadEffect) 0 else blendsSinceEffect + 1
         outgoing = null
         incoming = null
         handedOff = false
@@ -2320,6 +2408,25 @@ class CrossfadeController(
         eqFilters.incoming(lowIn, into.mid * entryRamp, into.high * entryRamp)
     }
 
+    /**
+     * DJ send-driving arm (F1 throw / F3 wash): voices the echo throw and the
+     * reverb wash bed on DJ_BLEND/DJ_FILTER, alongside (not instead of) the
+     * filter path — sends and filters address different buses. Throw: linear
+     * attack from progress 0.55 to 0.70, then held; the dry path mutes at
+     * 0.80/0.95 and finish() closes the send, so the line rings its residual
+     * ~2 s past the handoff. Wash: bloom over the first half.
+     */
+    private fun rideDjSend(progress: Float) {
+        if (render.echoThrow && render.echoAmount > 0.0 && render.echoBeatSeconds > 0.0) {
+            val attack = ((progress - 0.55f) / 0.15f).coerceIn(0f, 1f)
+            echoFilters.outgoing((render.echoAmount * attack).toFloat(), render.echoBeatSeconds.toFloat())
+        }
+        if (!render.echoThrow && render.reverbAmount > 0.0) {
+            val bloom = (progress * 2f).coerceIn(0f, 1f)
+            reverbFilters.outgoing((render.reverbAmount * bloom).toFloat(), false)
+        }
+    }
+
     private fun rideFilters(progress: Float, inProgress: Float) {
         // Resonance belongs to the sweep gesture only; every other style
         // re-parks it so a previous DJ_FILTER transition never leaks Q.
@@ -2330,6 +2437,10 @@ class CrossfadeController(
             TransitionStyle.DJ_FILTER -> {
                 // Review v2.1 C1: resonant sweep on the outgoing low-pass.
                 if (render.mixset) {
+                    // DJ effects (F1/F3): sends stack with the sweep.
+                    if (render.echoThrow || render.reverbAmount > 0.0) {
+                        rideDjSend(progress)
+                    }
                     filters.setResonance(TransitionFilterProcessor.FILTER_SWEEP_Q_FACTOR)
                     rideFilterSweep(progress)
                     rideMidKill(progress)
@@ -2338,6 +2449,12 @@ class CrossfadeController(
                 }
             }
             TransitionStyle.DJ_BLEND ->
+                // DJ effects (F1/F3): the send-driving arm runs alongside the
+                // filter path below — a throw/wash is a send move, the swap
+                // and separation are filter moves, and they stack by design.
+                if (render.mixset && (render.echoThrow || render.reverbAmount > 0.0)) {
+                    rideDjSend(progress)
+                }
                 // Full-audit P2 C5: a single swap event. The DJ-EQ schedule
                 // owns the low-end handover (downbeat-snapped fire + smooth
                 // 1-bar trade in rideEq); the legacy SVF bass swap below runs
