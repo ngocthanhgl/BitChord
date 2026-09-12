@@ -441,6 +441,25 @@ class CrossfadeController(
     // (masked by the 120 ms bail ramp); finish() must not commit a second
     // pipeline re-prepare at full volume for the same restore.
     private var deckRateReset = false
+    // Missed-window fix F1: the service's quality upgrade cuts the session
+    // source out from under an arm (replaceMediaItem + seekTo + prepare).
+    // The service exempts its own bookkeeping via swappingMediaId, but this
+    // listener never got the memo ΓÇö every swap read as "queue replaced" and
+    // bailed the arm. The service calls [noteSwapCut] before each cut; while
+    // the latch is fresh and the session still shows that id, discontinuities
+    // are the swap landing, not a user action. Timestamped, not cleared on
+    // use: a revert re-latches, and staleness expires on its own so a missed
+    // clear can never mute genuine bails for more than the window below.
+    private var swapCutMediaId: String? = null
+    private var swapCutAtMs: Long = 0L
+    // Missed-window fix F4: escalating re-arm damping. A bail storm (swap,
+    // error, repeat cut) re-arms on the next 250 ms tick straight into the
+    // next cut; each consecutive bail without an accepted arm in between
+    // holds the planner longer, up to the ceiling. Reset on begin() (an arm
+    // was accepted ΓÇö the storm is over) and on natural auto-advance (new
+    // pair, new context).
+    private var consecutiveBailCount = 0
+    private var bailCooldownUntilMs = 0L
     // Full-audit P2: latched fade span (see driveFade). Rearmed in begin().
     private var spanLatched = 0L
     // Full-audit P2 S1: live vocal flags (see updateLiveVocalFlags).
@@ -614,6 +633,26 @@ class CrossfadeController(
     fun msSinceTransition(): Long? =
         settledAt.takeIf { it != 0L }?.let { SystemClock.elapsedRealtime() - it }
 
+    /**
+     * Called by the service immediately before a quality-swap cut
+     * (replaceMediaItem + seekTo + prepare on the session player). See [swapCutMediaId].
+     */
+    fun noteSwapCut(mediaId: String) {
+        swapCutMediaId = mediaId
+        swapCutAtMs = SystemClock.elapsedRealtime()
+    }
+
+    private fun isSwapCut(): Boolean {
+        val id = swapCutMediaId ?: return false
+        if (SystemClock.elapsedRealtime() - swapCutAtMs > 3000L) {
+            swapCutMediaId = null
+            return false
+        }
+        // The swap keeps the media id; a user skip landing here changes it,
+        // so a genuine bail can never be swallowed by a stale latch.
+        return active().currentMediaItem?.mediaId == id
+    }
+
     private val listener = object : Player.Listener {
         override fun onPositionDiscontinuity(
             oldPosition: Player.PositionInfo,
@@ -622,19 +661,29 @@ class CrossfadeController(
         ) {
             // The listener moving the playhead is something no half-finished
             // crossfade should survive. Nothing this class does registers here
-            // any more: the handoff is a role swap, not a seek.
-            if (reason == Player.DISCONTINUITY_REASON_SEEK) bail()
+            // any more: the handoff is a role swap, not a seek. Quality-swap
+            // cuts land as SEEK on the same id ΓÇö exempt (F1), they are not
+            // the listener acting.
+            if (reason == Player.DISCONTINUITY_REASON_SEEK && !isSwapCut()) bail()
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                // A new pair by definition: any bail storm belonged to the
+                // pair that just ended (F4 reset).
+                consecutiveBailCount = 0
+                bailCooldownUntilMs = 0L
+            }
             when (reason) {
                 // Something replaced the queue out from under the fade — a new
                 // album, a new search result — so the tail still playing is a
                 // leftover of a session that no longer exists. Note that this
                 // does *not* fire when AutoPlay appends to the end, since the
                 // playing item doesn't change: extending the queue mid-fade is
-                // harmless and shouldn't cost the listener the blend.
-                Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> bail()
+                // harmless and shouldn't cost the listener the blend. A
+                // quality-swap cut reports the same reason on the same id ΓÇö
+                // exempt (F1), same as the SEEK above.
+                Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> if (!isSwapCut()) bail()
                 Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> bail()
                 // Full-audit P3: a natural auto-advance reaching this listener
                 // means ExoPlayer moved the queue on by itself — our blend
@@ -748,6 +797,14 @@ class CrossfadeController(
         val player = active()
         if (!player.isPlaying) {
             logGuardOnce("auto", "no transition: player not playing")
+            return
+        }
+        // Missed-window fix F4: damping after a bail storm. Re-arming on the
+        // next tick straight into the next cut is what escalated 8 AudioTrack
+        // recreations into 4 dead arms; hold the planner until the storm has
+        // had time to settle. Reset on begin()/auto-advance.
+        if (SystemClock.elapsedRealtime() < bailCooldownUntilMs) {
+            logGuardOnce("auto", "no transition: bail cooldown ($consecutiveBailCount consecutive)")
             return
         }
         // Nothing to transition *into*, so any analysis state left over from the
@@ -1355,6 +1412,14 @@ class CrossfadeController(
         if (out === into) return false
         val nextIndex = out.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return false
+        // Missed-window fix F2: refuse a stale window. Re-arming past the
+        // fade end replays a dead pair (the device log's ~75 s replay of a
+        // finished pair); the passed-mix rescue owns that case instead. The
+        // caller logs the refusal.
+        if (endMs <= out.currentPosition) {
+            TrackLog.d(TAG, "no arm: anchor passed (end=$endMs at=${out.currentPosition}ms)")
+            return false
+        }
 
         // The frozen anchor did its job getting here; a later lap of the
         // same pair (repeat-all) must freeze fresh, not inherit this lap's.
@@ -1376,6 +1441,9 @@ class CrossfadeController(
         lastCommittedRate = null
         lastRateCommitAt = 0L
         deckRateReset = false
+        // Missed-window fix F4: an accepted arm ends the storm.
+        consecutiveBailCount = 0
+        bailCooldownUntilMs = 0L
         spanLatched = 0L
         liveDuckA = 0f
         liveDelayB = 0f
@@ -1963,6 +2031,18 @@ class CrossfadeController(
     private fun bail() {
         if (phase == Phase.IDLE || phase == Phase.BAILING) return
         TrackLog.d(TAG, "bail from $phase")
+        // Missed-window fix F4: count consecutive bails and hold the planner
+        // back escalatingly. The cooldown is consumed in
+        // considerAutoTransition; reset on begin() (arm accepted) and on
+        // natural auto-advance (listener).
+        consecutiveBailCount++
+        val backoffMs = when (consecutiveBailCount) {
+            1 -> 1_500L
+            2 -> 3_000L
+            3 -> 6_000L
+            else -> 10_000L
+        }
+        bailCooldownUntilMs = SystemClock.elapsedRealtime() + backoffMs
         AppSettings.smartMixInProgress.value = false
         AppSettings.sharedHalfTimeBpm.value = null
         if (!handedOff) {

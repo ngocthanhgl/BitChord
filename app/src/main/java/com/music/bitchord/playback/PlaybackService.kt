@@ -2708,6 +2708,11 @@ class PlaybackService : MediaLibraryService() {
             // captured here rather than looked up again on revert.
             val previousFormat = NerdStats.declaredFormat(mediaId)
             swappingMediaId = mediaId
+            // Missed-window fix F1: the controller bails arms on exactly this
+            // cut unless told it is ours, not the listener's. Latched with a
+            // timestamp inside; the listener matches it against the session id
+            // so a genuine skip can never be swallowed.
+            crossfade?.noteSwapCut(mediaId)
             swapCutAt = SystemClock.elapsedRealtime()
             val upgradedMetadata = now.item.mediaMetadata.buildUpon()
                 .setExtras(Bundle(now.item.mediaMetadata.extras ?: Bundle()).apply {
@@ -3115,6 +3120,20 @@ class PlaybackService : MediaLibraryService() {
                 NerdStats.clearDeclared(mediaId)
             }
             swappingMediaId = mediaId
+            // Missed-window fix F1 (revert is a cut too) + F3 (below): the
+            // controller must not read this as the queue being replaced.
+            crossfade?.noteSwapCut(mediaId)
+            // Missed-window fix F3: the landing path shelves upgrades while a
+            // transition runs; the revert cut is the same surgery on the same
+            // player. Hold one grace window for the blend to clear, then
+            // proceed regardless ΓÇö bounded, never hangs the watch loop.
+            if (crossfade?.isTransitioning() == true) {
+                TrackLog.d("BitChord", "revert for $mediaId holding 3s; a transition is running")
+                delay(3000)
+                if (crossfade?.isTransitioning() == true) {
+                    TrackLog.d("BitChord", "revert for $mediaId proceeding anyway; transition still running")
+                }
+            }
             val abandoned = item.localConfiguration?.uri
             player.replaceMediaItem(
                 player.currentMediaItemIndex,
