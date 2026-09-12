@@ -2590,7 +2590,9 @@ private fun planTransitionInner(
                     type = if (mixset) TransitionType.HARMONIC_BLEND else plan.type,
                     // B3: the recompute at the actual start/cue can only
                     // downgrade — a weak bed must never outscore its plan.
-                    score = min(plan.score, scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime)),
+                    score = scoreCompatibility(analysis, nextAnalysis, plan.transitionStart, plan.incomingCueTime).let { re ->
+                        if (re.overall < plan.score.overall) re else plan.score
+                    },
                     eqCurve = EQCurve.BASS_SWAP,
                     policyReasons = policy.reasons,
                     reason = if (started) "smart-phrase-switch" else "before-phrase-switch",
