@@ -2448,7 +2448,7 @@ class CrossfadeController(
                     rideFilterSweep(progress)
                 }
             }
-            TransitionStyle.DJ_BLEND ->
+            TransitionStyle.DJ_BLEND -> {
                 // DJ effects (F1/F3): the send-driving arm runs alongside the
                 // filter path below — a throw/wash is a send move, the swap
                 // and separation are filter moves, and they stack by design.
@@ -2471,6 +2471,7 @@ class CrossfadeController(
                     filters.setResonance(1.0f)
                     rideVocalSeparation(progress)
                 }
+            }
             // GAPLESS is an album being played through, where any filtering would
             // be an edit the record didn't ask for — so it stays open whatever
             // the material does.
